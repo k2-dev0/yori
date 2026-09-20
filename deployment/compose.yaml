@@ -1,5 +1,5 @@
-# M1の専用Compose project。既存のCompose project・データへは触れない。
-# DBはホストへポートを公開しない。テストは同じnetwork上のNode containerで実行する。
+# M1の通常Compose project。既存のCompose project・データへは触れない。
+# DBはホストへポートを公開しない。通常upでmigrationを走らせないためmigrateはtools profileに置く。
 name: yori
 
 x-node-service: &node-service
@@ -62,22 +62,16 @@ services:
     ports:
       - "127.0.0.1:${YORI_API_PORT:-39119}:3210"
 
-  test:
-    <<: *node-service
-    command:
-      - sh
-      - -c
-      - npm ci --no-audit --no-fund && exec npm run test:src
-
   migrate:
     <<: *node-service
+    profiles:
+      - tools
     command:
       - sh
       - -c
       - npm ci --no-audit --no-fund && exec npm run migrate
 
 # volume名は既定で開発用の固定名のまま（通常composeのDB永続化を維持）。
-# テストはYORI_*_VOLUMEを上書きして、開発データと別のvolumeを使う。
 volumes:
   yori-pgdata:
     name: ${YORI_PGDATA_VOLUME:-yori-pgdata}
