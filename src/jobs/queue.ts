@@ -1,4 +1,5 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
+import { v7 as uuidv7 } from 'uuid';
 
 // route_search は分類待ちに依存させず、常に分類より先に処理する。
 export const ROUTE_SEARCH_PRIORITY = 100;
@@ -61,32 +62,220 @@ export interface BlockJobInput {
   errorCode: string;
 }
 
-// M1 Red時点では契約exportのみ。冪等キーで1件だけ登録する実装はM1 Greenで行う。
-export async function enqueueJob(_pool: Pool, _input: EnqueueJobInput): Promise<string> {
-  return '';
+const MAX_CLAIM_LIMIT = 100;
+const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
+const RETRY_BASE_MS = 1_000;
+const RETRY_MAX_MS = 60 * 60 * 1_000;
+
+interface JobRow {
+  id: string;
+  kind: JobKind;
+  priority: number;
+  session_id: string | null;
+  message_id: string | null;
+  target_revision: number | null;
+  payload: unknown;
+  attempts: number;
 }
 
-// M1 Red時点では契約exportのみ。SELECT ... FOR UPDATE SKIP LOCKEDとlease付与はM1 Greenで行う。
-export async function claimJobs(_pool: Pool, _input: ClaimJobsInput): Promise<ClaimedJob[]> {
-  return [];
+// due pendingをpriority DESC・作成順で安定に選ぶ。分類は同sessionの先行jobが未完了の間は後続を除外する。
+// 分類の順序はmessage.sequence_no→target_revisionで決め、未受信のsequence_noは待たない。
+const CLAIM_JOBS_SQL = `
+  SELECT j.id, j.kind, j.priority, j.session_id, j.message_id, j.target_revision, j.payload, j.attempts
+    FROM jobs j
+   WHERE j.status = 'pending'
+     AND j.next_run_at <= now()
+     AND j.kind = ANY($1::text[])
+     AND (
+       j.kind <> 'classify_message'
+       OR NOT EXISTS (
+         SELECT 1
+           FROM jobs o
+          WHERE o.session_id = j.session_id
+            AND o.kind = 'classify_message'
+            AND o.id <> j.id
+            AND (
+              o.status = 'running'
+              OR (
+                o.status IN ('pending', 'failed', 'blocked_policy')
+                AND EXISTS (
+                  SELECT 1
+                    FROM messages om
+                    JOIN messages m ON m.id = j.message_id
+                   WHERE om.id = o.message_id
+                     AND (om.sequence_no, o.target_revision) < (m.sequence_no, j.target_revision)
+                )
+              )
+            )
+       )
+     )
+   ORDER BY j.priority DESC, j.created_at ASC, j.id ASC
+   LIMIT $2
+   FOR UPDATE OF j SKIP LOCKED
+`;
+
+// 冪等キーが同じenqueueは既存jobのIDを返し、jobを増殖させない。
+export async function enqueueJob(pool: Pool | PoolClient, input: EnqueueJobInput): Promise<string> {
+  if (input.idempotencyKey.length === 0) {
+    throw new Error('idempotencyKeyは必須です');
+  }
+  if (input.priority !== undefined && !Number.isInteger(input.priority)) {
+    throw new Error('priorityは整数で指定してください');
+  }
+  if (input.nextRunAt !== undefined && !Number.isFinite(input.nextRunAt.getTime())) {
+    throw new Error('nextRunAtが不正です');
+  }
+  const id = uuidv7();
+  const inserted = await pool.query<{ id: string }>(
+    `INSERT INTO jobs (id, kind, priority, session_id, message_id, target_revision, payload, idempotency_key, next_run_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING id`,
+    [
+      id,
+      input.kind,
+      input.priority ?? 0,
+      input.sessionId ?? null,
+      input.messageId ?? null,
+      input.targetRevision ?? null,
+      input.payload ?? {},
+      input.idempotencyKey,
+      input.nextRunAt ?? new Date(),
+    ],
+  );
+  const insertedRow = inserted.rows[0];
+  if (insertedRow) {
+    return insertedRow.id;
+  }
+  const existing = await pool.query<{ id: string }>('SELECT id FROM jobs WHERE idempotency_key = $1', [input.idempotencyKey]);
+  return existing.rows[0].id;
 }
 
-// M1 Red時点では契約exportのみ。job id・lease token・対象revision・lease未失効の一致検証はM1 Greenで行う。
-export async function completeJob(_pool: Pool, _input: CompleteJobInput): Promise<boolean> {
-  return false;
+// 短いTXでSKIP LOCKEDし、jobごとに新しいUUIDv7 leaseを付与してrunningへ移す。
+export async function claimJobs(pool: Pool, input: ClaimJobsInput): Promise<ClaimedJob[]> {
+  const kinds = [...new Set(input.kinds.filter(isJobKind))];
+  if (kinds.length === 0) {
+    return [];
+  }
+  if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > MAX_CLAIM_LIMIT) {
+    throw new Error(`limitは1..${MAX_CLAIM_LIMIT}の整数で指定してください`);
+  }
+  const leaseMs = input.leaseMs ?? DEFAULT_JOB_LEASE_MS;
+  if (!Number.isFinite(leaseMs) || leaseMs < 1 || leaseMs > MAX_LEASE_MS) {
+    throw new Error(`leaseMsは1..${MAX_LEASE_MS}で指定してください`);
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const picked = await client.query<JobRow>(CLAIM_JOBS_SQL, [kinds, input.limit]);
+    const claimed: ClaimedJob[] = [];
+    for (const row of picked.rows) {
+      const leaseToken = uuidv7();
+      const leaseExpiresAt = new Date(Date.now() + leaseMs);
+      const updated = await client.query<{ attempts: number }>(
+        `UPDATE jobs
+            SET status = 'running', lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = now()
+          WHERE id = $1 AND status = 'pending'
+          RETURNING attempts`,
+        [row.id, leaseToken, leaseExpiresAt],
+      );
+      const attempts = updated.rows[0]?.attempts;
+      if (attempts === undefined) {
+        continue;
+      }
+      claimed.push({
+        id: row.id,
+        kind: row.kind,
+        priority: row.priority,
+        sessionId: row.session_id,
+        messageId: row.message_id,
+        targetRevision: row.target_revision,
+        payload: row.payload,
+        leaseToken,
+        leaseExpiresAt,
+        attempts,
+      });
+    }
+    await client.query('COMMIT');
+    return claimed;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-// M1 Red時点では契約exportのみ。指数バックオフ・jitter・Retry-Afterとfailedの保持はM1 Greenで行う。
-export async function failJob(_pool: Pool, _input: FailJobInput): Promise<boolean> {
-  return false;
+// job id・lease token・対象revision・未失効leaseがすべて一致する完了だけを受け付ける。
+export async function completeJob(pool: Pool, input: CompleteJobInput): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE jobs
+        SET status = 'completed', lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE id = $1
+        AND status = 'running'
+        AND lease_token = $2
+        AND lease_expires_at > now()
+        AND target_revision IS NOT DISTINCT FROM $3::integer`,
+    [input.jobId, input.leaseToken, input.targetRevision],
+  );
+  return result.rowCount === 1;
 }
 
-// M1 Red時点では契約exportのみ。blocked_policyとして保持し自動再試行を止める実装はM1 Greenで行う。
-export async function blockJob(_pool: Pool, _input: BlockJobInput): Promise<boolean> {
-  return false;
+// 一時障害はRetry-Afterと指数バックオフ+jitterでpendingへ戻し、恒久エラーはfailedとして保持する。
+export async function failJob(pool: Pool, input: FailJobInput): Promise<boolean> {
+  const retryAfterMs = input.retryAfterMs ?? 0;
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs < 0) {
+    throw new Error('retryAfterMsが不正です');
+  }
+  const leaseCondition = `id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()`;
+  if (input.retryable) {
+    const result = await pool.query(
+      `UPDATE jobs
+          SET status = 'pending',
+              lease_token = NULL,
+              lease_expires_at = NULL,
+              error_code = $3,
+              next_run_at = now() + interval '1 second' * (
+                GREATEST($4::double precision, LEAST($5::double precision * POWER(2, LEAST(attempts, 10)), $6::double precision))
+                * (1 + random() * 0.1) / 1000.0
+              ),
+              updated_at = now()
+        WHERE ${leaseCondition}`,
+      [input.jobId, input.leaseToken, input.errorCode, retryAfterMs, RETRY_BASE_MS, RETRY_MAX_MS],
+    );
+    return result.rowCount === 1;
+  }
+  const result = await pool.query(
+    `UPDATE jobs
+        SET status = 'failed', lease_token = NULL, lease_expires_at = NULL, error_code = $3, updated_at = now()
+      WHERE ${leaseCondition}`,
+    [input.jobId, input.leaseToken, input.errorCode],
+  );
+  return result.rowCount === 1;
 }
 
-// M1 Red時点では契約exportのみ。lease期限切れjobのpending復帰はM1 Greenで行う。
-export async function recoverExpiredJobs(_pool: Pool): Promise<number> {
-  return 0;
+// ポリシー未確認はblocked_policyとして保持し、外部送信を伴う自動再試行を止める。
+export async function blockJob(pool: Pool, input: BlockJobInput): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE jobs
+        SET status = 'blocked_policy', lease_token = NULL, lease_expires_at = NULL, error_code = $3, updated_at = now()
+      WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()`,
+    [input.jobId, input.leaseToken, input.errorCode],
+  );
+  return result.rowCount === 1;
+}
+
+// lease期限切れのrunning jobをpendingへ戻し、停止したworkerのjobを回収する。
+export async function recoverExpiredJobs(pool: Pool): Promise<number> {
+  const result = await pool.query(
+    `UPDATE jobs
+        SET status = 'pending', lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now()`,
+  );
+  return result.rowCount ?? 0;
+}
+
+// 外部入力のkindが契約したjob種別か判定する。
+function isJobKind(value: string): value is JobKind {
+  return (JOB_KINDS as readonly string[]).includes(value);
 }
