@@ -1,0 +1,87 @@
+# M1の専用Compose project。既存のCompose project・データへは触れない。
+# DBはホストへポートを公開しない。テストは同じnetwork上のNode containerで実行する。
+name: yori
+
+x-node-service: &node-service
+  image: node:24.21.0-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+  working_dir: /app
+  volumes:
+    - ..:/app
+    - yori-node-modules:/app/node_modules
+    - yori-npm-cache:/root/.npm
+  environment:
+    DATABASE_URL: postgres://yori:yori@db:5432/yori
+    API_HOST: 0.0.0.0
+    API_PORT: "3210"
+  depends_on:
+    db:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.6-pg18-trixie@sha256:78bf48b801e792f99e3ac62b5036fd3876e9be48afda16c1e331af1c75ceb2ff
+    environment:
+      POSTGRES_USER: yori
+      POSTGRES_PASSWORD: yori
+      POSTGRES_DB: yori
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - statement_timeout=30000
+    volumes:
+      - yori-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yori -d yori"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec ./node_modules/.bin/tsx src/api/server.ts
+    ports:
+      - "127.0.0.1:${YORI_API_PORT:-39119}:3210"
+
+  test:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec npm run test:src
+
+  migrate:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec npm run migrate
+
+# volume名は既定で開発用の固定名のまま（通常composeのDB永続化を維持）。
+# テストはYORI_*_VOLUMEを上書きして、開発データと別のvolumeを使う。
+volumes:
+  yori-pgdata:
+    name: ${YORI_PGDATA_VOLUME:-yori-pgdata}
+  yori-node-modules:
+    name: ${YORI_NODE_MODULES_VOLUME:-yori-node-modules}
+  yori-npm-cache:
+    name: ${YORI_NPM_CACHE_VOLUME:-yori-npm-cache}
