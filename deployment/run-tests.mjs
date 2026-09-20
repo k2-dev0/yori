@@ -10,11 +10,19 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const COMPOSE_FILE = path.join(REPO_ROOT, 'deployment', 'compose.yaml');
 // 開発用compose (project yori / volume yori-*) と開発データを共有しないテスト専用のproject・volume。
 const TEST_PROJECT_NAME = process.env.YORI_TEST_PROJECT ?? 'yori-test';
+if (TEST_PROJECT_NAME === 'yori') {
+  console.error('YORI_TEST_PROJECT=yori は開発用project・volumeを共有するため許可しません');
+  process.exit(1);
+}
+// テストAPIは開発用(39119)と別portを既定にし、同時起動した開発環境と衝突させない。
+const TEST_API_PORT = process.env.YORI_API_PORT ?? '39120';
+// テストvolumeはテストproject名から導出し、別projectが同じvolumeを共有しない。
 const TEST_ENV = {
   ...process.env,
-  YORI_PGDATA_VOLUME: process.env.YORI_TEST_PGDATA_VOLUME ?? 'yori-test-pgdata',
-  YORI_NODE_MODULES_VOLUME: process.env.YORI_TEST_NODE_MODULES_VOLUME ?? 'yori-test-node-modules',
-  YORI_NPM_CACHE_VOLUME: process.env.YORI_TEST_NPM_CACHE_VOLUME ?? 'yori-test-npm-cache',
+  YORI_API_PORT: TEST_API_PORT,
+  YORI_PGDATA_VOLUME: process.env.YORI_TEST_PGDATA_VOLUME ?? `${TEST_PROJECT_NAME}-pgdata`,
+  YORI_NODE_MODULES_VOLUME: process.env.YORI_TEST_NODE_MODULES_VOLUME ?? `${TEST_PROJECT_NAME}-node-modules`,
+  YORI_NPM_CACHE_VOLUME: process.env.YORI_TEST_NPM_CACHE_VOLUME ?? `${TEST_PROJECT_NAME}-npm-cache`,
 };
 
 function run(command, args, env = process.env) {
