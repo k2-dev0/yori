@@ -6,6 +6,9 @@ export const ROUTE_SEARCH_PRIORITY = 100;
 export const CLASSIFY_MESSAGE_PRIORITY = 10;
 export const DEFAULT_JOB_LEASE_MS = 60_000;
 
+// 同一sessionの分類claimを直列化するadvisory lock key1。key2はsession_idから導出する。
+const SESSION_CLAIM_LOCK_NAMESPACE = 20260923;
+
 export const JOB_KINDS = ['classify_message', 'route_search'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
@@ -114,6 +117,37 @@ const CLAIM_JOBS_SQL = `
    FOR UPDATE OF j SKIP LOCKED
 `;
 
+// session lock取得後の新snapshotで、running中の同session分類や先行sequence_no/revisionが無いかを再確認する。
+// 同TX内で追加したrunningもこの文で観測する。
+const RECHECK_CLASSIFY_JOB_SQL = `
+  SELECT 1
+    FROM jobs j
+   WHERE j.id = $1
+     AND j.kind = 'classify_message'
+     AND j.status = 'pending'
+     AND j.next_run_at <= now()
+     AND NOT EXISTS (
+       SELECT 1
+         FROM jobs o
+        WHERE o.session_id = j.session_id
+          AND o.kind = 'classify_message'
+          AND o.id <> j.id
+          AND (
+            o.status = 'running'
+            OR (
+              o.status IN ('pending', 'failed', 'blocked_policy')
+              AND EXISTS (
+                SELECT 1
+                  FROM messages om
+                  JOIN messages m ON m.id = j.message_id
+                 WHERE om.id = o.message_id
+                   AND (om.sequence_no, o.target_revision) < (m.sequence_no, j.target_revision)
+              )
+            )
+          )
+     )
+`;
+
 // 冪等キーが同じenqueueは既存jobのIDを返し、jobを増殖させない。
 export async function enqueueJob(pool: Pool | PoolClient, input: EnqueueJobInput): Promise<string> {
   if (input.idempotencyKey.length === 0) {
@@ -151,7 +185,8 @@ export async function enqueueJob(pool: Pool | PoolClient, input: EnqueueJobInput
   return existing.rows[0].id;
 }
 
-// 短いTXでSKIP LOCKEDし、jobごとに新しいUUIDv7 leaseを付与してrunningへ移す。
+// 短いTXでSKIP LOCKEDし、session単位のtry lockと再確認を通ったjobだけをrunningへ移す。
+// 分類は同sessionのrunning中claimをtry advisory xact lockで直列化し、route_searchと別sessionは止めない。
 export async function claimJobs(pool: Pool, input: ClaimJobsInput): Promise<ClaimedJob[]> {
   const kinds = [...new Set(input.kinds.filter(isJobKind))];
   if (kinds.length === 0) {
@@ -169,7 +204,32 @@ export async function claimJobs(pool: Pool, input: ClaimJobsInput): Promise<Clai
     await client.query('BEGIN');
     const picked = await client.query<JobRow>(CLAIM_JOBS_SQL, [kinds, input.limit]);
     const claimed: ClaimedJob[] = [];
+    // 分類中のsessionはxact lockを保持し、他claimはtry lockの失敗でskipする。
+    const lockedSessionIds = new Set<string>();
+    const busySessionIds = new Set<string>();
     for (const row of picked.rows) {
+      if (row.kind === 'classify_message') {
+        if (row.session_id !== null) {
+          if (busySessionIds.has(row.session_id)) {
+            continue;
+          }
+          if (!lockedSessionIds.has(row.session_id)) {
+            const lock = await client.query<{ locked: boolean }>(
+              'SELECT pg_try_advisory_xact_lock($1::int, hashtext($2)) AS locked',
+              [SESSION_CLAIM_LOCK_NAMESPACE, row.session_id],
+            );
+            if (!lock.rows[0].locked) {
+              busySessionIds.add(row.session_id);
+              continue;
+            }
+            lockedSessionIds.add(row.session_id);
+          }
+        }
+        const recheck = await client.query(RECHECK_CLASSIFY_JOB_SQL, [row.id]);
+        if (recheck.rows.length === 0) {
+          continue;
+        }
+      }
       const leaseToken = uuidv7();
       const leaseExpiresAt = new Date(Date.now() + leaseMs);
       const updated = await client.query<{ attempts: number }>(
