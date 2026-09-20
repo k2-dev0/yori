@@ -1,0 +1,84 @@
+# M1のテスト専用Compose。通常compose (project yori / volume yori-*) を参照しない。
+# volumeはnameを明示せずCompose projectスコープで隔離し、--project-nameを変えても開発volumeへ触れない。
+# DBはホストへポートを公開せず、テストは同じnetwork上のNode containerで実行する。
+
+x-node-service: &node-service
+  image: node:24.21.0-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+  working_dir: /app
+  volumes:
+    - ..:/app
+    - node-modules:/app/node_modules
+    - npm-cache:/root/.npm
+  environment:
+    DATABASE_URL: postgres://yori:yori@db:5432/yori
+    API_HOST: 0.0.0.0
+    API_PORT: "3210"
+  depends_on:
+    db:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.6-pg18-trixie@sha256:78bf48b801e792f99e3ac62b5036fd3876e9be48afda16c1e331af1c75ceb2ff
+    environment:
+      POSTGRES_USER: yori
+      POSTGRES_PASSWORD: yori
+      POSTGRES_DB: yori
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - statement_timeout=30000
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yori -d yori"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # テストAPIは開発用(39119)と分離したloopbackのみの公開にする。
+  api:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec ./node_modules/.bin/tsx src/api/server.ts
+    ports:
+      - "127.0.0.1:${YORI_API_PORT:-39120}:3210"
+
+  migrate:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec npm run migrate
+
+  test:
+    <<: *node-service
+    command:
+      - sh
+      - -c
+      - npm ci --no-audit --no-fund && exec npm run test:src
+
+# volume名はCompose projectスコープの既定に任せ、別project・開発volumeと共有しない。
+volumes:
+  pgdata:
+  node-modules:
+  npm-cache:
