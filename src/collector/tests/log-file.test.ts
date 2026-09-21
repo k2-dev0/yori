@@ -61,6 +61,89 @@ describe('transcript差分と診断', () => {
     }
   });
 
+  it('session_metaだけの初回収集でも対応版を保存し、別呼出しの発言を重複なく回収する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [codexSessionLine('session-1')]);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+
+      // 初回はmetadataだけ。送信はせず、対応版をstateへ残してcursorを進める。
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 0, '発言ゼロのmetadataだけで送信している');
+
+      // 別呼出し（再起動相当の再open）で追記した発言を回収する。
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'metadata直後の発言' })}\n`,
+      );
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-1', 1]],
+      );
+
+      // 再読込・再openで同じ発言を再送しない。
+      await collectFromHook(options);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '再読込で再送している');
+
+      // 続く発言も同じsessionのsequenceで回収する。
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: '続く発言' })}\n`,
+      );
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-2', 2]],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('session_meta直後の未完first messageを完成後のcollect/flushで回収し、再読込しない', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const message = codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '未完だった最初の発言' });
+      await writeTranscript(transcript, [codexSessionLine('session-1'), message.slice(0, 20)], { trailingNewline: false });
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 0, '未完行を送信している');
+
+      // 完成したfirst messageをflush（再起動相当の再open）で回収する。
+      await appendTranscript(transcript, `${message.slice(20)}\n`);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-1', 1]],
+      );
+
+      await collectFromHook(options);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '再読込で再送している');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('同一inodeの同サイズ書換えを検知し、本文変更をrevisionとして送る', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
