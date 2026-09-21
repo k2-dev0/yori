@@ -72,11 +72,14 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 
 ## 診断と制約
 
-- 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。
+- 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。
+- 未知版・session不一致で保留したscanは、そのscanで積んだmessage/outbox/採番/cursorを一体でrollbackし、保留原因の診断だけを残す。原因が解消すると同じ行を先頭から同じ順で読み直し、重複しないsequenceを採番する。
+- 1MiB超の行は本文を保持せず改行まで読み捨てる。読み捨て中の元行startと読取済みoffsetは`file_cursors`へ保存し、次回は途中から再開する。4MiBの読取予算は読み捨て中の読取も含む。inode交換・短縮・fingerprint不一致の再読込時は読み捨て状態も捨てる。旧schemaのstateには列を後方互換で追加する。
+- 識別子はserver契約と同じく空・NUL・単独サロゲート・1024 UTF-8 bytes超を拒否する。不正な`source_message_id`はoutboxへ入れず診断し、不正な`session_id`は収集境界で診断してsource/sessionを保存しない。
 - 同じmessage IDの本文変更はrevisionを増やし、完全一致の再録は無視する。role・発言時刻を変える更新は保留して診断する。
 - 1回の処理は最大4MiB読取・100イベント送信。outboxのSELECTも残りの送信予算（最大100件）以下に限り、本文を余分に読まない。outboxはsequence/revision順に最大100件・body 1MiB以内でbatch化する。
 - 同一sessionへの並行collectは`BEGIN IMMEDIATE`でcursor読取からcommitまでを直列化する。transcriptはscanと同じfile descriptorの同一inodeでstat/fingerprintし、scan中にpathのinodeが差し替わった場合はcommitせず次回へ回す。旧fileのoffsetを新inodeへ記録しない。
-- 送信前に設定`projects`とoutboxの`source_scope`/`project_id`を照合し、設定から外れた・再割当されたoutboxは送らず保持する。別projectのcollectが起動しても撤去済みprojectのoutboxは流れない。
+- 送信前に設定`projects`とoutboxの`source_scope`/`project_id`をペアで照合し、設定から外れた・再割当されたoutboxは送らず保持する。同じ`project_id`に複数repositoryがある設定でも、各repositoryのoutboxを送る。別projectのcollectが起動しても撤去済みprojectのoutboxは流れない。
 - `state_dir`は0700、SQLiteファイルは0600で作成する。送信は5秒timeoutでredirectを追わない。
 - 未登録repositoryのsourceは`cwd`/`source`/`session`/`transcript_path`の参照だけを保持し、本文を読まずに保留する。
 
