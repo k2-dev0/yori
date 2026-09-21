@@ -64,8 +64,12 @@ function isStorableText(text: string): boolean {
   return [...text].length <= MAX_TEXT_LENGTH;
 }
 
+// server契約（schema.tsのsourceIdentifier）と同じく、空・NUL・単独サロゲート・1024 UTF-8 bytes超を拒否する。
 function isStorableIdentifier(value: string): boolean {
-  return value.length > 0 && Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES;
+  if (value.length === 0 || value.includes('\u0000') || /[\uD800-\uDFFF]/u.test(value)) {
+    return false;
+  }
+  return Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES;
 }
 
 function supportedVersion(source: EventSource): string {
@@ -94,55 +98,65 @@ function fingerprintOf(fd: number, size: number, maxBytes = FINGERPRINT_BYTES): 
   return { length: total, hash: sha256Hex(buffer.subarray(0, total)) };
 }
 
-// 前回cursorとのinode・size・fingerprint比較から読み始めるbyte offsetを決める。
-function resolveStartOffset(fd: number, cursor: CursorRow | undefined, size: number, device: string, inode: string): number {
+// 前回cursorとのinode・size・fingerprint比較から、読み始めるbyte offsetと継続中のskip状態を決める。
+// inode交換・短縮・同inode書換えでは途中のoversize行のskip状態も捨てて0から読み直す。
+function resolveStartOffset(
+  fd: number,
+  cursor: CursorRow | undefined,
+  size: number,
+  device: string,
+  inode: string,
+): { offset: number; skipStart: number | null } {
   if (cursor === undefined) {
-    return 0;
+    return { offset: 0, skipStart: null };
   }
   if (cursor.device !== device || cursor.inode !== inode) {
-    return 0;
+    return { offset: 0, skipStart: null };
   }
   if (size < cursor.file_size) {
-    return 0;
+    return { offset: 0, skipStart: null };
   }
   if (cursor.fingerprint_length > 0 && size >= cursor.fingerprint_length) {
     const fingerprint = fingerprintOf(fd, size, cursor.fingerprint_length);
     if (fingerprint.hash !== cursor.fingerprint) {
-      return 0;
+      return { offset: 0, skipStart: null };
     }
   }
-  return Math.min(cursor.byte_offset, size);
+  if (cursor.skip_start !== null && cursor.skip_offset !== null) {
+    return { offset: Math.min(cursor.skip_offset, size), skipStart: cursor.skip_start };
+  }
+  return { offset: Math.min(cursor.byte_offset, size), skipStart: null };
 }
 
 interface ScanInput {
   fd: number;
   startOffset: number;
+  // 前回のscanから読み捨てを継続している1MiB超行の開始offset。nullなら通常の行処理。
+  skipStart: number | null;
   shouldStop: () => boolean;
   onLine: (line: string, byteOffset: number) => void;
   onOversize: (byteOffset: number) => void;
 }
 
 // 4MiB予算の範囲で改行単位に読み、未完の末尾行はcursorへ含めない。1MiB超の行は本文を保持せず読み飛ばす。
+// 予算はskip中の読取も含めて数え、skipが未完のままEOF/予算へ達した場合は元の行startと読取済みoffsetを返す。
 // fdは呼出元が開いたscan対象そのもの。読みの途中でpathが差し替わっても別inodeを混ぜない。
-function scanLines(input: ScanInput): { cursor: number } {
+function scanLines(input: ScanInput): { cursor: number; skipStart: number | null; skipOffset: number | null } {
   let position = input.startOffset;
-  let lineStart = position;
+  let lineStart = input.skipStart ?? input.startOffset;
   let partial = Buffer.alloc(0);
-  let skipStart: number | null = null;
-  let cursor = position;
+  let skipStart = input.skipStart;
+  let cursor = lineStart;
   let consumed = 0;
   while (consumed < MAX_READ_BYTES && !input.shouldStop()) {
-    const skippingAtStart = skipStart !== null;
-    const toRead = skippingAtStart ? READ_CHUNK_BYTES : Math.min(READ_CHUNK_BYTES, MAX_READ_BYTES - consumed);
+    const toRead = Math.min(READ_CHUNK_BYTES, MAX_READ_BYTES - consumed);
     const buffer = Buffer.allocUnsafe(toRead);
     const read = readSync(input.fd, buffer, 0, toRead, position);
     if (read === 0) {
       break;
     }
+    consumed += read;
     const chunk = buffer.subarray(0, read);
-    if (!skippingAtStart) {
-      consumed += read;
-    }
     let start = 0;
     let stopped = false;
     while (true) {
@@ -155,13 +169,19 @@ function scanLines(input: ScanInput): { cursor: number } {
         skipStart = null;
         partial = Buffer.alloc(0);
       } else {
-        const lineBytes = partial.length > 0 ? Buffer.concat([partial, chunk.subarray(start, newline)]) : chunk.subarray(start, newline);
-        partial = Buffer.alloc(0);
-        input.onLine(lineBytes.toString('utf8'), lineStart);
-        if (input.shouldStop()) {
-          stopped = true;
-          cursor = lineStart;
-          break;
+        const lineLength = partial.length + newline - start;
+        if (lineLength > MAX_LINE_BYTES) {
+          input.onOversize(lineStart);
+          partial = Buffer.alloc(0);
+        } else {
+          const lineBytes = partial.length > 0 ? Buffer.concat([partial, chunk.subarray(start, newline)]) : chunk.subarray(start, newline);
+          partial = Buffer.alloc(0);
+          input.onLine(lineBytes.toString('utf8'), lineStart);
+          if (input.shouldStop()) {
+            stopped = true;
+            cursor = lineStart;
+            break;
+          }
         }
       }
       lineStart = position + newline + 1;
@@ -172,13 +192,11 @@ function scanLines(input: ScanInput): { cursor: number } {
       break;
     }
     const rest = chunk.subarray(start);
-    if (rest.length > 0) {
-      if (skipStart === null) {
-        partial = partial.length > 0 ? Buffer.concat([partial, rest]) : Buffer.from(rest);
-        if (partial.length > MAX_LINE_BYTES) {
-          skipStart = lineStart;
-          partial = Buffer.alloc(0);
-        }
+    if (rest.length > 0 && skipStart === null) {
+      partial = partial.length > 0 ? Buffer.concat([partial, rest]) : Buffer.from(rest);
+      if (partial.length > MAX_LINE_BYTES) {
+        skipStart = lineStart;
+        partial = Buffer.alloc(0);
       }
     }
     position += read;
@@ -186,7 +204,7 @@ function scanLines(input: ScanInput): { cursor: number } {
       break;
     }
   }
-  return { cursor };
+  return { cursor, skipStart, skipOffset: skipStart === null ? null : position };
 }
 
 interface IngestContext {
@@ -201,6 +219,8 @@ interface IngestContext {
   nextSequence: number;
   sessionExists: boolean;
   held: boolean;
+  // 保留scanはTXごとrollbackするため、原因の固定code/offsetを別途保存できるよう保持する。
+  heldDiagnostic: { code: string; byteOffset: number } | null;
 }
 
 // 1件の発言を検証し、同一message IDは本文一致を無視・本文変更をrevision+1としてoutboxへ積む。
@@ -287,12 +307,12 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
   }
   if (record.kind === 'session') {
     if (record.source_session_id !== ctx.hook.session_id) {
-      recordDiagnostic(ctx.state, ctx.namespace, 'session_id_mismatch', byteOffset);
+      ctx.heldDiagnostic = { code: 'session_id_mismatch', byteOffset };
       ctx.held = true;
       return;
     }
     if (record.transcript_version !== ctx.supportedVersion) {
-      recordDiagnostic(ctx.state, ctx.namespace, 'transcript_unknown_version', byteOffset);
+      ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
       ctx.held = true;
       return;
     }
@@ -305,14 +325,14 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
     return;
   }
   if (record.source_session_id !== ctx.hook.session_id) {
-    recordDiagnostic(ctx.state, ctx.namespace, 'session_id_mismatch', byteOffset);
+    ctx.heldDiagnostic = { code: 'session_id_mismatch', byteOffset };
     ctx.held = true;
     return;
   }
   const version = record.transcript_version ?? ctx.version;
   if (version === null || version !== ctx.supportedVersion) {
     // 未知版は本文を取り込まず、cursorも進めず保留する。
-    recordDiagnostic(ctx.state, ctx.namespace, 'transcript_unknown_version', byteOffset);
+    ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
     ctx.held = true;
     return;
   }
@@ -336,6 +356,10 @@ export function ingestTranscript(
     projectId: string;
   },
 ): IngestResult {
+  if (!isStorableIdentifier(input.hook.session_id)) {
+    recordDiagnostic(state, input.namespace, 'session_invalid_identifier', NO_OFFSET);
+    return { held: true };
+  }
   const existing = getSession(state, input.namespace, input.source, input.hook.session_id);
   if (existing !== undefined && (existing.source_scope !== input.repository || existing.project_id !== input.projectId)) {
     recordDiagnostic(state, input.namespace, 'source_project_reassignment', NO_OFFSET);
@@ -374,7 +398,7 @@ export function ingestTranscript(
       const inode = String(stat.ino);
       const size = Number(stat.size);
       const cursor = getCursor(state, input.namespace, input.source, input.hook.session_id, input.hook.transcript_path);
-      const startOffset = resolveStartOffset(fd, cursor, size, device, inode);
+      const start = resolveStartOffset(fd, cursor, size, device, inode);
       const ctx: IngestContext = {
         state,
         namespace: input.namespace,
@@ -387,16 +411,22 @@ export function ingestTranscript(
         nextSequence: session?.next_sequence ?? 1,
         sessionExists: session !== undefined,
         held: false,
+        heldDiagnostic: null,
       };
       const scan = scanLines({
         fd,
-        startOffset,
+        startOffset: start.offset,
+        skipStart: start.skipStart,
         shouldStop: () => ctx.held,
         onLine: (line, offset) => processRecord(ctx, parseLine(input.source, line), offset),
         onOversize: (offset) => recordDiagnostic(state, input.namespace, 'transcript_line_too_long', offset),
       });
       if (ctx.held) {
-        state.db.exec('COMMIT');
+        // 同scanで積んだ先行message/outbox/採番/cursorは一体で戻し、保留原因の診断だけを残す。
+        state.db.exec('ROLLBACK');
+        if (ctx.heldDiagnostic !== null) {
+          recordDiagnostic(state, input.namespace, ctx.heldDiagnostic.code, ctx.heldDiagnostic.byteOffset);
+        }
         return { held: true };
       }
       if (ctx.sessionExists) {
@@ -426,6 +456,8 @@ export function ingestTranscript(
         file_size: Number(finalStat.size),
         fingerprint_length: fingerprint.length,
         fingerprint: fingerprint.hash,
+        skip_start: scan.skipStart,
+        skip_offset: scan.skipOffset,
       });
       state.db.exec('COMMIT');
       return { held: false };
@@ -443,6 +475,11 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<void
   const namespace = collectorNamespace(input.config.api_url, input.token);
   const state = openCollectorState(input.config.state_dir);
   try {
+    // 不正session_idは収集境界で拒否し、source/sessionを保存せず他のsessionの送信を妨げない。
+    if (!isStorableIdentifier(input.hook.session_id)) {
+      recordDiagnostic(state, namespace, 'session_invalid_identifier', NO_OFFSET);
+      return;
+    }
     const repository = resolveRepositoryFromCwd(input.hook.cwd);
     const project = repository === null ? undefined : input.config.projects.find((candidate) => candidate.repository === repository);
     if (repository === null || project === undefined) {
