@@ -45,6 +45,10 @@ const isRemote = command.length === 3 && command[0] === 'config' && command[1] =
 if (!isToplevel && !isRemote) {
   fail('unsupported subcommand: ' + command.join(' '), 2);
 }
+// 実gitと同じく、移動・削除されたcwdではrepositoryを解決できない。
+if (!fs.existsSync(directory)) {
+  process.exit(1);
+}
 const mappingFile = process.env.YORI_GIT_FIXTURE_FILE;
 if (!mappingFile) {
   fail('YORI_GIT_FIXTURE_FILE is not set', 2);
