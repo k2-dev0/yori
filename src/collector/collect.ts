@@ -360,6 +360,11 @@ export function ingestTranscript(
     recordDiagnostic(state, input.namespace, 'session_invalid_identifier', NO_OFFSET);
     return { held: true };
   }
+  // server契約を超えるscopeはsource/session/outboxを作らず保留し、他projectの送信を妨げない。
+  if (!isStorableIdentifier(input.repository)) {
+    recordDiagnostic(state, input.namespace, 'scope_invalid_identifier', NO_OFFSET);
+    return { held: true };
+  }
   const existing = getSession(state, input.namespace, input.source, input.hook.session_id);
   if (existing !== undefined && (existing.source_scope !== input.repository || existing.project_id !== input.projectId)) {
     recordDiagnostic(state, input.namespace, 'source_project_reassignment', NO_OFFSET);
