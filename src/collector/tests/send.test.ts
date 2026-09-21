@@ -7,6 +7,7 @@ import { collectFromHook, flushCollector } from '../collect.js';
 import {
   ackBodyFor,
   ackResponse,
+  appendTranscript,
   buildHook,
   codexMessageLine,
   codexSessionLine,
@@ -50,6 +51,7 @@ describe('outbox送信', () => {
         (request) => jsonResponse(202, ackBodyFor(request, () => ({ revision: 99 }))),
         (request) => jsonResponse(202, ackBodyFor(request, () => ({ message_id: null }))),
         (request) => jsonResponse(202, ackBodyFor(request, () => ({ message_id: '' }))),
+        (request) => jsonResponse(202, ackBodyFor(request, () => ({ message_id: 'not-a-uuid' }))),
         (request) => jsonResponse(202, ackBodyFor(request, () => ({ request_id: 42 }))),
         (request) => jsonResponse(202, ackBodyFor(request, () => ({ request_id: '' }))),
         (request) => {
@@ -123,6 +125,47 @@ describe('outbox送信', () => {
         assert.equal(request.body, originalBody);
         assert.equal(request.headers.authorization, 'Bearer token-a');
       }
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('恒久エラーはfailedとして自動collectを抑止し、明示flushのackで復帰する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(() => jsonResponse(401, { error: { code: 'unauthorized' } }));
+    const transcript = path.join(fixture.root, 'codex.jsonl');
+    const hook = buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir });
+    try {
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '最初の本文' }),
+      ]);
+      await collectFromHook({ source: 'codex', hook, config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '恒久エラーの初回collectが送信していない');
+
+      // failed中は新規発言を取り込んでも自動collectで送信しない（backoff待ちとは別の抑止）。
+      await appendTranscript(transcript, `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: '次の本文' })}\n`);
+      await collectFromHook({ source: 'codex', hook, config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, 'failed中の自動collectが再送している');
+
+      // 明示flushはfailedでも再試行し、ackでfailedを解除する。
+      mock.setResponder(ackResponse);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 2);
+      const [batch] = parseSentBatches([mock.requests[1]]);
+      assert.deepEqual(
+        batch.events.map((event) => event.source_message_id),
+        ['item-1', 'item-2'],
+      );
+
+      await appendTranscript(transcript, `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-3', role: 'user', text: '復帰後の本文' })}\n`);
+      await collectFromHook({ source: 'codex', hook, config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 3, 'ack後にfailedが解除されず自動collectが抑止されている');
+      assert.deepEqual(
+        sentEvents([mock.requests[2]]).map((event) => event.source_message_id),
+        ['item-3'],
+      );
     } finally {
       mock.restore();
       await fixture.cleanup();
