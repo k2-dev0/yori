@@ -742,7 +742,7 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 | M3〜M7 | 未実装。分類・検索振分けworker、文書分割・埋め込み、検索、MCP、入力時点の自動先行検索、関連根拠探索 |
 | M8 | 未実装。再索引・世代切替・VM配置・HTTPS・資源監視・性能検証 |
 
-検証: 収集単独44件、既存API/DBと収集を含む111件、配置・永続化7件が成功。typecheck/lint/build成功。外部AIへ実データ送信なし。対応確認版はCodex Desktop `0.155.0-alpha.9.2`とClaude Code `2.1.220`。未知版は保留。実Gitの既存repository解決は確認したが、実worktree作成のスモークは環境の`.git`保護により未確認。Stop時点でまだログにない発言は次のhookまたは明示flushで回収するため、M6の即時検索完了とは扱わない。
+検証: 収集単独57件、既存API/DBと収集を含む124件、配置・永続化7件が成功。typecheck/lint/build成功。外部AIへ実データ送信なし。対応確認版はCodex Desktop `0.155.0-alpha.9.2`とClaude Code `2.1.220`。未知版は保留。実Gitの既存repository解決は確認したが、実worktree作成のスモークは環境の`.git`保護により未確認。Stop時点でまだログにない発言は次のhookまたは明示flushで回収するため、M6の即時検索完了とは扱わない。
 
 ## 13. 必須の受け入れ条件
 
