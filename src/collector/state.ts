@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS file_cursors (
   file_size INTEGER NOT NULL,
   fingerprint_length INTEGER NOT NULL,
   fingerprint TEXT NOT NULL,
+  skip_start INTEGER,
+  skip_offset INTEGER,
   PRIMARY KEY (namespace, source, source_session_id, transcript_path)
 );
 CREATE TABLE IF NOT EXISTS stored_messages (
@@ -111,6 +113,22 @@ export function collectorNamespace(apiUrl: string, token: string): string {
   return createHash('sha256').update(`${apiUrl}\n${createHash('sha256').update(token, 'utf8').digest('hex')}`, 'utf8').digest('hex');
 }
 
+// 既存stateのtableへ不足している列だけを後方互換で追加する。既存行はNULLのまま扱う。
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const hasColumn = () => db.prepare(`PRAGMA table_info(${table})`).all().some((row) => String(row.name) === column);
+  if (hasColumn()) {
+    return;
+  }
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (error) {
+    // 並行openで先に追加された場合は、追加済みなら成功として扱う。
+    if (!hasColumn()) {
+      throw error;
+    }
+  }
+}
+
 // state_dirとSQLiteファイルを作成（0700/0600）し、schemaを用意して開く。
 export function openCollectorState(stateDir: string): CollectorState {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -127,6 +145,9 @@ export function openCollectorState(stateDir: string): CollectorState {
     // 既定journalのまま継続する
   }
   db.exec(SCHEMA_SQL);
+  // oversize行の読み捨て位置を保持する列は、旧stateではCREATE TABLE IF NOT EXISTSで追加されない。
+  ensureColumn(db, 'file_cursors', 'skip_start', 'INTEGER');
+  ensureColumn(db, 'file_cursors', 'skip_offset', 'INTEGER');
   return { stateDir, dbPath, db };
 }
 
@@ -178,6 +199,9 @@ export interface CursorRow {
   file_size: number;
   fingerprint_length: number;
   fingerprint: string;
+  // 1MiB超の行を読み捨てている間だけ、元の行startと読取済みoffsetを保持する。
+  skip_start: number | null;
+  skip_offset: number | null;
 }
 
 export interface StoredMessageRow {
@@ -236,7 +260,7 @@ export function updateSessionVersion(state: CollectorState, namespace: string, s
 export function getCursor(state: CollectorState, namespace: string, source: EventSource, sessionId: string, transcriptPath: string): CursorRow | undefined {
   const row = state.db
     .prepare(
-      `SELECT byte_offset, device, inode, file_size, fingerprint_length, fingerprint
+      `SELECT byte_offset, device, inode, file_size, fingerprint_length, fingerprint, skip_start, skip_offset
          FROM file_cursors
         WHERE namespace = ? AND source = ? AND source_session_id = ? AND transcript_path = ?`,
     )
@@ -251,6 +275,8 @@ export function getCursor(state: CollectorState, namespace: string, source: Even
     file_size: Number(row.file_size),
     fingerprint_length: Number(row.fingerprint_length),
     fingerprint: String(row.fingerprint),
+    skip_start: row.skip_start === null ? null : Number(row.skip_start),
+    skip_offset: row.skip_offset === null ? null : Number(row.skip_offset),
   };
 }
 
@@ -260,15 +286,25 @@ export function upsertCursor(
   source: EventSource,
   sessionId: string,
   transcriptPath: string,
-  cursor: { byte_offset: number; device: string; inode: string; file_size: number; fingerprint_length: number; fingerprint: string },
+  cursor: {
+    byte_offset: number;
+    device: string;
+    inode: string;
+    file_size: number;
+    fingerprint_length: number;
+    fingerprint: string;
+    skip_start: number | null;
+    skip_offset: number | null;
+  },
 ): void {
   state.db
     .prepare(
-      `INSERT INTO file_cursors (namespace, source, source_session_id, transcript_path, byte_offset, device, inode, file_size, fingerprint_length, fingerprint)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO file_cursors (namespace, source, source_session_id, transcript_path, byte_offset, device, inode, file_size, fingerprint_length, fingerprint, skip_start, skip_offset)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (namespace, source, source_session_id, transcript_path) DO UPDATE SET
          byte_offset = excluded.byte_offset, device = excluded.device, inode = excluded.inode,
-         file_size = excluded.file_size, fingerprint_length = excluded.fingerprint_length, fingerprint = excluded.fingerprint`,
+         file_size = excluded.file_size, fingerprint_length = excluded.fingerprint_length, fingerprint = excluded.fingerprint,
+         skip_start = excluded.skip_start, skip_offset = excluded.skip_offset`,
     )
     .run(
       namespace,
@@ -281,6 +317,8 @@ export function upsertCursor(
       cursor.file_size,
       cursor.fingerprint_length,
       cursor.fingerprint,
+      cursor.skip_start,
+      cursor.skip_offset,
     );
 }
 
