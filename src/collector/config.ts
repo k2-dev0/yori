@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { MAX_SOURCE_IDENTIFIER_BYTES } from '../api/contract.js';
 import { normalizeRepositoryIdentifier } from './remote.js';
 
 export interface CollectorProject {
@@ -39,7 +40,14 @@ const projectSchema = z.strictObject({
     .string()
     .min(1)
     .refine((value) => normalizeRepositoryIdentifier(value) !== null, { message: 'repositoryはcanonical host/pathで指定してください' })
-    .transform((value) => normalizeRepositoryIdentifier(value) as string),
+    .transform((value) => normalizeRepositoryIdentifier(value) as string)
+    // server契約（schema.tsのsourceIdentifier）と同じく、正規化後のNUL・単独サロゲート・1024 UTF-8 bytes超を拒否する。
+    .refine((value) => !value.includes('\u0000') && !/[\uD800-\uDFFF]/u.test(value), {
+      message: 'repositoryはNULおよび単独サロゲートを指定できません',
+    })
+    .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES, {
+      message: `repositoryはUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内にしてください`,
+    }),
   project_id: z.uuid().transform((value) => value.toLowerCase()),
 });
 
