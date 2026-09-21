@@ -55,6 +55,7 @@ curl -sS -X POST http://127.0.0.1:39119/v1/events \
 - `user`ロールは原文・`classify_message` job・自動検索受付(`search_requests`)・`route_search` jobを同一トランザクションで保存し202を返す。`assistant`/`agent_report`は自動検索を作らない。
 - `text`はUnicodeコードポイントで1..65536。`message_revisions.content_hash`はUTF-8バイト列のSHA-256で、空白・改行・末尾空白を無加工で保存する。
 - `idempotency_key`・`source_scope`・`source_session_id`・`source_message_id`・`text`はNULと単独サロゲート（不正UTF-16）を400で拒否し、DBへ書かない。有効なサロゲートペアは保持する。
+- `source_scope`・`source_session_id`・`source_message_id`は、それぞれUTF-8で1024バイトまで。日本語や絵文字もバイト数で判定し、超過は切り詰めず400で拒否する。scopeにサーバーが付ける会社・社員の接頭辞は入力上限に含めない。sessionの複合索引を含めて保存可能なサイズに収めるための制限で、本文の65536コードポイント上限とは別。
 - `revision`は1から始まり、更新は`current_revision + 1`のみ。同revision同本文の再送は既存IDを返し、同revision異本文、session/sequence_no/role/occurred_atの変更、revision飛越しは409。
 - 冪等キーは(company, employee, idempotency_key)で一意。`event_receipts.request_hash`は`src/api/contract.ts`の`RECEIPT_PAYLOAD_KEYS`順のcanonical JSON（`occurred_at`は受信した文字列のまま）のSHA-256。
 
