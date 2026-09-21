@@ -1,3 +1,4 @@
+import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { z } from 'zod';
@@ -136,6 +137,7 @@ interface ScanInput {
   shouldStop: () => boolean;
   onLine: (line: string, byteOffset: number) => void;
   onOversize: (byteOffset: number) => void;
+  onInvalidUtf8: (byteOffset: number) => void;
 }
 
 // 4MiB予算の範囲で改行単位に読み、未完の末尾行はcursorへ含めない。1MiB超の行は本文を保持せず読み飛ばす。
@@ -176,7 +178,11 @@ function scanLines(input: ScanInput): { cursor: number; skipStart: number | null
         } else {
           const lineBytes = partial.length > 0 ? Buffer.concat([partial, chunk.subarray(start, newline)]) : chunk.subarray(start, newline);
           partial = Buffer.alloc(0);
-          input.onLine(lineBytes.toString('utf8'), lineStart);
+          if (isUtf8(lineBytes)) {
+            input.onLine(lineBytes.toString('utf8'), lineStart);
+          } else {
+            input.onInvalidUtf8(lineStart);
+          }
           if (input.shouldStop()) {
             stopped = true;
             cursor = lineStart;
@@ -425,6 +431,7 @@ export function ingestTranscript(
         shouldStop: () => ctx.held,
         onLine: (line, offset) => processRecord(ctx, parseLine(input.source, line), offset),
         onOversize: (offset) => recordDiagnostic(state, input.namespace, 'transcript_line_too_long', offset),
+        onInvalidUtf8: (offset) => recordDiagnostic(state, input.namespace, 'transcript_invalid_utf8', offset),
       });
       if (ctx.held) {
         // 同scanで積んだ先行message/outbox/採番/cursorは一体で戻し、保留原因の診断だけを残す。
