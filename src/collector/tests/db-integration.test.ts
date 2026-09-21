@@ -97,7 +97,8 @@ describeWithDatabase('collector → 既存APIの縦通し (DATABASE_URL必須)',
       );
       assert.equal(sessionRow.rows.length, 1);
       assert.equal(sessionRow.rows[0].source, 'codex');
-      assert.equal(sessionRow.rows[0].source_scope, 'github.test/Org/Repo');
+      // 既存APIはsource_scopeへ会社・社員の前置きを付けて保存する（src/api/events.ts）。
+      assert.equal(sessionRow.rows[0].source_scope, `v1|${workspace.companyId}|${workspace.employeeId}|github.test/Org/Repo`);
       assert.equal(sessionRow.rows[0].source_session_id, 'session-db');
       assert.equal(await countRows(pool, 'search_requests'), 1, 'user発言の自動検索受付が保存されていない');
 
