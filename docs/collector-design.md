@@ -57,3 +57,5 @@ M2ではhookをログ読取の契機にする。hook.promptやlast_assistant_mes
 node:test、既存tsx。`npm run test:src`に含まれる配置とする。独立実行は`node --import tsx --test --test-concurrency=1 'src/collector/tests/*.test.ts'`。外部HTTPはNode MockAgent相当のグローバルfetch mock又はローカルHTTP fixtureで検証し、実データ送信なし。HTTPを使う検証はサンドボックス外で実行する。DBとの縦通しは既存Fastify app.inject＋実PostgreSQL fixtureを使い、collectorが生成したbatchを既存APIへ渡して保存・重複・自動検索受付を確認する。
 
 Redは公開関数/CLIの最小stubを許可し、import失敗ではなく未実装の期待値不一致で確認する。Red後に親が1ファイル1commitとbaselineを実施。Green後に対象テスト、既存API回帰、typecheck、lint、buildを実行。独立レビューは固定commit全差分。
+
+テスト環境補足: テスト用Node slim imageにはgitがなく、実行sandboxは一時directory内の.git作成も拒否する。通常テストではテスト専用PATH内のgit fixtureで引数・cwdとremote/worktree応答を検証する。productionへの注入口は追加しない。実gitの連携はホスト上の一時repository/worktreeで別途スモーク検証する。明示flushはretry時刻を待たずfailed/pendingを再試行でき、自動collectだけがbackoffを守る。
