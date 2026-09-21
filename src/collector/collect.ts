@@ -522,9 +522,14 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
     for (const row of sources) {
       const source = row.source as EventSource;
       const sessionId = String(row.source_session_id);
+      // 元cwdが移動・削除されてrepositoryを解決できない場合は、このsourceの未読ログ再収集だけをskipする。
+      // 保存済みoutboxの送信は送信側の登録済みproject/scope検証へ委ね、blockedProjectsへ入れない。
       const repository = resolveRepositoryFromCwd(String(row.cwd));
-      const project = repository === null ? undefined : input.config.projects.find((candidate) => candidate.repository === repository);
-      if (repository === null || project === undefined) {
+      if (repository === null) {
+        continue;
+      }
+      const project = input.config.projects.find((candidate) => candidate.repository === repository);
+      if (project === undefined) {
         const session = getSession(state, namespace, source, sessionId);
         if (session !== undefined) {
           blockedProjects.add(session.project_id);
