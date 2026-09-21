@@ -25,6 +25,7 @@ const INVALID_VALUES = [
 
 // 原文だけでなく保存・identityに使う受信文字列も境界で拒否する。
 const SENSITIVE_FIELDS = ['idempotency_key', 'source_scope', 'source_session_id', 'source_message_id'] as const;
+const STORED_FIELDS = ['text', ...SENSITIVE_FIELDS] as const;
 
 before(async () => {
   await runMigrations(pool);
@@ -41,6 +42,20 @@ after(async () => {
 });
 
 describe('POST /v1/events NUL・不正UTF-16', () => {
+  for (const field of STORED_FIELDS) {
+    it(`${field}の末尾・単独のhighサロゲートを400で拒否する`, async () => {
+      for (const value of [LONE_HIGH_SURROGATE, `末尾${LONE_HIGH_SURROGATE}`, `${EMOJI}${LONE_HIGH_SURROGATE}`]) {
+        const event = buildEventInput({ [field]: value });
+        const response = await postEvents(app, {
+          token: workspace.token,
+          payload: JSON.stringify(buildEventBatch(workspace.projectId, [event])),
+        });
+        assert.equal(response.statusCode, 400, `${field}の末尾highサロゲートが拒否されない: ${response.body}`);
+        await assertNoEventWrites(pool);
+      }
+    });
+  }
+
   it('textのNUL・単独サロゲートは400で全テーブルへ書かない', async () => {
     for (const invalid of INVALID_VALUES) {
       const event = buildEventInput({ text: `前${invalid.value}後` });
