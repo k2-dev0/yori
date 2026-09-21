@@ -296,6 +296,11 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
       ctx.held = true;
       return;
     }
+    // 確認済みsession_metaの時点でsessionを作成し、発言ゼロでも対応版とscope/project束縛を残す。
+    if (!ctx.sessionExists) {
+      insertSession(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, ctx.repository, ctx.projectId);
+      ctx.sessionExists = true;
+    }
     ctx.version = record.transcript_version;
     return;
   }
