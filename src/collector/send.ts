@@ -103,7 +103,8 @@ interface QueueTarget {
 }
 
 // 1回の送信予算100件の中から、次の送信対象を選ぶ。
-// config.projectsとsource_scope/projectの対応が取れないoutbox（設定から削除・再割当）は送らず保持する。
+// 登録確認はproject_idとsource_scopeのペアで行い、同じprojectに複数repositoryがある設定もそれぞれ送る。
+// config.projectsと対応が取れないoutbox（設定から削除・再割当）は送らず保持する。
 // automaticは恒久failedとbackoff中を対象にしない。
 function selectDeliverableProject(
   input: Pick<DeliverPendingInput, 'state' | 'namespace' | 'config' | 'automatic' | 'blockedProjects'>,
@@ -117,12 +118,14 @@ function selectDeliverableProject(
         ORDER BY first_id`,
     )
     .all(input.namespace);
-  const configuredScopes = new Map(input.config.projects.map((project) => [project.project_id, project.repository]));
   const now = Date.now();
   for (const row of rows) {
     const projectId = String(row.project_id);
     const sourceScope = String(row.source_scope);
-    if (configuredScopes.get(projectId) !== sourceScope) {
+    const configured = input.config.projects.some(
+      (project) => project.project_id === projectId && project.repository === sourceScope,
+    );
+    if (!configured) {
       continue;
     }
     if (input.blockedProjects.has(projectId)) {
