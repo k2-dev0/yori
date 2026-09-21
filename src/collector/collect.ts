@@ -280,8 +280,9 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     updateStoredMessageRevision(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id, revision, contentHash);
   }
 
+  // 区切り文字が識別子に含まれても組の境界が崩れないよう、配列をJSONとして直列化してhashする。
   const idempotencyKey = sha256Hex(
-    [ctx.namespace, ctx.source, ctx.repository, ctx.hook.session_id, record.source_message_id, String(revision)].join('\n'),
+    JSON.stringify([ctx.namespace, ctx.source, ctx.repository, ctx.hook.session_id, record.source_message_id, String(revision)]),
   );
   enqueueOutbox(ctx.state, {
     namespace: ctx.namespace,
