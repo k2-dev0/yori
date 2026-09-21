@@ -76,4 +76,43 @@ describe('collector設定', () => {
       }),
     );
   });
+
+  it('正規化後のrepositoryをUTF-8 1024 bytesまで許可し、超過・NUL・単独サロゲートを拒否する', () => {
+    const prefix = 'github.com/Org/';
+    const boundary = `${prefix}${'a'.repeat(1024 - Buffer.byteLength(prefix, 'utf8'))}`;
+    assert.equal(Buffer.byteLength(boundary, 'utf8'), 1024);
+    assert.equal(
+      parseCollectorConfig({ ...validConfig(), projects: [{ repository: boundary, project_id: PROJECT_ID }] }).projects[0].repository,
+      boundary,
+    );
+
+    // 生のURLが長くても、scheme/userinfo/query/fragment/.gitを除いたcanonicalが上限内なら受理する。
+    const paddedUrl = `https://user:${'p'.repeat(2_000)}@github.com/Org/Repo.git?x=${'q'.repeat(2_000)}#fragment`;
+    assert.ok(Buffer.byteLength(paddedUrl, 'utf8') > 1024);
+    assert.equal(
+      parseCollectorConfig({ ...validConfig(), projects: [{ repository: paddedUrl, project_id: PROJECT_ID }] }).projects[0].repository,
+      'github.com/Org/Repo',
+    );
+
+    // 正規化後のunicodeは文字数ではなく最終UTF-8 bytesで判定する。
+    const unicodeBoundary = `${prefix}${'あ'.repeat(336)}a`;
+    assert.equal(Buffer.byteLength(unicodeBoundary, 'utf8'), 1024);
+    assert.equal(
+      parseCollectorConfig({ ...validConfig(), projects: [{ repository: unicodeBoundary, project_id: PROJECT_ID }] }).projects[0].repository,
+      unicodeBoundary,
+    );
+
+    for (const repository of [
+      `${boundary}a`,
+      `${prefix}${'あ'.repeat(337)}`,
+      `https://github.com/Org/${'a'.repeat(1024)}.git`,
+      'github.com/Org/Re\u0000po',
+      'github.com/Org/Re\uD800po',
+    ]) {
+      assert.throws(
+        () => parseCollectorConfig({ ...validConfig(), projects: [{ repository, project_id: PROJECT_ID }] }),
+        `repository ${JSON.stringify(repository)} を受理している`,
+      );
+    }
+  });
 });
