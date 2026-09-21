@@ -3,18 +3,23 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { MAX_BATCH_SIZE, MAX_EVENT_BODY_BYTES } from '../../api/contract.js';
-import { collectFromHook, flushCollector } from '../collect.js';
+import { collectFromHook, flushCollector, ingestTranscript } from '../collect.js';
+import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
 import {
   ackBodyFor,
   ackResponse,
   appendTranscript,
+  buildCollectorConfig,
   buildHook,
   codexMessageLine,
   codexSessionLine,
   createCollectorFixture,
+  createGitRepository,
   installFetchMock,
   jsonResponse,
+  makeTempDir,
   parseSentBatches,
+  removeTempDir,
   sentEvents,
   type FetchMock,
   type FetchResponder,
@@ -265,6 +270,99 @@ describe('outbox送信', () => {
     } finally {
       mock.restore();
       await fixture.cleanup();
+    }
+  });
+
+  it('同じproject_idの複数repositoryをすべて送信し、設定から外れたrepositoryのoutboxは保持する', async () => {
+    const root = await makeTempDir();
+    const projectId = randomUUID();
+    const mock = installFetchMock(ackResponse);
+    try {
+      const repoA = path.join(root, 'repo-a');
+      const repoB = path.join(root, 'repo-b');
+      await createGitRepository(repoA, 'https://github.com/Org/A.git');
+      await createGitRepository(repoB, 'https://github.com/Org/B.git');
+      const stateDir = path.join(root, 'state');
+      const config = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [
+          { repository: 'github.com/Org/A', project_id: projectId },
+          { repository: 'github.com/Org/B', project_id: projectId },
+        ],
+      });
+      const transcriptA = path.join(root, 'a.jsonl');
+      const transcriptB = path.join(root, 'b.jsonl');
+      await writeTranscript(transcriptA, [
+        codexSessionLine('session-a'),
+        codexMessageLine({ sessionId: 'session-a', messageId: 'a-1', role: 'user', text: 'repository Aの本文' }),
+      ]);
+      await writeTranscript(transcriptB, [
+        codexSessionLine('session-b'),
+        codexMessageLine({ sessionId: 'session-b', messageId: 'b-1', role: 'user', text: 'repository Bの本文' }),
+      ]);
+
+      const namespace = collectorNamespace(config.api_url, 'token-a');
+      const ingest = (state: ReturnType<typeof openCollectorState>, sessionId: string, transcriptPath: string, cwd: string, repository: string) =>
+        ingestTranscript(state, {
+          namespace,
+          source: 'codex',
+          hook: buildHook({ session_id: sessionId, transcript_path: transcriptPath, cwd }),
+          repository,
+          projectId,
+        });
+
+      // 送信前に両repository分をingestし、outboxの2ペアを並べる。
+      const state = openCollectorState(stateDir);
+      try {
+        assert.equal(ingest(state, 'session-a', transcriptA, repoA, 'github.com/Org/A').held, false);
+        assert.equal(ingest(state, 'session-b', transcriptB, repoB, 'github.com/Org/B').held, false);
+      } finally {
+        closeCollectorState(state);
+      }
+      assert.equal(mock.requests.length, 0);
+
+      await flushCollector({ config, token: 'token-a' });
+      assert.deepEqual(
+        sentEvents(mock.requests)
+          .map((event) => [event.source_scope, event.text])
+          .sort(),
+        [
+          ['github.com/Org/A', 'repository Aの本文'],
+          ['github.com/Org/B', 'repository Bの本文'],
+        ].sort(),
+      );
+
+      // 続きの発言を追加し、片方のrepositoryを設定から外しても、そのoutboxだけ保持する。
+      await appendTranscript(transcriptA, `${codexMessageLine({ sessionId: 'session-a', messageId: 'a-2', role: 'assistant', text: 'Aの続き' })}\n`);
+      await appendTranscript(transcriptB, `${codexMessageLine({ sessionId: 'session-b', messageId: 'b-2', role: 'assistant', text: 'Bの続き' })}\n`);
+      const state2 = openCollectorState(stateDir);
+      try {
+        assert.equal(ingest(state2, 'session-a', transcriptA, repoA, 'github.com/Org/A').held, false);
+        assert.equal(ingest(state2, 'session-b', transcriptB, repoB, 'github.com/Org/B').held, false);
+      } finally {
+        closeCollectorState(state2);
+      }
+
+      // 同じprojectのsourceが設定から外れている間は、既存のproject単位の保護どおりoutboxを保持する。
+      const configWithoutB = buildCollectorConfig({ state_dir: stateDir, projects: [{ repository: 'github.com/Org/A', project_id: projectId }] });
+      await flushCollector({ config: configWithoutB, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, '設定から外れたrepositoryを含むprojectのoutboxを送信している');
+      assert.ok(!mock.requests.slice(2).some((request) => request.body.includes('Bの続き')));
+
+      // 両repositoryを設定へ戻したflushで、保持していたoutboxを元のscopeへ送る。
+      await flushCollector({ config, token: 'token-a' });
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(2))
+          .map((event) => [event.source_message_id, event.source_scope])
+          .sort(),
+        [
+          ['a-2', 'github.com/Org/A'],
+          ['b-2', 'github.com/Org/B'],
+        ].sort(),
+      );
+    } finally {
+      mock.restore();
+      await removeTempDir(root);
     }
   });
 });
