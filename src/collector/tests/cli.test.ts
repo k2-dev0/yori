@@ -79,6 +79,11 @@ describe('collector CLI', () => {
       assert.ok(diagnostics.stdout.trim().length > 0, '診断結果が出力されていない');
       assert.ok(diagnostics.stdout.includes(String(lineByteOffset(lines, 2))), `診断のoffsetがない: ${diagnostics.stdout}`);
       assert.ok(!diagnostics.stdout.includes(secret), '診断へ生ログを出力している');
+      const parsedDiagnostics = JSON.parse(diagnostics.stdout) as unknown;
+      assert.ok(Array.isArray(parsedDiagnostics) && parsedDiagnostics.length > 0, '診断がJSON配列ではない');
+      assert.equal(typeof (parsedDiagnostics[0] as { code?: unknown }).code, 'string');
+      const firstOffset = (parsedDiagnostics[0] as { byteOffset?: unknown }).byteOffset;
+      assert.ok(firstOffset === null || typeof firstOffset === 'number', 'byteOffsetの型が不正');
     } finally {
       mock.restore();
       await fixture.cleanup();
