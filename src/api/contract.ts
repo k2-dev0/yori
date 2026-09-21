@@ -3,6 +3,7 @@ export const MAX_EVENT_BODY_BYTES = 1_048_576;
 export const MIN_BATCH_SIZE = 1;
 export const MAX_BATCH_SIZE = 100;
 export const MAX_TEXT_LENGTH = 65_536;
+export const MAX_SOURCE_IDENTIFIER_BYTES = 1024;
 export const AUTO_SEARCH_POLICY_VERSION = 'initial-v1';
 
 export const EVENT_SOURCES = ['codex', 'claude_code'] as const;
