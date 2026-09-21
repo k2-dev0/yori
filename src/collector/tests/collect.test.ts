@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { collectFromHook, flushCollector } from '../collect.js';
+import { collectFromHook, flushCollector, ingestTranscript } from '../collect.js';
+import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
 import { buildCollectorConfig } from './support.js';
 import {
   ackResponse,
@@ -371,6 +373,31 @@ describe('会話の収集', () => {
     }
   });
 
+  it('state_dirとSQLiteファイルを0700/0600で作成する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '権限確認' }),
+      ]);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      });
+
+      assert.equal(statSync(fixture.stateDir).mode & 0o777, 0o700, 'state_dirが0700ではない');
+      const dbPath = path.join(fixture.stateDir, 'collector.sqlite3');
+      assert.equal(statSync(dbPath).mode & 0o777, 0o600, 'SQLiteファイルが0600ではない');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('既存sourceのproject再割当を拒否し、未送信分を別案件へ流さない', async () => {
     const projectA = randomUUID();
     const projectB = randomUUID();
@@ -404,6 +431,155 @@ describe('会話の収集', () => {
     } finally {
       mock.restore();
       await fixture.cleanup();
+    }
+  });
+
+  it('同じsessionを並行collectしても同じ発言を重複して取り込まない', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '並行1' }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: '並行2' }),
+      ]);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+
+      await Promise.all([collectFromHook(options), collectFromHook(options)]);
+
+      const events = sentEvents(mock.requests);
+      const keysByMessage = new Map(events.map((event) => [event.source_message_id, event.idempotency_key]));
+      assert.deepEqual([...keysByMessage.keys()].sort(), ['item-1', 'item-2'], '同じ発言を重複して取り込んでいる');
+      assert.equal(new Set(events.map((event) => event.sequence_no)).size, 2);
+      for (const request of mock.requests) {
+        const [batch] = parseSentBatches([request]);
+        assert.equal(new Set(batch.events.map((event) => event.source_message_id)).size, batch.events.length, '同一batch内で発言が重複している');
+      }
+
+      const requestsBefore = mock.requests.length;
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, requestsBefore, '並行collect後にoutboxが残っている');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('transcriptが別inodeへ差し替わっても旧offsetを新fileへ適用せず、全発言を重複なく取り込む', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '差替え前' }),
+      ]);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 1);
+
+      // 同じpathへ別inodeのfileを置き、旧cursorのoffsetを新fileの途中として扱わないことを確認する。
+      const replacement = path.join(fixture.root, 'replacement.jsonl');
+      await writeTranscript(replacement, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '差替え前' }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: '差替え後' }),
+      ]);
+      renameSync(replacement, transcript);
+
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 2, '別inodeの全文を読み直していない');
+      assert.deepEqual(
+        sentEvents([mock.requests[1]]).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-2', 2]],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('設定から外れたprojectのoutboxは、別の登録済みprojectのcollectでも送らない', async () => {
+    const root = await makeTempDir();
+    const removedProject = randomUUID();
+    const activeProject = randomUUID();
+    const mock = installFetchMock(ackResponse);
+    try {
+      const repoA = path.join(root, 'repo-a');
+      const repoB = path.join(root, 'repo-b');
+      await createGitRepository(repoA, 'https://github.com/Org/A.git');
+      await createGitRepository(repoB, 'https://github.com/Org/B.git');
+      const stateDir = path.join(root, 'state');
+      const configA = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [{ repository: 'github.com/Org/A', project_id: removedProject }],
+      });
+      const transcriptA = path.join(root, 'a.jsonl');
+      await writeTranscript(transcriptA, [
+        codexSessionLine('session-a'),
+        codexMessageLine({ sessionId: 'session-a', messageId: 'a-1', role: 'user', text: '撤去される本文' }),
+      ]);
+      // 送信前にプロセスが落ちた状態を作る: ingestだけ行い、outboxをbackoff/failedなしで保持する。
+      const state = openCollectorState(stateDir);
+      try {
+        const result = ingestTranscript(state, {
+          namespace: collectorNamespace(configA.api_url, 'token-a'),
+          source: 'codex',
+          hook: buildHook({ session_id: 'session-a', transcript_path: transcriptA, cwd: repoA }),
+          repository: 'github.com/Org/A',
+          projectId: removedProject,
+        });
+        assert.equal(result.held, false);
+      } finally {
+        closeCollectorState(state);
+      }
+      assert.equal(mock.requests.length, 0);
+
+      // repo Aを設定から外し、repo Bだけを登録してcollectする。Aの未送信outboxは保持する。
+      const configB = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [{ repository: 'github.com/Org/B', project_id: activeProject }],
+      });
+      const transcriptB = path.join(root, 'b.jsonl');
+      await writeTranscript(transcriptB, [
+        codexSessionLine('session-b'),
+        codexMessageLine({ sessionId: 'session-b', messageId: 'b-1', role: 'user', text: 'Bの本文' }),
+      ]);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-b', transcript_path: transcriptB, cwd: repoB }),
+        config: configB,
+        token: 'token-a',
+      });
+
+      assert.equal(mock.requests.length, 1);
+      const [sentAfterRemoval] = parseSentBatches([mock.requests[0]]);
+      assert.equal(sentAfterRemoval.project_id, activeProject, '設定から外れたprojectのoutboxを送信している');
+      assert.ok(!mock.requests[0].body.includes('撤去される本文'));
+
+      // 設定へAを戻したflushでは、保持していたoutboxを元のprojectへ送信できる。
+      await flushCollector({ config: configA, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, '保持したoutboxを設定復帰後のflushで送れていない');
+      const [restored] = parseSentBatches([mock.requests[1]]);
+      assert.equal(restored.project_id, removedProject);
+      assert.deepEqual(
+        restored.events.map((event) => event.source_message_id),
+        ['a-1'],
+      );
+    } finally {
+      mock.restore();
+      await removeTempDir(root);
     }
   });
 });
