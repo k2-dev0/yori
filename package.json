@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1)",
+  "description": "社内開発会話の共有検索基盤 (M1/M2)",
   "engines": {
     "node": ">=24"
   },
@@ -14,7 +14,10 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json",
-    "migrate": "tsx src/db/migrate-cli.ts"
+    "migrate": "tsx src/db/migrate-cli.ts",
+    "collector:collect": "tsx src/collector/cli.ts collect",
+    "collector:flush": "tsx src/collector/cli.ts flush",
+    "collector:diagnostics": "tsx src/collector/cli.ts diagnostics"
   },
   "dependencies": {
     "fastify": "^5.12.5",
