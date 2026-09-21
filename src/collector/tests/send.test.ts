@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { MAX_BATCH_SIZE, MAX_EVENT_BODY_BYTES } from '../../api/contract.js';
@@ -363,6 +363,148 @@ describe('outbox送信', () => {
     } finally {
       mock.restore();
       await removeTempDir(root);
+    }
+  });
+
+  it('改行入りIDの組が衝突せず、送信失敗で両方をoutboxへ残して別keyで送る', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(() => jsonResponse(500, { error: { code: 'internal_error' } }));
+    const transcriptA = path.join(fixture.root, 'newline-a.jsonl');
+    const transcriptB = path.join(fixture.root, 'newline-b.jsonl');
+    // join('\n')では'a\nb'/'c'と'a'/'b\nc'が同じhash入力になる組。
+    const hookA = buildHook({ session_id: 'a\nb', transcript_path: transcriptA, cwd: fixture.repoDir });
+    const hookB = buildHook({ session_id: 'a', transcript_path: transcriptB, cwd: fixture.repoDir });
+    try {
+      await writeTranscript(transcriptA, [
+        codexSessionLine('a\nb'),
+        codexMessageLine({ sessionId: 'a\nb', messageId: 'c', role: 'user', text: '改行IDの本文A' }),
+      ]);
+      await writeTranscript(transcriptB, [
+        codexSessionLine('a'),
+        codexMessageLine({ sessionId: 'a', messageId: 'b\nc', role: 'user', text: '改行IDの本文B' }),
+      ]);
+
+      // 送信を失敗させ、衝突する組の両方がoutboxへ残ることを確認する。
+      await collectFromHook({ source: 'codex', hook: hookA, config: fixture.config, token: 'token-a' });
+      await collectFromHook({ source: 'codex', hook: hookB, config: fixture.config, token: 'token-a' });
+      const state = openCollectorState(fixture.stateDir);
+      try {
+        const outboxCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM outbox').get() as { count: number }).count);
+        assert.equal(outboxCount, 2, '改行入りIDの組がoutboxで衝突している');
+      } finally {
+        closeCollectorState(state);
+      }
+
+      // ackで両方を送り、keyが異なることと原文・元IDが保持されることを確認する。
+      const failedRequests = mock.requests.length;
+      mock.setResponder(ackResponse);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      const events = sentEvents(mock.requests.slice(failedRequests));
+      assert.equal(events.length, 2, '衝突する組の両方を送信していない');
+      assert.equal(new Set(events.map((event) => event.idempotency_key)).size, 2, '改行入りIDの組が同じidempotency_keyになっている');
+      assert.deepEqual(
+        events.map((event) => [event.source_session_id, event.source_message_id, event.text]).sort(),
+        [
+          ['a', 'b\nc', '改行IDの本文B'],
+          ['a\nb', 'c', '改行IDの本文A'],
+        ].sort(),
+      );
+
+      // ack後の再取込・flushではoutboxが増えず、再送もしない。
+      await collectFromHook({ source: 'codex', hook: hookA, config: fixture.config, token: 'token-a' });
+      await collectFromHook({ source: 'codex', hook: hookB, config: fixture.config, token: 'token-a' });
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, failedRequests + 1, 'ack後の再取込で同じ発言を再送している');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('先行分をack済みでも、改行位置違いのID組は後続と異なるkeyになる', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    const transcriptA = path.join(fixture.root, 'newline-a.jsonl');
+    const transcriptB = path.join(fixture.root, 'newline-b.jsonl');
+    const hookA = buildHook({ session_id: 'a\nb', transcript_path: transcriptA, cwd: fixture.repoDir });
+    const hookB = buildHook({ session_id: 'a', transcript_path: transcriptB, cwd: fixture.repoDir });
+    try {
+      await writeTranscript(transcriptA, [
+        codexSessionLine('a\nb'),
+        codexMessageLine({ sessionId: 'a\nb', messageId: 'c', role: 'user', text: '先行分の本文' }),
+      ]);
+      await writeTranscript(transcriptB, [
+        codexSessionLine('a'),
+        codexMessageLine({ sessionId: 'a', messageId: 'b\nc', role: 'user', text: '後続分の本文' }),
+      ]);
+
+      await collectFromHook({ source: 'codex', hook: hookA, config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '先行分を送信していない');
+      const firstKey = sentEvents([mock.requests[0]])[0].idempotency_key;
+
+      await collectFromHook({ source: 'codex', hook: hookB, config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, '先行ack後の後続分を送信していない');
+      const second = sentEvents([mock.requests[1]])[0];
+      assert.equal(second.source_session_id, 'a');
+      assert.equal(second.source_message_id, 'b\nc');
+      assert.notEqual(firstKey, second.idempotency_key, '改行位置違いのID組が同じkeyになっている');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('アップグレード前の方式で保存済みのoutboxは、再送でも保存済みkey・本文のまま送る', async () => {
+    const projectId = randomUUID();
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: projectId } });
+    const mock = installFetchMock(() => jsonResponse(500, { error: { code: 'internal_error' } }));
+    try {
+      const namespace = collectorNamespace(fixture.config.api_url, 'token-a');
+      // 変更前のjoin('\n')方式で生成済みのoutbox行をSQLite fixtureとして再現する。
+      const legacyKey = createHash('sha256')
+        .update([namespace, 'codex', 'github.com/Org/Repo', 'session-1', 'item-1', '1'].join('\n'))
+        .digest('hex');
+      const state = openCollectorState(fixture.stateDir);
+      try {
+        state.db
+          .prepare(
+            `INSERT INTO outbox (namespace, idempotency_key, project_id, source, source_scope, source_session_id, source_message_id, sequence_no, revision, role, occurred_at, text, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            namespace,
+            legacyKey,
+            projectId,
+            'codex',
+            'github.com/Org/Repo',
+            'session-1',
+            'item-1',
+            1,
+            1,
+            'user',
+            '2026-09-21T00:00:01.000Z',
+            'アップグレード前の本文',
+            Date.now(),
+          );
+      } finally {
+        closeCollectorState(state);
+      }
+
+      // 保存済み行の再送でもkey・bodyを再計算せず、同じ内容で送る。
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1);
+      const failedBody = mock.requests[0].body;
+      mock.setResponder(ackResponse);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 2);
+      assert.equal(mock.requests[1].body, failedBody, '保存済みoutboxの再送bodyが変わっている');
+      const [event] = sentEvents([mock.requests[1]]);
+      assert.equal(event.idempotency_key, legacyKey, '保存済みのidempotency_keyを書き換えている');
+      assert.equal(event.text, 'アップグレード前の本文', '保存済みの本文を書き換えている');
+      assert.equal(event.source_message_id, 'item-1');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
     }
   });
 });
