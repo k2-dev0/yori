@@ -4,7 +4,8 @@ import { renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { collectFromHook, flushCollector, ingestTranscript } from '../collect.js';
-import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
+import { parseCollectorConfig } from '../config.js';
+import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from '../state.js';
 import { buildCollectorConfig } from './support.js';
 import {
   ackResponse,
@@ -694,6 +695,125 @@ describe('会話の収集', () => {
         restored.events.map((event) => [event.source_session_id, event.source_message_id, event.text]),
         [['session-b', 'b-2', '再割当を待つ本文']],
       );
+    } finally {
+      mock.restore();
+      await removeTempDir(root);
+    }
+  });
+
+  it('正規化後1024 UTF-8 bytesのrepositoryを設定で受理し、source_scopeとして送信する', async () => {
+    const prefix = 'github.com/Org/';
+    const repository = `${prefix}${'a'.repeat(1024 - Buffer.byteLength(prefix, 'utf8'))}`;
+    assert.equal(Buffer.byteLength(repository, 'utf8'), 1024);
+    const projectId = randomUUID();
+    const fixture = await createCollectorFixture({ remoteUrl: `https://${repository}.git` });
+    const config = parseCollectorConfig({
+      api_url: 'https://api.example.test',
+      token_env: 'YORI_TEST_TOKEN',
+      state_dir: fixture.stateDir,
+      projects: [{ repository, project_id: projectId }],
+    });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-boundary'),
+        codexMessageLine({ sessionId: 'session-boundary', messageId: 'boundary-1', role: 'user', text: '境界識別子の本文' }),
+      ]);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-boundary', transcript_path: transcript, cwd: fixture.repoDir }),
+        config,
+        token: 'token-a',
+      });
+
+      assert.equal(mock.requests.length, 1, '1024 bytesのsource_scopeを送信していない');
+      const [batch] = parseSentBatches(mock.requests);
+      assert.equal(batch.project_id, projectId);
+      assert.deepEqual(
+        batch.events.map((event) => [event.source_scope, event.source_message_id]),
+        [[repository, 'boundary-1']],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('公開ingestTranscriptの長すぎるrepositoryはoutboxへ入れず、同じstateの別repo送信を妨げない', async () => {
+    const root = await makeTempDir();
+    const longRepository = `github.com/Org/${'a'.repeat(1010)}`;
+    assert.equal(Buffer.byteLength(longRepository, 'utf8'), 1025);
+    const longProjectId = randomUUID();
+    const normalProjectId = randomUUID();
+    const mock = installFetchMock(ackResponse);
+    try {
+      const repoDir = path.join(root, 'repo');
+      await createGitRepository(repoDir, 'https://github.com/Org/Repo.git');
+      const stateDir = path.join(root, 'state');
+      // config schemaを通らない対応表を直接組み、公開ingestの入口検証だけを確認する。
+      const config = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [
+          { repository: longRepository, project_id: longProjectId },
+          { repository: 'github.com/Org/Repo', project_id: normalProjectId },
+        ],
+      });
+      const namespace = collectorNamespace(config.api_url, 'token-a');
+      const longTranscript = path.join(root, 'long.jsonl');
+      await writeTranscript(longTranscript, [
+        codexSessionLine('session-long'),
+        codexMessageLine({ sessionId: 'session-long', messageId: 'long-1', role: 'user', text: '送ってはいけない本文' }),
+      ]);
+
+      const state = openCollectorState(stateDir);
+      try {
+        const result = ingestTranscript(state, {
+          namespace,
+          source: 'codex',
+          hook: buildHook({ session_id: 'session-long', transcript_path: longTranscript, cwd: repoDir }),
+          repository: longRepository,
+          projectId: longProjectId,
+        });
+        assert.equal(result.held, true, '長すぎるrepositoryを保留していない');
+        assert.equal(result.projectId, undefined, '保留理由へ他projectのprojectIdを付けている');
+        assert.ok(
+          listCollectorDiagnostics(state, namespace).some(
+            (diagnostic) => diagnostic.code === 'scope_invalid_identifier' && diagnostic.byteOffset === null,
+          ),
+          '長すぎるrepositoryの診断がない',
+        );
+        const outboxCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM outbox').get() as { count: number }).count);
+        const sourceCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM sources').get() as { count: number }).count);
+        const sessionCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM source_sessions').get() as { count: number }).count);
+        assert.equal(outboxCount, 0, '長すぎるrepositoryをoutboxへ保存している');
+        assert.equal(sourceCount, 0, 'sourceを保存している');
+        assert.equal(sessionCount, 0, 'sessionを保存している');
+      } finally {
+        closeCollectorState(state);
+      }
+
+      // 同じstateへ正常な別repositoryをcollectし、diagnoseしたscopeが送信を妨げないことを確認する。
+      const normalTranscript = path.join(root, 'normal.jsonl');
+      await writeTranscript(normalTranscript, [
+        codexSessionLine('session-normal'),
+        codexMessageLine({ sessionId: 'session-normal', messageId: 'normal-1', role: 'user', text: '正常repoの本文' }),
+      ]);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-normal', transcript_path: normalTranscript, cwd: repoDir }),
+        config,
+        token: 'token-a',
+      });
+      assert.equal(mock.requests.length, 1, '正常な別repositoryを送信していない');
+      const [batch] = parseSentBatches(mock.requests);
+      assert.equal(batch.project_id, normalProjectId);
+      assert.deepEqual(
+        batch.events.map((event) => [event.source_scope, event.source_message_id]),
+        [['github.com/Org/Repo', 'normal-1']],
+      );
+      await flushCollector({ config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, 'flushで再送している');
     } finally {
       mock.restore();
       await removeTempDir(root);
