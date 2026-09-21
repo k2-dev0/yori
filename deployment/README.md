@@ -1,6 +1,6 @@
 # deployment
 
-M1の通常Composeとテスト専用Compose、テスト実行手順。既存のCompose project・DB・Docker設定は変更しない。
+M1のサーバーとテスト専用Compose、M2の端末収集の導入先。既存のCompose project・DB・Docker設定は変更しない。端末への導入・設定・再送手順は [docs/collector.md](../docs/collector.md) を参照する。
 
 ## 構成
 
@@ -69,11 +69,13 @@ curl -sS -X POST http://127.0.0.1:39119/v1/events \
 - 完了はjob id・lease token・未失効lease・対象revisionが一致する場合だけ。期限切れleaseはrecoverでpendingへ戻す。
 - 一時障害は指数バックオフ+jitter/Retry-Afterでpending、恒久エラーはfailed、ポリシー未確認はblocked_policyとして保持する。
 
-## M1の実装範囲
+## 実装範囲
 
-実装済み: Compose、PostgreSQL 18+pgvector、migration、`POST /v1/events`（認証・strict検証・冪等保存・revision・自動検索受付・同一TXのjob登録）、永続jobキュー、`GET /health/live`・`GET /health/ready`、原文のコンテナ再作成後の永続化。
+M1実装済み: Compose、PostgreSQL 18+pgvector、migration、`POST /v1/events`（認証・strict検証・冪等保存・revision・自動検索受付・同一TXのjob登録）、永続jobキュー、`GET /health/live`・`GET /health/ready`、原文のコンテナ再作成後の永続化。
 
-未実装（M2以降）: MCPサーバー、Codex/Claude Code収集アダプター、Jev分類・検索振り分けの実行worker、VoyageEmbeddingProvider、決定的文書分割・埋め込み・検索・周辺探索。M1では外部Jev/Voyageへ実データを送信しない。
+M2実装済み: `src/collector/`の端末収集（Codex/Claude Codeアダプター、設定Zod検証、SQLite outbox/cursor/診断、project対応表・remote正規化、送信batch・backoff・明示再送、`collect`/`flush`/`diagnostics` CLI）。導入・設定例・対応版・再送手順は [docs/collector.md](../docs/collector.md) を参照する。
+
+未実装（M3以降）: MCPサーバー、Jev分類・検索振り分けの実行worker、VoyageEmbeddingProvider、決定的文書分割・埋め込み・検索・周辺探索。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
 
 ## テスト
 
