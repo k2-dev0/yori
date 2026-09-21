@@ -582,4 +582,121 @@ describe('会話の収集', () => {
       await removeTempDir(root);
     }
   });
+
+  it('元cwdの移動後も保存済みoutboxを同じbody・識別子で再送し、設定外のoutboxは送らない', async () => {
+    const root = await makeTempDir();
+    const projectId = randomUUID();
+    const mock = installFetchMock(() => jsonResponse(500, { error: { code: 'internal_error' } }));
+    try {
+      const repoDir = path.join(root, 'repo');
+      await createGitRepository(repoDir, 'https://github.com/Org/Repo.git');
+      const stateDir = path.join(root, 'state');
+      const config = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [{ repository: 'github.com/Org/Repo', project_id: projectId }],
+      });
+      const transcriptA = path.join(root, 'a.jsonl');
+      const transcriptB = path.join(root, 'b.jsonl');
+      await writeTranscript(transcriptA, [
+        codexSessionLine('session-a'),
+        codexMessageLine({ sessionId: 'session-a', messageId: 'a-1', role: 'user', text: 'Aの本文' }),
+      ]);
+      await writeTranscript(transcriptB, [
+        codexSessionLine('session-b'),
+        codexMessageLine({ sessionId: 'session-b', messageId: 'b-1', role: 'user', text: 'Bの本文' }),
+      ]);
+      // 送信前にプロセスが落ちた状態を作る: 2 sessionをingestだけ行い、outboxを保持する。
+      const state = openCollectorState(stateDir);
+      try {
+        for (const session of [
+          { id: 'session-a', transcript: transcriptA },
+          { id: 'session-b', transcript: transcriptB },
+        ]) {
+          const result = ingestTranscript(state, {
+            namespace: collectorNamespace(config.api_url, 'token-a'),
+            source: 'codex',
+            hook: buildHook({ session_id: session.id, transcript_path: session.transcript, cwd: repoDir }),
+            repository: 'github.com/Org/Repo',
+            projectId,
+          });
+          assert.equal(result.held, false);
+        }
+      } finally {
+        closeCollectorState(state);
+      }
+
+      // 通信失敗で2 session分のoutboxを永続化する。
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-a', transcript_path: transcriptA, cwd: repoDir }),
+        config,
+        token: 'token-a',
+      });
+      assert.equal(mock.requests.length, 1);
+      const failedBody = mock.requests[0].body;
+      const failedEvents = sentEvents([mock.requests[0]]);
+      assert.deepEqual(
+        failedEvents.map((event) => event.source_message_id),
+        ['a-1', 'b-1'],
+      );
+
+      // 元cwdを移動する。同じ設定のまま、未読ログの再収集はできないが保存済みoutboxは送れる。
+      const movedDir = path.join(root, 'repo-moved');
+      renameSync(repoDir, movedDir);
+      mock.setResponder(ackResponse);
+      await flushCollector({ config, token: 'token-a' });
+
+      assert.equal(mock.requests.length, 2, '元cwdの移動後に保存済みoutboxを再送していない');
+      assert.equal(mock.requests[1].body, failedBody, '再送bodyが保存済みのbodyと変わっている');
+      const [resend] = parseSentBatches([mock.requests[1]]);
+      assert.equal(resend.project_id, projectId);
+      assert.deepEqual(
+        resend.events.map((event) => [event.source_session_id, event.source_message_id, event.idempotency_key]),
+        failedEvents.map((event) => [event.source_session_id, event.source_message_id, event.idempotency_key]),
+        '保存済みと異なる識別子で再送している',
+      );
+
+      // ack済みのoutboxを再度送らない。
+      await flushCollector({ config, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, 'ack後に同じoutboxを二重送信している');
+
+      // 元cwdが無い状態でも、設定から削除・再割当されたoutboxは送らない。
+      await appendTranscript(transcriptB, `${codexMessageLine({ sessionId: 'session-b', messageId: 'b-2', role: 'assistant', text: '再割当を待つ本文' })}\n`);
+      const nextState = openCollectorState(stateDir);
+      try {
+        const result = ingestTranscript(nextState, {
+          namespace: collectorNamespace(config.api_url, 'token-a'),
+          source: 'codex',
+          hook: buildHook({ session_id: 'session-b', transcript_path: transcriptB, cwd: repoDir }),
+          repository: 'github.com/Org/Repo',
+          projectId,
+        });
+        assert.equal(result.held, false);
+      } finally {
+        closeCollectorState(nextState);
+      }
+
+      const removed = buildCollectorConfig({ state_dir: stateDir, projects: [] });
+      await flushCollector({ config: removed, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, '設定から削除したoutboxを送信している');
+      const reassigned = buildCollectorConfig({
+        state_dir: stateDir,
+        projects: [{ repository: 'github.com/Org/Repo', project_id: randomUUID() }],
+      });
+      await flushCollector({ config: reassigned, token: 'token-a' });
+      assert.equal(mock.requests.length, 2, '再割当後のprojectへoutboxを送信している');
+
+      // 設定を元へ戻すと、保持していたoutboxは再送できる。
+      await flushCollector({ config, token: 'token-a' });
+      assert.equal(mock.requests.length, 3, '設定復帰後のflushで保持outboxを送れていない');
+      const [restored] = parseSentBatches([mock.requests[2]]);
+      assert.deepEqual(
+        restored.events.map((event) => [event.source_session_id, event.source_message_id, event.text]),
+        [['session-b', 'b-2', '再割当を待つ本文']],
+      );
+    } finally {
+      mock.restore();
+      await removeTempDir(root);
+    }
+  });
 });
