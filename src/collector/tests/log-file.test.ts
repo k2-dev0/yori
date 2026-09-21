@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, statSync } from 'node:fs';
+import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { rename } from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -43,6 +43,74 @@ function codexPaddedLine(targetBytes: number, messageId: string): string {
 }
 
 describe('transcript差分と診断', () => {
+  it('不正UTF-8の行を置換せず除外し、両エージェントの正常な後続本文を保持する', async () => {
+    for (const source of ['codex', 'claude_code'] as const) {
+      const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+      const mock = installFetchMock(ackResponse);
+      try {
+        const transcript = path.join(fixture.root, 'invalid-utf8.jsonl');
+        const sessionId = 'utf8-session';
+        const messageLine = (id: string, text: string) => source === 'codex'
+          ? codexMessageLine({ sessionId, messageId: id, role: 'user', text })
+          : claudeMessageLine({ sessionId, uuid: id, role: 'user', content: text });
+        const prefix = source === 'codex' ? `${codexSessionLine(sessionId)}\n` : '';
+        const chunks = [Buffer.from(prefix)];
+        const invalidOffsets: number[] = [];
+        for (const [index, bytes] of [Buffer.from([0xff]), Buffer.from([0xf0, 0x80, 0x80, 0x80])].entries()) {
+          invalidOffsets.push(Buffer.concat(chunks).length);
+          const line = messageLine(`invalid-${index}`, '壊れた本文 BAD_UTF8');
+          const marker = line.indexOf('BAD_UTF8');
+          chunks.push(Buffer.from(line.slice(0, marker)), bytes, Buffer.from(`${line.slice(marker + 'BAD_UTF8'.length)}\n`));
+        }
+        // 正当に記録された置換文字も通常のUnicode本文として保持する。
+        const validText = ' 日本語😀と明示的な置換文字�\n末尾空白  ';
+        chunks.push(Buffer.from(`${messageLine('valid', validText)}\n`));
+        writeFileSync(transcript, Buffer.concat(chunks));
+        const options = { source, hook: buildHook({ session_id: sessionId, transcript_path: transcript, cwd: fixture.repoDir }), config: fixture.config, token: 'token-a' };
+        await collectFromHook(options);
+        assert.deepEqual(sentEvents(mock.requests).map((event) => [event.source_message_id, event.text, event.sequence_no]), [['valid', validText, 1]]);
+        const state = openCollectorState(fixture.stateDir);
+        try {
+          assert.deepEqual(listCollectorDiagnostics(state).filter((item) => item.code === 'transcript_invalid_utf8').map((item) => item.byteOffset), invalidOffsets);
+        } finally {
+          closeCollectorState(state);
+        }
+        await collectFromHook(options);
+        assert.equal(mock.requests.length, 1, '不正行の再読込や正常行の重複送信がある');
+      } finally {
+        mock.restore();
+        await fixture.cleanup();
+      }
+    }
+  });
+
+  it('UTF-8文字の途中で終わる末尾行は追記を待ち、完成後に原文を保持する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'partial-utf8.jsonl');
+      const text = '正常な日本語😀';
+      const complete = Buffer.from(`${codexSessionLine('utf8-session')}\n${codexMessageLine({ sessionId: 'utf8-session', messageId: 'valid', role: 'user', text })}\n`);
+      const split = complete.indexOf(Buffer.from('日')) + 1;
+      writeFileSync(transcript, complete.subarray(0, split));
+      const options = { source: 'codex' as const, hook: buildHook({ session_id: 'utf8-session', transcript_path: transcript, cwd: fixture.repoDir }), config: fixture.config, token: 'token-a' };
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 0);
+      writeFileSync(transcript, complete.subarray(split), { flag: 'a' });
+      await collectFromHook(options);
+      assert.deepEqual(sentEvents(mock.requests).map((event) => event.text), [text]);
+      const state = openCollectorState(fixture.stateDir);
+      try {
+        assert.ok(!listCollectorDiagnostics(state).some((item) => item.code === 'transcript_invalid_utf8'));
+      } finally {
+        closeCollectorState(state);
+      }
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('未完の末尾行は次回に回し、完成後に一度だけ取り込む', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
