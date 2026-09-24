@@ -360,6 +360,47 @@ async function revalidateMessage(
   return true;
 }
 
+interface RelationTuple {
+  relation: string;
+  relatedToMessageId: string;
+  relatedToRevision: number;
+}
+
+// 公開relations配列（複数target）または従来の単一relation fieldから全relationを取り出す。
+function relationTuplesOf(item: Record<string, unknown>): RelationTuple[] {
+  const tuples: RelationTuple[] = [];
+  if (Array.isArray(item.relations)) {
+    for (const entry of item.relations) {
+      const object = asObject(entry);
+      if (
+        object !== null &&
+        typeof object.relation === 'string' &&
+        typeof object.related_to_message_id === 'string' &&
+        typeof object.related_to_revision === 'number'
+      ) {
+        tuples.push({
+          relation: object.relation,
+          relatedToMessageId: object.related_to_message_id,
+          relatedToRevision: object.related_to_revision,
+        });
+      }
+    }
+  }
+  if (
+    tuples.length === 0 &&
+    typeof item.relation === 'string' &&
+    typeof item.related_to_message_id === 'string' &&
+    typeof item.related_to_revision === 'number'
+  ) {
+    tuples.push({
+      relation: item.relation,
+      relatedToMessageId: item.related_to_message_id,
+      relatedToRevision: item.related_to_revision,
+    });
+  }
+  return tuples;
+}
+
 // M7 related item 1件を検証し、有効なら内部metadataだけを除いた公開形を返す。
 async function revalidateRelatedItem(
   pool: Pool,
@@ -376,26 +417,41 @@ async function revalidateRelatedItem(
     return null;
   }
   if (sourceKind === 'correction') {
-    const relation = item.relation;
-    const relatedToMessageId = item.related_to_message_id;
-    const relatedToRevision = item.related_to_revision;
-    if (
-      typeof relation !== 'string' ||
-      typeof relatedToMessageId !== 'string' ||
-      typeof relatedToRevision !== 'number'
-    ) {
+    const tuples = relationTuplesOf(item);
+    if (tuples.length === 0) {
       return null;
     }
-    const row = await pool.query(
-      `SELECT 1
-         FROM message_relations
-        WHERE source_message_id = $1 AND source_revision = $2
-          AND target_message_id = $3 AND target_revision = $4 AND relation = $5`,
-      [messageId, revision, relatedToMessageId, relatedToRevision, relation],
-    );
-    if (row.rows.length === 0) {
+    // 複数targetのrelationを全件検証し、無効relationだけを落とす。1件でも残ればitemを保持する。
+    const validTuples: RelationTuple[] = [];
+    for (const tuple of tuples) {
+      const row = await pool.query(
+        `SELECT 1
+           FROM message_relations
+          WHERE source_message_id = $1 AND source_revision = $2
+            AND target_message_id = $3 AND target_revision = $4 AND relation = $5`,
+        [messageId, revision, tuple.relatedToMessageId, tuple.relatedToRevision, tuple.relation],
+      );
+      if (row.rows.length > 0) {
+        validTuples.push(tuple);
+      }
+    }
+    if (validTuples.length === 0) {
       return null;
     }
+    const cleaned = publicRelatedItem(item);
+    delete cleaned.relations;
+    const first = validTuples[0] as RelationTuple;
+    cleaned.relation = first.relation;
+    cleaned.related_to_message_id = first.relatedToMessageId;
+    cleaned.related_to_revision = first.relatedToRevision;
+    if (validTuples.length > 1) {
+      cleaned.relations = validTuples.map((tuple) => ({
+        relation: tuple.relation,
+        related_to_message_id: tuple.relatedToMessageId,
+        related_to_revision: tuple.relatedToRevision,
+      }));
+    }
+    return cleaned;
   } else if (sourceKind === 'explicit_session_link') {
     // 起点primary sessionからの全link経路を検証し、1辺でも無効なら落とす。
     const linkIdsRaw = item._link_ids;
@@ -533,26 +589,21 @@ async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: 
     // 収録済みcorrectionで覆えないrelationが1件でもあれば、保存結果をstaleとしてmatch全体を落とす。
     const coverage = new Set<string>();
     for (const related of relatedValid) {
-      if (related.source_kind !== 'correction' || typeof related.relation !== 'string') {
+      if (related.source_kind !== 'correction' || typeof related.message_id !== 'string' || typeof related.revision !== 'number') {
         continue;
       }
-      if (
-        typeof related.message_id !== 'string' ||
-        typeof related.revision !== 'number' ||
-        typeof related.related_to_message_id !== 'string' ||
-        typeof related.related_to_revision !== 'number'
-      ) {
-        continue;
+      // 同じ訂正messageが複数targetを覆う場合も全relation組をcoverageへ入れる。
+      for (const tuple of relationTuplesOf(related)) {
+        coverage.add(
+          correctionCoverageKey(
+            related.message_id,
+            related.revision,
+            tuple.relatedToMessageId,
+            tuple.relatedToRevision,
+            tuple.relation,
+          ),
+        );
       }
-      coverage.add(
-        correctionCoverageKey(
-          related.message_id,
-          related.revision,
-          related.related_to_message_id,
-          related.related_to_revision,
-          related.relation,
-        ),
-      );
     }
     const subjects = new Map<string, { messageId: string; revision: number }>();
     for (const item of evidence) {
