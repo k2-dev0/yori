@@ -2,7 +2,6 @@ import { z } from 'zod';
 import {
   CONTINUITIES,
   DECISION_ACTIONS,
-  JEV_RELATION_EXPLICIT_QUESTION_ID,
   JEV_SAME_CONDITIONS_QUESTION_ID,
   PRIMARY_INTENTS,
   RETENTIONS,
@@ -11,6 +10,7 @@ import {
   STATEMENT_STATUSES,
   TECHNICAL_LABELS,
   jevQuestionId,
+  jevRelationExplicitQuestionId,
   jevTechnicalLabelQuestionId,
   type JevAnswer,
   type JevChoiceQuestion,
@@ -162,11 +162,13 @@ export function buildQuestions(part: JevStatePart, candidateIds: readonly string
       criteria: SAME_CONDITION_CRITERIA,
     };
   }
-  questions[`${JEV_RELATION_EXPLICIT_QUESTION_ID}#0`] = {
-    type: 'choice',
-    instructions: `relation_targetを選んだ場合、その関係が原文に明示されているかrelation_explicitを選ぶ。`,
-    criteria: { explicit: '原文に明示', inferred: '文脈からの推定' },
-  };
+  for (const candidateId of candidateIds) {
+    questions[jevRelationExplicitQuestionId(candidateId, 0)] = {
+      type: 'choice',
+      instructions: `${partLabel}とstateの直前発言候補 ${candidateId} の関係が、原文に明示されているか文脈からの推定かをrelation_explicitで選ぶ。`,
+      criteria: { explicit: '原文に明示', inferred: '文脈からの推定' },
+    };
+  }
   return questions;
 }
 
