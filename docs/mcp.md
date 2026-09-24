@@ -25,10 +25,10 @@ token本文を設定ファイルへ保存しない。設定ファイルにはAPI
 export YORI_MCP_CONFIG=/absolute/path/to/yori-mcp.json
 export YORI_API_URL=https://yori.example.internal
 export YORI_API_TOKEN='発行されたtoken'
-npm run mcp:start
+npm run --silent mcp:start
 ```
 
-MCPホストには、リポジトリ直下で`npm run mcp:start`を起動するstdioサーバーとして登録する。ホスト固有の設定形式は対象バージョンの公式手順を確認する。標準出力はMCP protocol専用であり、設定エラーは標準エラーへ出る。
+MCPホストには、リポジトリ直下で`npm run --silent mcp:start`を起動するstdioサーバーとして登録する。`--silent`を外すとnpmの起動バナーがprotocol用の標準出力へ混ざるため、省略しない。ホスト固有の設定形式は対象バージョンの公式手順を確認する。標準出力はMCP protocol専用であり、設定エラーは標準エラーへ出る。
 
 接続先URLに資格情報、query、fragmentは指定できない。tokenをコマンド引数、設定ファイル、ログへ書かない。
 
