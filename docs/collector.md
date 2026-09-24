@@ -48,7 +48,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 
 - Codex/Claude Codeとも同じcommon input（`session_id`、`cwd`、`transcript_path`）を使う。`hook.prompt`や`last_assistant_message`から別IDを発明しない。
 - 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`の`notify`は内部でcollectも行うため、同じeventへ別のcollectを並列登録しない。今回のcollectで新規または改訂されたuser発言を特定できた場合だけ、検索結果を1回最大5秒・累計最大10秒待つ。
-- `notify`は完了結果を`hookSpecificOutput.additionalContext`として返す。Codexは現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。hook完了だけで新しいturnを強制開始しない。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。
+- `notify`は完了結果を`hookSpecificOutput.additionalContext`として返す。Codexは現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。hook完了だけで新しいturnを強制開始しない。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
 - Stop直後に未書込の最終発言は、次のhookまたは明示flushで回収する。入力直後の自動検索と現在入力のID照合はM6で実装済み。
 - 1回の入力処理はcursor・message・outboxを同一SQLite transactionで更新する。ネットワーク待機中はtransactionを保持しない。
 
