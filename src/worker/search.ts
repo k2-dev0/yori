@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import { v7 as uuidv7 } from 'uuid';
+import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
 import { completeJob, type ClaimedJob } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import {
@@ -842,23 +842,45 @@ async function saveSearchResult(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const leased = await client.query(
-      `SELECT 1 FROM jobs
+    const lockedJob = await client.query<{ message_id: string | null; session_id: string | null; payload: unknown }>(
+      `SELECT message_id, session_id, payload FROM jobs
         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()
           AND target_revision IS NOT DISTINCT FROM $3
         FOR UPDATE`,
       [input.job.id, input.job.leaseToken, input.job.targetRevision],
     );
-    if (leased.rows.length === 0) {
+    const currentJob = lockedJob.rows[0];
+    if (currentJob === undefined) {
       throw new LeaseLostError('jobのlease所有を確認できません');
     }
-    const request = await client.query<{ status: string }>('SELECT status FROM search_requests WHERE id = $1 FOR UPDATE', [input.request.id]);
-    const requestStatus = request.rows[0]?.status;
-    if (requestStatus === undefined) {
-      throw new TargetMissingError('search_requestがありません');
+    // 開始時target/requestとDB現在値のidentityを再検証する。payload objectの開始時値は信用しない。
+    if (
+      currentJob.message_id !== input.target.messageId ||
+      currentJob.session_id !== input.target.sessionId ||
+      searchRequestIdFromPayload(currentJob.payload) !== input.request.id
+    ) {
+      throw new StaleApplyError('jobのidentityまたはpayloadが変化しました');
     }
-    if (requestStatus !== 'running') {
-      throw new StaleApplyError('search_requestがrunningではありません');
+    const request = await client.query<{ status: string }>(
+      `SELECT status FROM search_requests
+        WHERE id = $1 AND status = 'running'
+          AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
+          AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8
+          AND search_action = 'new_search'
+        FOR UPDATE`,
+      [
+        input.request.id,
+        input.target.messageId,
+        input.target.targetRevision,
+        input.target.sequenceNo,
+        input.target.companyId,
+        input.target.projectId,
+        input.target.employeeId,
+        input.target.sessionId,
+      ],
+    );
+    if (request.rows.length === 0) {
+      throw new StaleApplyError('search_requestのidentityまたはscopeが変化しました');
     }
     const inputMessage = await client.query<{ current_revision: number; session_project_id: string; project_company_id: string }>(
       `SELECT m.current_revision, s.project_id AS session_project_id, p.company_id AS project_company_id
@@ -925,8 +947,22 @@ async function saveSearchResult(
       `UPDATE search_requests
           SET status = 'completed', outcome = $2, result = $3::jsonb, stage = 'completed', error_code = NULL, updated_at = now()
         WHERE id = $1 AND status = 'running'
+          AND input_id = $4 AND input_revision = $5 AND input_sequence_no = $6
+          AND company_id = $7 AND project_id = $8 AND employee_id = $9 AND session_id = $10
+          AND search_action = 'new_search'
         RETURNING id`,
-      [input.request.id, outcome, JSON.stringify(result)],
+      [
+        input.request.id,
+        outcome,
+        JSON.stringify(result),
+        input.target.messageId,
+        input.target.targetRevision,
+        input.target.sequenceNo,
+        input.target.companyId,
+        input.target.projectId,
+        input.target.employeeId,
+        input.target.sessionId,
+      ],
     );
     if (updated.rows.length === 0) {
       throw new StaleApplyError('search_requestを更新できません');
@@ -944,13 +980,13 @@ async function saveSearchResult(
   }
 }
 
-// execute_searchのpayloadから対象search_request IDを取り出す。不正ならnullを返し、対象を推測しない。
+// execute_searchのpayloadから対象search_request IDを取り出す。有効なUUID以外はnullを返し、対象を推測しない。
 export function searchRequestIdFromPayload(payload: unknown): string | null {
   if (typeof payload !== 'object' || payload === null) {
     return null;
   }
   const requestId = (payload as { search_request_id?: unknown }).search_request_id;
-  return typeof requestId === 'string' && requestId.length > 0 ? requestId : null;
+  return typeof requestId === 'string' && validateUuid(requestId) ? requestId : null;
 }
 
 // jobのmessage/revisionとsearch_requestのscope・input revision・new_searchを照合する。
