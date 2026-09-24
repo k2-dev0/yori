@@ -50,7 +50,7 @@ interface RelatedFixture {
   relation?: string;
   relatedToMessageId?: string;
   relatedToRevision?: number;
-  linkId?: string;
+  linkIds?: string[];
 }
 
 function relatedJson(input: RelatedFixture): Record<string, unknown> {
@@ -69,7 +69,7 @@ function relatedJson(input: RelatedFixture): Record<string, unknown> {
           related_to_message_id: input.relatedToMessageId,
           related_to_revision: input.relatedToRevision,
         }),
-    ...(input.linkId === undefined ? {} : { _link_id: input.linkId }),
+    ...(input.linkIds === undefined ? {} : { _link_ids: input.linkIds }),
   };
 }
 
@@ -275,7 +275,7 @@ async function seedRevalidationFixture(): Promise<RevalidationFixture> {
     occurredAt: '2026-09-21T01:03:00.000Z',
     text: 'REVAL-EXPLICIT',
     sourceKind: 'explicit_session_link',
-    linkId,
+    linkIds: [linkId],
   };
   const requestId = uuidv7();
   await insertSearchRequest({
@@ -304,6 +304,72 @@ async function seedRevalidationFixture(): Promise<RevalidationFixture> {
     explicitLinkId: linkId,
     relationId,
   };
+}
+
+interface MultiHopFixture {
+  requestId: string;
+  primary: SeededSession;
+  bMessageId: string;
+  linkAB: string;
+  linkBC: string;
+}
+
+// A(primary)→B→Cの2 hop。B/Cのrelated itemは起点からのlink ID経路を内部metadataに持つ。
+async function seedMultiHopFixture(): Promise<MultiHopFixture> {
+  const input = await seedSessionWithMessage('m7-path-input', 1, 'PATH-INPUT-QUERY', 'user');
+  const primary = await seedSessionWithMessage('m7-path-primary', 1, 'PATH-PRIMARY-ANSWER');
+  const sessionB = await seedSessionWithMessage('m7-path-b', 2, 'PATH-B');
+  const sessionC = await seedSessionWithMessage('m7-path-c', 1, 'PATH-C');
+  const linkAB = await insertLink(primary.sessionId, sessionB.sessionId, sessionB.messageId);
+  const linkBC = await insertLink(sessionB.sessionId, sessionC.sessionId, sessionC.messageId);
+  const requestId = uuidv7();
+  await insertSearchRequest({
+    requestId,
+    sessionId: input.sessionId,
+    inputMessageId: input.messageId,
+    inputRevision: 1,
+    inputSequenceNo: 1,
+    result: directResult({
+      requestId,
+      inputId: input.messageId,
+      inputRevision: 1,
+      projectId: workspace.projectId,
+      evidence: [
+        {
+          messageId: primary.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:00:00.000Z',
+          text: 'PATH-PRIMARY-ANSWER',
+          sourceKind: 'neighbor',
+        },
+      ],
+      related: [
+        {
+          messageId: sessionB.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:01:00.000Z',
+          text: 'PATH-B',
+          sourceKind: 'explicit_session_link',
+          linkIds: [linkAB],
+        },
+        {
+          messageId: sessionC.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:02:00.000Z',
+          text: 'PATH-C',
+          sourceKind: 'explicit_session_link',
+          linkIds: [linkAB, linkBC],
+        },
+      ],
+    }),
+  });
+  return { requestId, primary, bMessageId: sessionB.messageId, linkAB, linkBC };
 }
 
 function relatedTexts(body: DirectMatchBody): string[] {
@@ -436,6 +502,87 @@ describe('M7 結果取得時の再検証', () => {
     assert.equal(body.matches?.length ?? 0, 0);
   });
 
+  it('前後2以内のcorrectionが収録済みresultならGETは元根拠と訂正を同時に返す', async () => {
+    const input = await seedSessionWithMessage('m7-reval-adj-input', 1, 'ADJ-INPUT-QUERY', 'user');
+    const primary = await seedSessionWithMessage('m7-reval-adj-primary', 2, 'ADJ-PRIMARY-ANSWER');
+    const correction = await insertMessage(pool, {
+      sessionId: primary.sessionId,
+      sourceMessageId: 'msg-m7-reval-adj-correction',
+      sequenceNo: 1,
+      role: 'assistant',
+      text: 'ADJ-CORRECTION',
+    });
+    await insertRelation(correction.messageId, primary.messageId, 'change');
+    const requestId = uuidv7();
+    await insertSearchRequest({
+      requestId,
+      sessionId: input.sessionId,
+      inputMessageId: input.messageId,
+      inputRevision: 1,
+      inputSequenceNo: 1,
+      result: directResult({
+        requestId,
+        inputId: input.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: primary.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:00:00.000Z',
+            text: 'ADJ-PRIMARY-ANSWER',
+            sourceKind: 'neighbor',
+          },
+        ],
+        related: [
+          {
+            messageId: correction.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:00:30.000Z',
+            text: 'ADJ-CORRECTION',
+            sourceKind: 'correction',
+            relation: 'change',
+            relatedToMessageId: primary.messageId,
+            relatedToRevision: 1,
+          },
+        ],
+      }),
+    });
+    const response = await getSearchById(app, { token: workspace.token, id: requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'matched');
+    assert.ok(body.matches?.[0]?.evidence?.some((item) => item.message_id === primary.messageId), '元根拠がない');
+    const correctionItem = (body.matches?.[0]?.related_evidence ?? []).find((item) => item.text === 'ADJ-CORRECTION');
+    assert.ok(correctionItem, '前後2以内の訂正relatedがない');
+    assert.equal(correctionItem.source_kind, 'correction');
+    assert.equal(correctionItem.relation, 'change');
+    assert.equal(correctionItem.related_to_message_id, primary.messageId);
+  });
+
+  it('保存後に元根拠への未収録change relationが追加されたらno_matchにする', async () => {
+    const fixture = await seedRevalidationFixture();
+    const extra = await seedSessionWithMessage('m7-reval-extra', 1, 'REVAL-EXTRA', 'user');
+    await insertRelation(extra.messageId, fixture.primary.messageId, 'change');
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'no_match', '未収録correctionがあるのにmatchedを返している');
+    assert.equal(body.matches?.length ?? 0, 0);
+  });
+
+  it('保存後に訂正relatedへの未収録change relationが追加されたらno_matchにする', async () => {
+    const fixture = await seedRevalidationFixture();
+    const extra = await seedSessionWithMessage('m7-reval-extra2', 1, 'REVAL-EXTRA2', 'user');
+    await insertRelation(extra.messageId, fixture.correction.messageId, 'change');
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'no_match', '訂正への未収録correctionがあるのにmatchedを返している');
+    assert.equal(body.matches?.length ?? 0, 0);
+  });
+
   it('by-inputのdirect matchedでもrelated itemを再検証する', async () => {
     const fixture = await seedRevalidationFixture();
     const query = {
@@ -458,5 +605,30 @@ describe('M7 結果取得時の再検証', () => {
     const secondBody = second.json<DirectMatchBody & { lookup_status?: string }>();
     assert.equal(secondBody.outcome, 'matched');
     assert.ok(!relatedTexts(secondBody).includes('REVAL-NEIGHBOR'), 'by-inputで改訂済みrelatedを返している');
+  });
+
+  it('multi-hop explicitの起点linkがrevokeされたら終端Cも直接Bも落とす', async () => {
+    const fixture = await seedMultiHopFixture();
+    const before = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const beforeBody = before.json<DirectMatchBody>();
+    assert.ok(relatedTexts(beforeBody).includes('PATH-B'), '直接Bのcontextがない');
+    assert.ok(relatedTexts(beforeBody).includes('PATH-C'), '終端Cのcontextがない');
+
+    await pool.query("UPDATE session_links SET status = 'revoked', updated_at = now() WHERE id = $1", [fixture.linkAB]);
+    const after = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const afterBody = after.json<DirectMatchBody>();
+    assert.equal(afterBody.outcome, 'matched');
+    assert.ok(!relatedTexts(afterBody).includes('PATH-B'), '起点link revoke後も直接Bを返している');
+    assert.ok(!relatedTexts(afterBody).includes('PATH-C'), '起点link revoke後も終端Cを返している');
+  });
+
+  it('multi-hop explicitの起点link evidenceが改訂されたら終端Cも直接Bも落とす', async () => {
+    const fixture = await seedMultiHopFixture();
+    await advanceMessageRevision(pool, fixture.bMessageId, 'PATH-B-REVISED');
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'matched');
+    assert.ok(!relatedTexts(body).includes('PATH-B'), '起点evidence改訂後も直接Bを返している');
+    assert.ok(!relatedTexts(body).includes('PATH-C'), '起点evidence改訂後も終端Cを返している');
   });
 });
