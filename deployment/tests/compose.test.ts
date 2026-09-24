@@ -70,8 +70,12 @@ describe('deploymentのテスト構成分離', () => {
       `通常composeのデフォルト起動にtest serviceが含まれる: ${Object.keys(defaultConfig.services).join(', ')}`,
     );
     assert.ok(
-      Object.keys(defaultConfig.services).every((name) => ['api', 'db', 'migrate'].includes(name)),
+      Object.keys(defaultConfig.services).every((name) => ['api', 'db', 'migrate', 'worker'].includes(name)),
       `通常composeに想定外のserviceがある: ${Object.keys(defaultConfig.services).join(', ')}`,
+    );
+    assert.ok(
+      Object.hasOwn(defaultConfig.services, 'worker'),
+      `通常composeにworker serviceがない: ${Object.keys(defaultConfig.services).join(', ')}`,
     );
     assert.deepEqual(volumeNames(defaultConfig).sort(), [...DEV_VOLUMES].sort(), '通常composeの開発用volume名が変わっている');
 
