@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
+import { EVENT_WRITE_LOCK_NAMESPACE } from '../api/contract.js';
 import {
   BUILD_DOCUMENTS_PRIORITY,
   DEFAULT_JOB_LEASE_MS,
@@ -28,6 +29,7 @@ import {
   planEvaluations,
   type EvaluationPlan,
   type JobTarget,
+  type PriorSearch,
 } from './context.js';
 import { JevCallError, callJev, validateJevResponse } from './jev.js';
 import { aggregateEvaluations, type AggregatedEvaluation, type PartEvaluation } from './analysis.js';
@@ -37,10 +39,7 @@ class PolicyBlockedError extends Error {}
 class LeaseLostError extends Error {}
 class TargetMissingError extends Error {}
 
-interface RouteDecision {
-  kind: 'new_search' | 'reuse' | 'skip';
-  originRequestId?: string;
-}
+type RouteDecision = { kind: 'new_search' | 'skip' } | { kind: 'reuse'; priorSearch: PriorSearch };
 
 interface CachedEvaluation {
   responseModel: string;
@@ -425,6 +424,14 @@ async function applyRouteDecision(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (decision.kind === 'reuse') {
+      // イベント受付と同じ社員単位ロックを先に取り、複数入力の行ロック順の逆転を防ぐ。
+      // 外部評価は完了済みなので、このロックをHTTP待ちの間に保持しない。
+      await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [
+        EVENT_WRITE_LOCK_NAMESPACE,
+        `${target.companyId}:${target.employeeId}`,
+      ]);
+    }
     const message = await client.query<{ current_revision: number }>('SELECT current_revision FROM messages WHERE id = $1 FOR UPDATE', [
       target.messageId,
     ]);
@@ -441,14 +448,16 @@ async function applyRouteDecision(
     if (searchRequestId === null) {
       throw new TargetMissingError('search_requestがありません');
     }
-    if (decision.kind === 'reuse') {
+    // 評価した先行受付とchainをこの保存TX内で再検証し、元入力のロックをcommitまで保持する。
+    const reuse = decision.kind === 'reuse' ? await resolveReuse(client, target, decision.priorSearch) : null;
+    if (reuse?.eligible && reuse.originRequestId !== null) {
       await client.query(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, search_action = 'reuse',
                 stage = 'awaiting_reused_search', reused_from_request_id = $2, original_request_id = $2,
                 result = NULL, updated_at = now()
           WHERE id = $1`,
-        [searchRequestId, decision.originRequestId],
+        [searchRequestId, reuse.originRequestId],
       );
     } else if (decision.kind === 'skip') {
       await client.query(
@@ -532,12 +541,10 @@ async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     aggregate.searchAction === 'reuse' &&
     aggregate.sameConditions &&
     aggregate.continuity === 'same_topic' &&
-    plan.evaluations.every((evaluation) => evaluation.priorSearchIncluded)
+    plan.evaluations.every((evaluation) => evaluation.priorSearchIncluded) &&
+    plan.priorSearch !== undefined
   ) {
-    const reuse = await resolveReuse(pool, target, plan.priorSearch);
-    if (reuse.eligible && reuse.originRequestId !== null) {
-      decision = { kind: 'reuse', originRequestId: reuse.originRequestId };
-    }
+    decision = { kind: 'reuse', priorSearch: plan.priorSearch };
   }
   const condition = conditionHash(
     target,
