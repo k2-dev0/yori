@@ -2,7 +2,7 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
-import { insertProject, insertSession, resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
+import { insertProject, insertSession, resetDatabase, seedWorkspace, sha256Bytes, type WorkspaceFixture } from '../../db/tests/fixtures.js';
 import { processJob } from '../process.js';
 import {
   advanceRevision,
@@ -21,6 +21,7 @@ import {
   seedSearchRequest,
   seedSession,
   seedUserMessage,
+  sleep,
   startFakeJev,
   type EvidenceSeed,
   type FakeJevServer,
@@ -175,7 +176,125 @@ function reuseReply(): (request: Parameters<typeof jevReply>[0]) => { body: unkn
   });
 }
 
+// 実際のDBロック待ちを観測し、固定sleepで保存前後の順序を仮定しない。
+async function waitForDatabaseBlock(blockerPid: number, waitingPid?: number): Promise<number> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ pid: number }>(
+      `SELECT pid FROM pg_stat_activity
+        WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))
+          AND ($2::integer IS NULL OR pid = $2)`,
+      [blockerPid, waitingPid ?? null],
+    );
+    if (result.rows[0]) {
+      return result.rows[0].pid;
+    }
+    await sleep(10);
+  }
+  assert.fail('対象トランザクションのロック待ちを観測できない');
+}
+
+// 直近受付またはchainの元入力を改訂する、保存競合用の組を作る。
+async function seedPersistencePair(viaChain: boolean) {
+  const chain = viaChain ? await seedReuseChain() : undefined;
+  const pair: PairSeed = chain
+    ? {
+        priorSessionId: chain.current.sessionId,
+        evidenceMessageId: chain.evidenceMessageId,
+        priorRequestId: chain.originRequestId,
+        current: chain.current,
+      }
+    : await seedPair();
+  const origin = await pool.query<{ input_id: string }>('SELECT input_id FROM search_requests WHERE id = $1', [pair.priorRequestId]);
+  return { pair, changedInputId: origin.rows[0].input_id };
+}
+
 describe('再利用の制限', () => {
+  for (const viaChain of [false, true]) {
+    const label = viaChain ? 'chainの元入力' : '直近入力';
+
+    it(`保存の行ロック待ち中に${label}が改訂されたらnew_searchへ戻す`, async () => {
+      const { pair, changedInputId } = await seedPersistencePair(viaChain);
+      const server = await startFakeJev(reuseReply());
+      const blocker = await pool.connect();
+      let processing: Promise<void> | undefined;
+      try {
+        const config = buildWorkerConfig(server.baseUrl);
+        await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl });
+        const job = await claimJobForMessage(pool, 'route_search', pair.current.messageId);
+        const baseline = await countJobsByKind(pool, 'execute_search');
+        await blocker.query('BEGIN');
+        const backend = await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        await blocker.query('SELECT id FROM messages WHERE id = $1 FOR UPDATE', [pair.current.messageId]);
+        processing = processJob(pool, job, config);
+        await waitForDatabaseBlock(backend.rows[0].pid);
+        const revisedText = '保存待機中に条件を変更';
+        await blocker.query('INSERT INTO message_revisions (message_id, revision, text, content_hash) VALUES ($1, 2, $2, $3)', [
+          changedInputId, revisedText, sha256Bytes(revisedText),
+        ]);
+        await blocker.query('UPDATE messages SET current_revision = 2 WHERE id = $1', [changedInputId]);
+        await blocker.query('COMMIT');
+        await processing;
+        const stored = await readSearchRequest(pool, pair.current.searchRequestId);
+        assert.equal(stored.search_action, 'new_search', '保存待機中に無効化された入力を再利用している');
+        assert.equal(stored.reused_from_request_id, null);
+        assert.equal(await countJobsByKind(pool, 'execute_search'), baseline + 1);
+        assert.equal(server.requests.length, 1, 'Jev評価後の保存待ちを再現していない');
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => undefined);
+        blocker.release();
+        await processing;
+        await server.close();
+      }
+    });
+
+    it(`再利用判定後も保存完了までは${label}の改訂を待たせる`, async () => {
+      const { pair, changedInputId } = await seedPersistencePair(viaChain);
+      const server = await startFakeJev(reuseReply());
+      const blocker = await pool.connect();
+      const writer = await pool.connect();
+      let processing: Promise<void> | undefined;
+      let writing: Promise<unknown> | undefined;
+      try {
+        const config = buildWorkerConfig(server.baseUrl);
+        await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl });
+        const job = await claimJobForMessage(pool, 'route_search', pair.current.messageId);
+        const baseline = await countJobsByKind(pool, 'execute_search');
+        await blocker.query('BEGIN');
+        const backend = await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        await blocker.query('SELECT id FROM search_requests WHERE id = $1 FOR UPDATE', [pair.current.searchRequestId]);
+        processing = processJob(pool, job, config);
+        const workerPid = await waitForDatabaseBlock(backend.rows[0].pid);
+        await writer.query('BEGIN');
+        const writerBackend = await writer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const revisedText = '再利用保存と競合する改訂';
+        await writer.query('INSERT INTO message_revisions (message_id, revision, text, content_hash) VALUES ($1, 2, $2, $3)', [
+          changedInputId, revisedText, sha256Bytes(revisedText),
+        ]);
+        writing = writer.query('UPDATE messages SET current_revision = 2 WHERE id = $1', [changedInputId]);
+        await waitForDatabaseBlock(workerPid, writerBackend.rows[0].pid);
+        await blocker.query('COMMIT');
+        await processing;
+        await writing;
+        await writer.query('COMMIT');
+        const stored = await readSearchRequest(pool, pair.current.searchRequestId);
+        assert.equal(stored.search_action, 'reuse', '改訂より先に確定した有効な再利用を失っている');
+        assert.equal(stored.reused_from_request_id, pair.priorRequestId);
+        assert.equal(await countJobsByKind(pool, 'execute_search'), baseline);
+        const revised = await pool.query<{ current_revision: number }>('SELECT current_revision FROM messages WHERE id = $1', [changedInputId]);
+        assert.equal(revised.rows[0].current_revision, 2, '保存完了後も改訂を妨げている');
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => undefined);
+        blocker.release();
+        await processing;
+        await writing;
+        await writer.query('ROLLBACK').catch(() => undefined);
+        writer.release();
+        await server.close();
+      }
+    });
+  }
+
   it('有効期間内のcompleted matchedは再利用し、期限切れはnew_searchにする', async () => {
     const inside = await seedPair({ priorCreatedAt: minutesAgo(5), priorExpiresAt: minutesFromNow(5) });
     const insideServer = await startFakeJev(reuseReply());
