@@ -106,7 +106,6 @@ describe('M6 MCP stdio serverとstrict入力', () => {
       for (const expected of ['search_history', 'get_search_result', 'get_evidence', 'record_case']) {
         assert.ok(names.includes(expected), `${expected}が公開されていない: ${names.join(',')}`);
       }
-      assert.ok(!names.includes('link_session'), 'M7のlink_sessionを公開している');
       for (const tool of tools) {
         assert.ok(
           typeof tool.inputSchema === 'object' && tool.inputSchema !== null,
