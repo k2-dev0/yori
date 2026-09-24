@@ -75,7 +75,7 @@ describe('worker runner', () => {
       assert.equal(request.search_action, 'new_search');
       assert.equal(await countJobsByKind(pool, 'build_documents'), 1);
       assert.equal(await countJobsByKind(pool, 'execute_search'), 1);
-      // M4以降のrunnerはclassifyとbuild_documentsを同じ外部処理laneでclaimし、execute_searchはM5までclaimしない。
+      // runnerはclassify_message・build_documents・execute_searchを同じ外部処理laneでclaimする。
       assert.equal((await readJob(pool, seeded.classifyJobId)).status, 'completed');
       assert.equal((await readJob(pool, seeded.routeJobId)).status, 'completed');
     } finally {
