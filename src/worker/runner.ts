@@ -3,9 +3,9 @@ import { DEFAULT_JOB_LEASE_MS, claimJobs, recoverExpiredJobs, renewJobLease, typ
 import type { WorkerConfig } from './config.js';
 import { processJob } from './process.js';
 
-// route/search laneはroute_searchだけ、外部処理laneはclassify_messageとbuild_documentsを1並列で扱う。
-// M5のexecute_searchはまだclaimしない。
-const EXTERNAL_KINDS: readonly JobKind[] = ['classify_message', 'build_documents'];
+// route/search laneはroute_searchだけ、外部処理laneはclassify_message・build_documents・execute_searchを
+// 1並列で扱う。検索はbuildより優先度が高いが、同じ外部処理laneで順に処理し並列数を増やさない。
+const EXTERNAL_KINDS: readonly JobKind[] = ['classify_message', 'build_documents', 'execute_search'];
 const ROUTE_KINDS: readonly JobKind[] = ['route_search'];
 const RECOVER_INTERVAL_MS = 30_000;
 
