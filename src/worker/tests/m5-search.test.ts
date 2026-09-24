@@ -1072,6 +1072,11 @@ describe('M5 順位統合とJev投入量', () => {
       (result.matches?.[0]?.evidence ?? []).some((evidence) => evidence.message_id === messageIds[0]),
       'RRF 1位の候補が代表evidenceになっていない',
     );
+    const warnings = (result.warnings ?? []) as { code?: string; excluded_count?: number }[];
+    assert.ok(
+      warnings.some((warning) => warning.code === 'candidate_limit_exceeded' && warning.excluded_count === 2),
+      `10件上限の除外warningがない: ${JSON.stringify(result.warnings)}`,
+    );
   });
 
   it('合計8,000トークン超の候補は安定順の末尾から除外しwarningへ記録する', async () => {
@@ -1113,9 +1118,101 @@ describe('M5 順位統合とJev投入量', () => {
     assert.equal(request.outcome, 'matched');
     const result = await readStoredResult(pool, seeded.requestId);
     assert.ok(Array.isArray(result.warnings) && result.warnings.length > 0, '予算除外のwarningがresult.warningsにない');
+    assert.ok(
+      (result.warnings as { code?: string }[]).some((warning) => warning.code === 'candidate_token_budget_exceeded'),
+      `token予算超過のwarning codeがない: ${JSON.stringify(result.warnings)}`,
+    );
     const jevBody = allJevRawBody(jev);
     assert.ok(jevBody.includes(markers[0]), '安定順の先頭候補を予算内に残していない');
     assert.ok(!jevBody.includes(markers[7]), '8,000トークン超でも末尾候補をJevへ送っている');
+  });
+
+  it('Jev本文予算は現在質問と候補の合計で数え、質問分を超える末尾候補をwarningで除外する', async () => {
+    const queryVector = basisVector(0, 1);
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const tokenizer = await loadVoyageTokenizer();
+    const questionText = `${exactTokenText(tokenizer, 4_000)} QBUDGET`;
+    const candidateText = exactTokenText(tokenizer, 3_000);
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const markers = ['QBUDGET-A', 'QBUDGET-B'];
+    for (const [index, marker] of markers.entries()) {
+      const text = `${marker} ${candidateText}`;
+      const message = await seedMessage(pool, {
+        sessionId: sessionA,
+        sequenceNo: index + 1,
+        role: 'assistant',
+        text: `質問予算候補-${index + 1}`,
+      });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `question-budget-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes(markers[0]), '質問分を引いた予算内の先頭候補をJevへ送っていない');
+    assert.ok(!jevBody.includes(markers[1]), '現在質問を含めた予算を超えても末尾候補をJevへ送っている');
+    const result = await readStoredResult(pool, seeded.requestId);
+    const warnings = (result.warnings ?? []) as { code?: string; excluded_count?: number }[];
+    assert.ok(
+      warnings.some((warning) => warning.code === 'candidate_token_budget_exceeded' && (warning.excluded_count ?? 0) >= 1),
+      `質問分を含むtoken予算の除外warningがない: ${JSON.stringify(result.warnings)}`,
+    );
+  });
+
+  it('現在質問だけで8,000 tokenを使い切る場合はinput_budget_exceededの恒久failedにし、no_matchにしない', async () => {
+    const queryVector = basisVector(0, 1);
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const tokenizer = await loadVoyageTokenizer();
+    // 既存fixtureの語列長では8,000 tokenを1回で作れないため、予算を使い切る長さへ連結する。
+    const questionText = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 100)}`;
+    assert.ok(tokenizer.encode(questionText).ids.length >= 8_000, '8,000 token以上の質問fixtureを作れない');
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const text = 'INPUT-BUDGET-CANDIDATE 候補本文';
+    const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'input-budget-candidate',
+      content: text,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const job = await readJob(pool, seeded.jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error_code, 'input_budget_exceeded');
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'failed');
+    assert.equal(request.error_code, 'input_budget_exceeded');
+    assert.notEqual(request.outcome, 'no_match');
+    assert.equal(request.result, null);
+    assert.equal(jev.requests.length, 0, '質問だけで予算超過なのにJevへ送信した');
   });
 
   it('同じ原文範囲の重複候補はJevへ1件にまとめ、結果evidenceにも重複させない', async () => {
@@ -1154,6 +1251,11 @@ describe('M5 順位統合とJev投入量', () => {
       .flatMap((match) => match.evidence ?? [])
       .filter((evidence) => evidence.message_id === message.messageId).length;
     assert.equal(evidenceCount, 1, '同じ原文範囲のevidenceを結果へ重複保存した');
+    const warnings = (result.warnings ?? []) as { code?: string; excluded_count?: number }[];
+    assert.ok(
+      warnings.some((warning) => warning.code === 'duplicate_source_range_excluded' && warning.excluded_count === 1),
+      `同じ原文範囲の重複除外warningがない: ${JSON.stringify(result.warnings)}`,
+    );
   });
 });
 
@@ -1437,6 +1539,238 @@ describe('M5 provider障害の分類', () => {
   }
 });
 
+describe('M5 実行状態と障害対象', () => {
+  it('execute_searchは外部HTTPの前にrequestをrunningにし、完了後にcompletedへする', async () => {
+    const queryVector = basisVector(0, 1);
+    const gate = createExternalGate();
+    gate.armed = true;
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: async (request) => {
+        if (gate.armed) {
+          gate.armed = false;
+          gate.enter();
+          await gate.waitRelease();
+        }
+        return vectorQueryResponder(queryVector)(request);
+      },
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const text = 'RUNNING-CANDIDATE 実行状態の候補';
+    const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'running-status',
+      content: text,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'RUNNING-QUERY' });
+    const job = await claimExecuteJob(pool, seeded.jobId);
+    const processing = processJob(pool, job, config);
+    const entered = await waitForGateOrProcessing(gate, processing, EXTERNAL_WAIT_TIMEOUT_MS);
+    if (entered) {
+      const running = await readSearchRequest(pool, seeded.requestId);
+      assert.equal(running.status, 'running', '外部HTTP前にsearch_requestがrunningでない');
+      assert.equal(running.error_code, null);
+      assert.equal(running.outcome, null);
+      gate.release();
+    }
+    await processing;
+    assert.ok(entered, 'Voyage query埋め込みまで到達しなかった（runningを観測できない）');
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    assert.equal(request.error_code, null);
+    assert.equal((await readJob(pool, seeded.jobId)).status, 'completed');
+  });
+
+  it('execute_search障害はpayloadのrequestだけをfailedにし、別auto/manual requestを巻き込まない', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: (request) => ({ body: voyageBody(request.input ?? [], () => new Array<number>(VOYAGE_DIMENSIONS).fill(0)) }),
+    });
+    await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionB = await seedSession(pool, workspace);
+    const targetMessage = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 1, role: 'user', text: 'SCOPE-ERROR-QUERY' });
+    const unrelatedRequestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: sessionB,
+      inputId: targetMessage.messageId,
+      inputRevision: targetMessage.revision,
+      sequenceNo: 1,
+      searchAction: 'new_search',
+    });
+    await pool.query("UPDATE search_requests SET status = 'failed', error_code = 'seed-unrelated' WHERE id = $1", [unrelatedRequestId]);
+    const manualRequestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: sessionB,
+      inputId: targetMessage.messageId,
+      inputRevision: targetMessage.revision,
+      sequenceNo: 1,
+      trigger: 'manual',
+      searchAction: 'new_search',
+    });
+    const targetRequestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: sessionB,
+      inputId: targetMessage.messageId,
+      inputRevision: targetMessage.revision,
+      sequenceNo: 1,
+      policyVersion: 'm5-other-policy',
+      searchAction: 'new_search',
+    });
+    const jobId = await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:payload-scope:${targetRequestId}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: sessionB,
+      messageId: targetMessage.messageId,
+      targetRevision: targetMessage.revision,
+      payload: { search_request_id: targetRequestId },
+    });
+    await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+    await runExecuteSearch(pool, { jobId, config });
+
+    const target = await readSearchRequest(pool, targetRequestId);
+    assert.equal(target.status, 'failed');
+    assert.equal(target.error_code, 'provider_contract_invalid');
+    const unrelated = await readSearchRequest(pool, unrelatedRequestId);
+    assert.equal(unrelated.status, 'failed');
+    assert.equal(unrelated.error_code, 'seed-unrelated', 'payload外のauto requestを障害更新した');
+    assert.equal((await readSearchRequest(pool, manualRequestId)).status, 'pending');
+
+    assert.equal(await retryJob(pool, jobId, config), true);
+    assert.equal((await readSearchRequest(pool, targetRequestId)).status, 'pending');
+    const unrelatedAfterRetry = await readSearchRequest(pool, unrelatedRequestId);
+    assert.equal(unrelatedAfterRetry.status, 'failed');
+    assert.equal(unrelatedAfterRetry.error_code, 'seed-unrelated', 'retryJobがpayload外のauto requestを再開した');
+    assert.equal((await readSearchRequest(pool, manualRequestId)).status, 'pending');
+  });
+
+  it('payloadが不正なexecute_searchは無関係requestをfailedにしない', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
+    await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionB = await seedSession(pool, workspace);
+    const message = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 1, role: 'user', text: 'INVALID-PAYLOAD-QUERY' });
+    const requestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: sessionB,
+      inputId: message.messageId,
+      inputRevision: message.revision,
+      sequenceNo: 1,
+      searchAction: 'new_search',
+    });
+    const jobId = await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:invalid-payload:${uuidv7()}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: sessionB,
+      messageId: message.messageId,
+      targetRevision: message.revision,
+      payload: {},
+    });
+    await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+    await runExecuteSearch(pool, { jobId, config });
+
+    const job = await readJob(pool, jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error_code, 'target_missing');
+    const request = await readSearchRequest(pool, requestId);
+    assert.equal(request.status, 'pending', 'payload不正なexecute_searchが無関係requestをfailedにした');
+    assert.equal(request.error_code, null);
+  });
+});
+
+describe('M5 stale inputの終端', () => {
+  it('process開始時にinputが改訂済みなら外部送信なしでexpiredにし、jobを完了する', async () => {
+    const { jev, voyage, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
+    await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'STALE-START 旧input' });
+    await advanceRevision(pool, seeded.messageId, 'STALE-START 改訂後input');
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const job = await readJob(pool, seeded.jobId);
+    assert.equal(job.status, 'completed', 'stale inputのjobを完了せず再回収対象に残した');
+    assert.equal(job.error_code, null);
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'expired');
+    assert.equal(request.error_code, 'input_revision_stale');
+    assert.equal(request.outcome, null);
+    assert.equal(request.result, null, 'old input revisionの結果を保存した');
+    assert.equal(voyage.requests.length, 0, 'stale inputなのにVoyageへ送信した');
+    assert.equal(jev.requests.length, 0, 'stale inputなのにJevへ送信した');
+    const message = await pool.query<{ current_revision: number }>('SELECT current_revision FROM messages WHERE id = $1', [
+      seeded.messageId,
+    ]);
+    assert.equal(message.rows[0]?.current_revision, 2, '改訂後の新revisionを失った');
+    const stored = await pool.query<{ input_revision: number; result: unknown }>(
+      'SELECT input_revision, result FROM search_requests WHERE id = $1',
+      [seeded.requestId],
+    );
+    assert.equal(stored.rows[0]?.input_revision, 1, 'old input revisionの受付を新revisionへ流用した');
+    assert.equal(stored.rows[0]?.result, null);
+  });
+
+  it('候補判定後にinputが改訂されたらold inputの結果を保存せずexpiredにし、jobを完了する', async () => {
+    const queryVector = basisVector(0, 1);
+    const gate = createExternalGate();
+    gate.armed = true;
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      gate,
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const candidateText = 'STALE-SAVE-CANDIDATE 候補本文';
+    const candidate = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text: candidateText });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'stale-save-candidate',
+      content: candidateText,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: candidate.messageId, messageRevision: 1, startOffset: 0, endOffset: candidateText.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'STALE-SAVE 旧input' });
+    const job = await claimExecuteJob(pool, seeded.jobId);
+    const processing = processJob(pool, job, config);
+    const entered = await waitForGateOrProcessing(gate, processing, EXTERNAL_WAIT_TIMEOUT_MS);
+    if (entered) {
+      await advanceRevision(pool, seeded.messageId, 'STALE-SAVE 改訂後input');
+      gate.release();
+    }
+    await processing;
+    assert.ok(entered, 'Jev候補判定まで到達しなかった（stale保存経路を検証できない）');
+
+    const jobAfter = await readJob(pool, seeded.jobId);
+    assert.equal(jobAfter.status, 'completed', 'stale inputのjobを完了せず再回収対象に残した');
+    assert.equal(jobAfter.error_code, null);
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'expired');
+    assert.equal(request.error_code, 'input_revision_stale');
+    assert.equal(request.outcome, null);
+    assert.equal(request.result, null, 'old input revisionの候補evidenceを保存した');
+    const stored = await pool.query<{ input_revision: number; result: unknown }>(
+      'SELECT input_revision, result FROM search_requests WHERE id = $1',
+      [seeded.requestId],
+    );
+    assert.equal(stored.rows[0]?.input_revision, 1, 'old input revisionの受付を新revisionへ流用した');
+    assert.equal(stored.rows[0]?.result, null);
+  });
+});
+
 describe('M5 世代固定と再検証', () => {
   it('active generationがprovider specと不一致ならfailed/embedding_generation_mismatchにし、no_matchにしない', async () => {
     const { jev, voyage, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
@@ -1620,7 +1954,7 @@ describe('M5 世代固定と再検証', () => {
     assert.ok(!JSON.stringify(result).includes('STALE-PUB'), '非公開化した文書を結果へ保存した');
   });
 
-  it('候補判定中にleaseを失った場合はsearch_requestを更新しない', async () => {
+  it('候補判定中にleaseを失った場合はsearch_requestを更新せずrunningのまま残す', async () => {
     const queryVector = basisVector(0, 1);
     const gate = createExternalGate();
     gate.armed = true;
@@ -1656,10 +1990,13 @@ describe('M5 世代固定と再検証', () => {
     assert.ok(entered, 'Jev候補判定まで到達しなかった（M5未実行）');
 
     const request = await readSearchRequest(pool, seeded.requestId);
-    assert.equal(request.status, 'pending', 'lease喪失時にsearch_requestを完了・失敗させた');
+    assert.equal(request.status, 'running', 'lease喪失時にsearch_requestを完了・失敗・pending化した');
+    assert.equal(request.error_code, null);
     assert.equal(request.outcome, null);
     assert.equal(request.result, null);
-    assert.notEqual((await readJob(pool, seeded.jobId)).status, 'completed');
+    const storedJob = await readJob(pool, seeded.jobId);
+    assert.equal(storedJob.status, 'running', 'lease喪失後に旧ownerがjobを完了/失敗させた');
+    assert.equal(storedJob.error_code, null);
   });
 });
 
