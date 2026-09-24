@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1/M2)",
+  "description": "社内開発会話の共有検索基盤 (M1〜M4)",
   "engines": {
     "node": ">=24"
   },
@@ -24,6 +24,7 @@
     "provider:revoke": "tsx src/worker/cli.ts revoke"
   },
   "dependencies": {
+    "@huggingface/tokenizers": "0.2.0",
     "fastify": "^5.12.5",
     "pg": "^8.23.0",
     "uuid": "^13.0.2",
