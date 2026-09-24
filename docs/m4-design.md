@@ -21,7 +21,7 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 
 ## 文書生成
 
-- sessionの現行message revisionと`WORKER_POLICY_VERSION`の現行analysisだけをsequence順に使う。is_searchable=false/progress_onlyは除外する。原文は常に`message_revisions`へ残す。
+- sessionの現行message revisionと`WORKER_POLICY_VERSION`の現行analysisだけをsequence順に使う。is_searchable=false/progress_onlyは除外する。現行policyで有効なrevoke/change relationのtarget message revision（relationのsourceとtargetがともに現行revisionで、同一案件・会社内のmessage間に限る）も索引対象から除外する。原文・relationは常に保持する。
 - tokenizerはVoyage公式docsが案内する`voyageai/voyage-4-lite`の公開tokenizerを固定revisionのローカル資産（`assets/voyage-4-lite/`）として使う。実行時に会話本文を配信元へ送らない。`tokenizer_version`へasset revisionと実行library版（`voyageai/voyage-4-lite@0335ddf7698395712e3220733b4079006951cfef+@huggingface/tokenizers@0.2.0`）を記録する。依存はexact 0.2.0に固定する。
 - 目標800・上限1200・重複100トークンにprovider document prefixの予約32トークンを含める。message→paragraph→code block境界を優先し、上限を超える単一blockだけをrange付きで分割する。UTF-16サロゲートペアは割らない。
 - 単一block分割時のatom上限は、次chunkが重複window（100トークン）と区切り1トークンを保持しても上限内に収まる値にする。改行のない長文でも隣接chunkのoverlapを破棄せず、chunk全体を複製しない。
@@ -31,7 +31,7 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 - 新revisionの公開時にstale=falseへ戻して以前のready revisionをsupersededにする。
 - provider_rejected/provider_contract_invalidの恒久エラー時は、そのjobが保持するpending/embedding revisionだけをfailedにする（job lease・desired_revisionで限定）。policy blocked・retryable・stale・lease喪失ではfailedにしない。明示retry後は同じ内容のfailed revisionをpendingへ戻して実際に再埋め込みし、空完了にしない。
 - 外部HTTPの前に文書構築TXを完了する。processBuild開始時にtarget.currentRevisionとtarget.targetRevisionが不一致なら、文書計画を変更せずlease条件付きcompletedにする。
-- loadSessionMessages時点で、session全messageのcurrent_revisionと現行policyのanalysis状態（revision/policy/state_hash/is_searchable/retention）の決定的fingerprintを取得する。applyDocumentPlanはsession advisory lock取得後・書込前に、jobのrunning/lease_token/期限/target_revisionとsession fingerprintをDBで再確認し、不一致はLeaseLostError/StaleApplyErrorでrollbackする。新規message追加・原文revision・分析再分類のいずれでも適用を拒否し、desired_revision/publication/revisionを変更しない。HTTP後の既存再検証も維持する。
+- loadSessionMessages時点で、session全messageのcurrent_revisionと現行policyのanalysis状態（revision/policy/state_hash/is_searchable/retention）、および文書選別に効く有効revoke/change relation状態（relation種別・source message/revision・target revisionを決定的順序で集約）のfingerprintを取得する。applyDocumentPlanはsession advisory lock取得後・書込前に、jobのrunning/lease_token/期限/target_revisionとsession fingerprintをDBで再確認し、不一致はLeaseLostError/StaleApplyErrorでrollbackする。新規message追加・原文revision・分析再分類・有効relationの追加/変更のいずれでも適用を拒否し、desired_revision/publication/revisionを変更しない。HTTP後の既存再検証も維持する。
 
 ## VoyageEmbeddingProvider
 
@@ -55,7 +55,8 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 ## 保留（ユーザー指定）
 
 - 公開を拒否したstale応答のvectorは、同じ旧本文のexact hashに対するembedding_cache行として残り得る（stale応答自体は公開しない）。cacheはcompany_id+generation_id+operation+完全なinput hashで隔離されるため、別の本文の公開へは適用されない。
+- HTTP待ち中に同じmessage revisionのanalysisだけが変わると、次buildまで旧計画が一時公開され得る（原文・analysisは保持され、次のbuildで新しいanalysisから再計画する）。
 
 ## 検証
 
-`src/worker/tests/m4-documents.test.ts`がbuild_documents、Voyage送信契約、承認ゲート、cache、障害、外部待ち中の状態変更、runner/retryを実PostgreSQLとloopback HTTP fixtureで検証する。非先頭sourceのprogress_only再分類でのpublication削除、snapshot後のlease回収・snapshot不一致での計画適用拒否、改行なし長文のoverlapも同fileで検証する。`src/db/tests/schema.test.ts`が0004_m4.sqlのschema契約を検証する。実Voyage・実会話は送信しない。
+`src/worker/tests/m4-documents.test.ts`がbuild_documents、Voyage送信契約、承認ゲート、cache、障害、外部待ち中の状態変更、runner/retryを実PostgreSQLとloopback HTTP fixtureで検証する。非先頭sourceのprogress_only再分類でのpublication削除、snapshot後のlease回収・snapshot不一致での計画適用拒否、改行なし長文のoverlap、revoke/change relationによる索引除外と古いrevision・別policy・他relation種別の非除外も同fileで検証する。`src/db/tests/schema.test.ts`が0004_m4.sqlのschema契約を検証する。実Voyage・実会話は送信しない。
