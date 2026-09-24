@@ -113,12 +113,12 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 
 ### build_documents
 
-- sessionの現行message revisionと`initial-v1`の現行analysisだけを使い、is_searchable=false/progress_onlyを除外して決定的な検索文書を作る。詳細は[m4-design.md](m4-design.md)。
+- sessionの現行message revisionと`initial-v1`の現行analysisだけを使い、is_searchable=false/progress_onlyを除外して決定的な検索文書を作る。現行policyで有効なrevoke/change relationのtarget message revision（sourceとtargetがともに現行revisionで、同一案件・会社内のmessage間）も索引対象から除外し、原文・relationは保持する。詳細は[m4-design.md](m4-design.md)。
 - 目標800・上限1200・重複100トークン（provider document prefix予約32トークン込み）。message→paragraph→code block境界を優先し、上限超過blockだけをUTF-16 range付きで分割する。単一blockのatom上限は、次chunkが重複windowと区切りを保持しても上限内に収まる値にし、改行なし長文でも隣接chunkのoverlapを破棄しない。
 - projectの初回だけactive generationを作成/再利用して紐付ける。既存世代がconfigと不一致なら`embedding_generation_mismatch`の恒久失敗。
 - 文書構築TXの後、承認済みVoyageへ`voyage-4-lite`/input_type=document/1024/float/truncation=falseで送信する。応答index・件数・model・次元・finite・非ゼロを検証し、不正は`provider_contract_invalid`、他の4xxは`provider_rejected`でfailedにする。恒久エラー時はそのjobが保持するpending/embedding revisionだけをfailedにし、明示retryで同じrevisionをpendingへ戻して再埋め込みする。
 - 旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭に残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）で残す。source消失・message revision変更・range変更を含む制限的変更や計画から消えた文書は、外部HTTP前の文書構築TXでpublication行を削除して即時検索不能にし、成功時に作り直す。is_searchableは新desired revisionの埋め込み用にtrueを維持する。
-- processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession fingerprint（全messageのcurrent_revisionと現行policyのanalysis状態）をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionとfingerprintをDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
+- processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession fingerprint（全messageのcurrent_revision、現行policyのanalysis状態、有効revoke/change relation状態）をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionとfingerprintをDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
 - 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にstale=falseへ戻し、以前のready revisionはsupersededにする。
 - `embedding_cache`（company+generation+operation+input hash）はvector結果だけを再利用し、document/sourceのidentityを統合しない。cache hitでも承認を再確認し、未承認はblocked_policyにする。
 
@@ -147,6 +147,7 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 ## 既知の保留事項
 
 - 公開を拒否したstale応答のvectorは、同じ旧本文のexact hashに対するembedding_cache行として残り得る。stale応答自体は公開せず、cacheはcompany_id+generation_id+operation+完全なinput hashで隔離されるため別本文へ適用されない。
+- HTTP待ち中に同じmessage revisionのanalysisだけが変わると、次buildまで旧計画が一時公開され得る（原文・analysisは保持され、次のbuildで新しいanalysisから再計画する）。
 - 成功ヘッダー受信後の本文受信timeout・通信切断は恒久失敗となる。原文は保持され、明示retryで再開する。
 - 長文の複数partが同じ承認・撤回関係を示す場合、関係の根拠範囲は最初のpartだけが保存される。
 - 正常な外部応答の所要時間はヘッダー受信までを計測し、本文受信の時間を含まない。
