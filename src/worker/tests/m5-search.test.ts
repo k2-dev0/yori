@@ -1898,6 +1898,102 @@ describe('M5 実行状態と障害対象', () => {
     const request = await readSearchRequest(pool, requestId);
     assert.equal(request.status, 'pending', 'payload不正なexecute_searchが無関係requestをfailedにした');
     assert.equal(request.error_code, null);
+
+    assert.equal(await retryJob(pool, jobId, config), false, 'payload空でretryJobが再開した');
+    const jobAfter = await readJob(pool, jobId);
+    assert.equal(jobAfter.status, 'failed');
+    assert.equal(jobAfter.error_code, 'target_missing');
+    assert.equal((await readSearchRequest(pool, requestId)).status, 'pending');
+  });
+
+  it('payloadが同案件の別inputを指す場合は無関係requestをfailedへせず、retryJobもfalseにする', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
+    const sessionB = await seedSession(pool, workspace);
+    const targetMessage = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 1, role: 'user', text: 'SCOPE-B-TARGET' });
+    const otherMessage = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 2, role: 'user', text: 'SCOPE-B-OTHER' });
+    const otherRequestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: sessionB,
+      inputId: otherMessage.messageId,
+      inputRevision: otherMessage.revision,
+      sequenceNo: 2,
+      searchAction: 'new_search',
+    });
+    await pool.query("UPDATE search_requests SET status = 'failed', error_code = 'seed-other', result = $2::jsonb WHERE id = $1", [
+      otherRequestId,
+      JSON.stringify({ marker: 'keep' }),
+    ]);
+    const jobId = await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:scope-other-input:${otherRequestId}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: sessionB,
+      messageId: targetMessage.messageId,
+      targetRevision: targetMessage.revision,
+      payload: { search_request_id: otherRequestId },
+    });
+    await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+    await runExecuteSearch(pool, { jobId, config });
+
+    const job = await readJob(pool, jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error_code, 'target_missing');
+    const otherBefore = await readSearchRequest(pool, otherRequestId);
+    assert.equal(otherBefore.status, 'failed');
+    assert.equal(otherBefore.error_code, 'seed-other');
+
+    assert.equal(await retryJob(pool, jobId, config), false, 'scope不一致のpayloadでretryJobが再開した');
+    const jobAfter = await readJob(pool, jobId);
+    assert.equal(jobAfter.status, 'failed');
+    assert.equal(jobAfter.error_code, 'target_missing');
+    const otherAfter = await readSearchRequest(pool, otherRequestId);
+    assert.equal(otherAfter.status, 'failed');
+    assert.equal(otherAfter.error_code, 'seed-other', 'scope不一致のpayloadで無関係requestを更新した');
+    assert.deepEqual(otherAfter.result, { marker: 'keep' }, 'scope不一致のpayloadで無関係requestのresultを変えた');
+  });
+
+  it('payloadが別案件requestを指す場合も無関係requestを更新しない', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
+    const targetSession = await seedSession(pool, workspace);
+    const targetMessage = await seedMessage(pool, { sessionId: targetSession, sequenceNo: 1, role: 'user', text: 'SCOPE-C-TARGET' });
+    const otherProjectId = await insertProject(pool, workspace.companyId, 'repo-scope-other');
+    const otherSessionId = await insertSession(pool, { projectId: otherProjectId, employeeId: workspace.employeeId });
+    const otherMessage = await seedMessage(pool, { sessionId: otherSessionId, sequenceNo: 1, role: 'user', text: 'SCOPE-C-OTHER' });
+    const otherRequestId = await seedSearchRequest(pool, {
+      workspace: { ...workspace, projectId: otherProjectId },
+      sessionId: otherSessionId,
+      inputId: otherMessage.messageId,
+      inputRevision: otherMessage.revision,
+      sequenceNo: 1,
+      searchAction: 'new_search',
+    });
+    const jobId = await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:scope-other-project:${otherRequestId}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: targetSession,
+      messageId: targetMessage.messageId,
+      targetRevision: targetMessage.revision,
+      payload: { search_request_id: otherRequestId },
+    });
+    await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+    await runExecuteSearch(pool, { jobId, config });
+
+    const job = await readJob(pool, jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error_code, 'target_missing');
+    const otherBefore = await readSearchRequest(pool, otherRequestId);
+    assert.equal(otherBefore.status, 'pending');
+    assert.equal(otherBefore.error_code, null);
+
+    assert.equal(await retryJob(pool, jobId, config), false, '別案件payloadでretryJobが再開した');
+    const jobAfter = await readJob(pool, jobId);
+    assert.equal(jobAfter.status, 'failed');
+    assert.equal(jobAfter.error_code, 'target_missing');
+    const otherAfter = await readSearchRequest(pool, otherRequestId);
+    assert.equal(otherAfter.status, 'pending', '別案件payloadで無関係requestを更新した');
+    assert.equal(otherAfter.error_code, null);
+    assert.equal(otherAfter.result, null);
   });
 });
 
@@ -2424,6 +2520,73 @@ describe('M5 冪等とrunner', () => {
     assert.equal((await readJob(pool, seeded.jobId)).status, 'completed');
     assert.equal(voyage.requests.filter((item) => item.body.input_type === 'query').length, 1);
     assert.ok(jev.requests.length >= 1);
+  });
+});
+
+describe('M5 entity backfill', () => {
+  it('0005適用前のready文書は本文不変のbuild_documents再処理でentityを補充し、Voyage再送・新revision・publication切替を起こさない', async () => {
+    await requireM5Tables(pool);
+    const { voyage, config } = await startProviders(pool, workspace.companyId, { approveJev: false });
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 1,
+      text: 'BACKFILL src/worker/process.ts の修正',
+    });
+    await runBuildJob(pool, message.buildJobId, config);
+
+    const documents = await findReadyDocuments(pool, workspace.projectId, 'BACKFILL');
+    assert.equal(documents.length, 1, 'backfill対象のready文書がない');
+    const documentId = documents[0].id;
+    const entityKeys = async (): Promise<string[]> =>
+      (
+        await pool.query<{ entity_key: string }>('SELECT entity_key FROM document_entities WHERE document_id = $1 ORDER BY entity_key', [
+          documentId,
+        ])
+      ).rows.map((row) => row.entity_key);
+    const beforeEntities = await entityKeys();
+    assert.ok(beforeEntities.includes('src/worker/process.ts'), `backfill前のentityがない: ${JSON.stringify(beforeEntities)}`);
+    const beforeRevisions = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM search_document_revisions WHERE document_id = $1',
+      [documentId],
+    );
+    const beforePublications = await pool.query<{ revision: number; generation_id: string }>(
+      'SELECT revision, generation_id FROM document_publications WHERE document_id = $1 ORDER BY generation_id',
+      [documentId],
+    );
+    const beforeEmbeddings = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM document_embeddings WHERE document_id = $1',
+      [documentId],
+    );
+    const voyageCalls = voyage.requests.length;
+
+    // 0005適用前にreadyだった状態を模してentityだけ消す。
+    await pool.query('DELETE FROM document_entities WHERE document_id = $1', [documentId]);
+    await reopenJob(pool, message.buildJobId);
+    await runBuildJob(pool, message.buildJobId, config);
+
+    assert.deepEqual(await entityKeys(), beforeEntities, '本文不変の再処理でentityが補充されていない');
+    assert.equal(voyage.requests.length, voyageCalls, 'backfillでVoyageを再送した');
+    const afterRevisions = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM search_document_revisions WHERE document_id = $1',
+      [documentId],
+    );
+    assert.equal(afterRevisions.rows[0]?.count, beforeRevisions.rows[0]?.count, 'backfillでrevisionが増えた');
+    const afterPublications = await pool.query<{ revision: number; generation_id: string }>(
+      'SELECT revision, generation_id FROM document_publications WHERE document_id = $1 ORDER BY generation_id',
+      [documentId],
+    );
+    assert.deepEqual(afterPublications.rows, beforePublications.rows, 'backfillでpublicationが切り替わった');
+    const afterEmbeddings = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM document_embeddings WHERE document_id = $1',
+      [documentId],
+    );
+    assert.equal(afterEmbeddings.rows[0]?.count, beforeEmbeddings.rows[0]?.count, 'backfillでembeddingを作り直した');
+
+    // もう一度再処理しても増殖しない。
+    await reopenJob(pool, message.buildJobId);
+    await runBuildJob(pool, message.buildJobId, config);
+    assert.deepEqual(await entityKeys(), beforeEntities, '再実行でentityが増殖した');
   });
 });
 
