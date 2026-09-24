@@ -125,7 +125,7 @@ MCP toolはHTTP APIと同じstrict入力を受け、中央APIの成功応答をs
 
 `source_kind`は`neighbor`、`correction`、`explicit_session_link`、`inferred_session_link`のいずれか。訂正・撤回では`relation`と`related_to_*`を返し、それ以外は省略する。同じ訂正messageが複数の根拠を対象にする場合、原文は1件に保ち、全関係を`relations`へ返す。単一関係では従来の単数fieldを維持し、複数関係でも先頭関係を単数fieldへ残す。`related_evidence_ids`は`related_evidence`のmessage IDを初出順で重複除去した互換fieldとする。
 
-token予算はprimary evidenceを除く追加候補の採用判定に使う。primary evidenceは原文性を壊す切り詰めをせず、単独で6,000 tokenを超えても保持して`truncated=true`と`context_token_budget_exceeded` warningを返す。
+token予算はprimary evidenceを除く追加候補の採用判定に使う。追加候補の予算採用順は訂正・撤回、neighbor、明示session link、推定session linkとし、訂正を長い周辺発言より先に確保する。公開結果の表示順はneighbor、訂正・撤回、明示session link、推定session linkの安定順を維持する。primary evidenceは原文性を壊す切り詰めをせず、単独で6,000 tokenを超えても保持して`truncated=true`と`context_token_budget_exceeded` warningを返す。
 
 ## 補助通知
 
