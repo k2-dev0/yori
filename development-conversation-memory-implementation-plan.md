@@ -3,7 +3,7 @@
 - 文書作成日：2026-09-21
 - 対象：Codex／Claude Code と社員の会話を集約し、別の社員・別のセッションから再利用する社内システム
 - 文書の用途：別の実装エージェントへの引き継ぎ
-- 状態：M1〜M3のローカル実装・合成fixture検証済み。M3にはユーザー指定の保留事項あり（12.1節）。M0の外部SDK確認とM4〜M8は残作業。実端末への導入・実データ送信・クラウド配置・性能検証は未実施
+- 状態：M1〜M5のローカル実装・合成fixture検証済み。M3/M4にはユーザー指定の保留事項あり（12.1節）。M0の外部SDK確認とM6〜M8は残作業。実端末への導入・実データ送信・クラウド配置・性能検証は未実施
 - 改訂方針：2026-09-21、管理型の記憶・検索サービスを採用せず、PostgreSQL＋pgvectorで自作する。旧MySQL＋Supermemory案は廃止。
 - 用語：本書の「必須」は実装要件、「初期値」は設定変更可能な出発点、「将来」は今回の実装対象外
 
@@ -739,8 +739,10 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 | M0 | API受付契約とM2のフック仕様・実ログ構造を確認。Jev/Voyage/MCPのSDK・外部仕様確認は各工程で継続 |
 | M1 | 実装済み。イベント受付・認証・冪等保存・revision・永続ジョブ・自動検索受付・Compose・原文永続化 |
 | M2 | ローカル実装済み。両アダプター・登録案件の判定・SQLite未送信キューと読取位置・再送・診断CLI。合成fixtureから既存API/DBまで検証。導入は[収集手順](docs/collector.md)、確定仕様は[実装契約](docs/collector-design.md) |
-| M3 | ローカル実装済み。Jev分類・選別・関係保存、new_search/reuse/skip振り分け、評価cache、送信承認、2 lane worker・再試行CLI。合成HTTPと実PostgreSQLで検証。運用は[worker手順](docs/worker.md)、確定仕様は[実装契約](docs/m3-design.md)。build_documents/execute_searchは待機jobの登録まで |
-| M4〜M7 | 未実装。文書分割・埋め込み、検索、MCP、入力時点の自動先行検索の取得・通知、関連根拠探索 |
+| M3 | ローカル実装済み。Jev分類・選別・関係保存、new_search/reuse/skip振り分け、評価cache、送信承認、2 lane worker・再試行CLI。合成HTTPと実PostgreSQLで検証。運用は[worker手順](docs/worker.md)、確定仕様は[実装契約](docs/m3-design.md) |
+| M4 | ローカル実装済み。決定的文書分割、VoyageEmbeddingProvider、送信ゲート、世代・公開revision・原文対応・cache。確定仕様は[実装契約](docs/m4-design.md) |
+| M5 | ローカル実装済み。案件内の厳密vector検索、明示識別子完全一致、RRF、Jev候補判定、原文根拠付き結果保存、世代・revision・lease競合制御。確定仕様は[実装契約](docs/m5-design.md) |
+| M6〜M7 | 未実装。MCP/APIの入力ID照合・追加検索・結果取得・通知、短い対応記録、前後・引き継ぎ・撤回探索 |
 | M8 | 未実装。再索引・世代切替・VM配置・HTTPS・資源監視・性能検証 |
 
 検証: 収集単独63件、既存API/DBと収集を含む130件が成功。配置・永続化7件、typecheck/lint/buildも成功。外部AIへ実データ送信なし。対応確認版はCodex Desktop `0.155.0-alpha.9.2`とClaude Code `2.1.220`。未知版は保留。実Gitの既存repository解決は確認したが、実worktree作成のスモークは環境の`.git`保護により未確認。Stop時点でまだログにない発言は次のhookまたは明示flushで回収するため、M6の即時検索完了とは扱わない。
@@ -748,6 +750,8 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 ユーザー選択に基づき、リポジトリ識別子上限、不正UTF-8の非送信、元worktree消失後の保存済みキュー再送を修正。同一発言IDの過去本文を含むログの再読込による改訂増殖は、通常運用での発生条件が未確認のため修正保留。詳細は収集手順の既知の制限を参照する。
 
 M3追加後の検証: API/DB・収集・workerを含む182件、配置・永続化7件が成功。typecheck・変更pathのlint・buildも成功。再利用は先行入力の有効性確認から保存完了まで同一TXの行ロックで保護し、改訂先行/保存先行の両順序を直接/chain参照で検証。Jevの実API・実会話は使用せず、公式HTTP契約に合わせた合成fixtureで検証。成功ヘッダー受信後の本文受信timeout/通信切断が恒久失敗になる問題は、ユーザー指定により保留。原文は保持され、明示retryで再開する。複数partが同じ関係を示す場合の根拠範囲の統合と、正常応答の本文受信時間の計測も今回の対象外。詳細は[worker手順の保留事項](docs/worker.md)を参照する。
+
+M5追加後の検証: srcテスト291件、配置・永続化7件、typecheck/lint/buildが成功。M5単独35件で社員横断検索、案件境界、自己根拠除外、識別子索引、RRF、候補・token上限、no_match、承認・provider障害、世代固定、stale input、原文revision/publication/lease競合、冪等性、runnerを実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。TypeSafe公式APIのstructured state契約は確認したが、実アカウントでの候補判定疎通は未実施。
 
 ## 13. 必須の受け入れ条件
 
