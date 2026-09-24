@@ -327,6 +327,53 @@ describe('再利用の制限', () => {
     }
   });
 
+  it('manual追加検索は自動routeのprior_searchに混ぜず、autoの先行検索だけを再利用する', async () => {
+    const pair = await seedPair();
+    const priorInput = await pool.query<{ input_id: string }>('SELECT input_id FROM search_requests WHERE id = $1', [
+      pair.priorRequestId,
+    ]);
+    const priorInputId = priorInput.rows[0]?.input_id;
+    assert.ok(priorInputId, '先行入力IDがない');
+    // 同じsequenceへ、より新しいcreated_atのmanual追加検索を置く。auto限定が無いとこちらが直近として選ばれる。
+    const manualId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: pair.priorSessionId,
+      inputId: priorInputId,
+      sequenceNo: 2,
+      trigger: 'manual',
+      status: 'completed',
+      outcome: 'matched',
+      searchAction: 'new_search',
+      question: 'manualで追加した質問',
+      result: matchedResult([
+        {
+          messageId: pair.evidenceMessageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: new Date().toISOString(),
+          text: '以前の修正報告',
+        },
+      ]),
+      createdAt: minutesAgo(1),
+      expiresAt: minutesFromNow(5),
+    });
+    const server = await startFakeJev(reuseReply());
+    try {
+      await expectRouteAction(pair, server, 'reuse', 'manualを除外した自動先行検索');
+      assert.equal(server.requests.length, 1, '外部評価を経由していない');
+      assert.equal(
+        server.requests[0].body.state.prior_search?.request_id,
+        pair.priorRequestId,
+        'manual受付をprior_searchへ混ぜている',
+      );
+      const current = await readSearchRequest(pool, pair.current.searchRequestId);
+      assert.notEqual(current.reused_from_request_id, manualId, 'manual受付をreuse元にしている');
+    } finally {
+      await server.close();
+    }
+  });
+
   it('Jev応答待ち中に先行入力が改訂されたらnew_searchにする', async () => {
     const pair = await seedPair();
     const server = await startFakeJev(async (request) => {
