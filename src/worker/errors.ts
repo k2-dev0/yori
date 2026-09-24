@@ -12,3 +12,6 @@ export class StaleApplyError extends Error {}
 
 // 既存active generationが現在のprovider specと一致しない。自動切替しない恒久エラー。
 export class GenerationMismatchError extends Error {}
+
+// 対象message/revision・search_requestが存在しない、またはjobの契約と一致しない。
+export class TargetMissingError extends Error {}
