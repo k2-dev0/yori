@@ -11,6 +11,7 @@ import {
   jevChoices,
   jevReply,
   readAnalysis,
+  readEvaluations,
   readJob,
   readSearchRequest,
   seedApproval,
@@ -116,6 +117,56 @@ describe('Jev評価キャッシュ', () => {
     } finally {
       await first.close();
       await second.close();
+    }
+  });
+  it('応答modelがNULLの旧cacheは再評価し、実応答modelで置き換える', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '旧cache再評価の対象' });
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: { ...jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })), model: 'jev-actual-3' },
+    }));
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      const classifyJob = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
+      await processJob(pool, classifyJob, config);
+      assert.equal(server.requests.length, 1);
+      await pool.query('UPDATE jev_evaluations SET response_model = NULL WHERE company_id = $1', [workspace.companyId]);
+
+      const routeJob = await claimJobForMessage(pool, 'route_search', seeded.messageId);
+      await processJob(pool, routeJob, config);
+      assert.equal(server.requests.length, 2, '応答model不明の旧cacheを再利用している');
+      assert.equal((await readJob(pool, routeJob.id)).status, 'completed');
+
+      const evaluations = await readEvaluations(pool, workspace.companyId);
+      assert.equal(evaluations.length, 1, 'cache行が増えている');
+      assert.equal(evaluations[0].model, 'jev-latest', '要求modelをcache keyとして保持していない');
+      assert.equal(evaluations[0].response_model, 'jev-actual-3', '実応答modelで旧cacheを更新していない');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('cache-hitでも実応答modelを分類のmodel_versionへ伝搬する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: 'cache経由分類の対象' });
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: { ...jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })), model: 'jev-cached-9' },
+    }));
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      const routeJob = await claimJobForMessage(pool, 'route_search', seeded.messageId);
+      await processJob(pool, routeJob, config);
+      assert.equal(server.requests.length, 1);
+
+      const classifyJob = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
+      await processJob(pool, classifyJob, config);
+      assert.equal(server.requests.length, 1, 'cacheがあるのにclassifyが再評価している');
+      const analysis = await readAnalysis(pool, seeded.messageId, 1);
+      assert.ok(analysis, 'cache経由の分析が保存されていない');
+      assert.equal(analysis.model_version, 'jev-cached-9', '応答modelがcache経由で伝搬していない');
+      assert.equal(analysis.parts[0]?.model_version, 'jev-cached-9', 'partの応答modelが伝搬していない');
+    } finally {
+      await server.close();
     }
   });
 });
