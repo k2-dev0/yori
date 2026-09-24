@@ -197,6 +197,32 @@ const rawResponseSchema = z.object({
   }),
 });
 
+// 応答本文から実応答modelだけを取り出す。検証結果とは独立にusageへ記録する。推測補完はしない。
+export function extractJevResponseModel(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null) {
+    return null;
+  }
+  const model = (raw as { model?: unknown }).model;
+  return typeof model === 'string' && model.length > 0 ? model : null;
+}
+
+// 応答本文のusageだけを取り出す。不完全・不正はnullにする。
+export function extractJevUsage(raw: unknown): JevUsage {
+  if (typeof raw !== 'object' || raw === null) {
+    return { input_tokens: null, output_tokens: null };
+  }
+  const usage = (raw as { usage?: unknown }).usage;
+  if (typeof usage !== 'object' || usage === null) {
+    return { input_tokens: null, output_tokens: null };
+  }
+  const input = (usage as { input_tokens?: unknown }).input_tokens;
+  const output = (usage as { output_tokens?: unknown }).output_tokens;
+  return {
+    input_tokens: typeof input === 'number' && Number.isInteger(input) && input >= 0 ? input : null,
+    output_tokens: typeof output === 'number' && Number.isInteger(output) && output >= 0 ? output : null,
+  };
+}
+
 export interface ValidatedJevResponse {
   model: string;
   answers: Record<string, JevAnswer>;
