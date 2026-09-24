@@ -194,11 +194,12 @@ function toPriorSearch(row: PriorSearchRow): PriorSearch {
 }
 
 // 直近の先行検索を1件だけ読み、古い有効候補へ飛ばないようにする。policy/状態の適格性はreuse側で判定する。
+// manualは追加検索であり自動継続の比較対象ではないため、自動routeのprior_searchにはautoだけを使う。
 export async function loadPriorSearch(pool: Pool, target: JobTarget): Promise<PriorSearch | undefined> {
   const result = await pool.query<PriorSearchRow>(
     `${PRIOR_SEARCH_SELECT}
       WHERE sr.company_id = $1 AND sr.project_id = $2 AND sr.employee_id = $3 AND sr.session_id = $4
-        AND sr.input_sequence_no < $5
+        AND sr.input_sequence_no < $5 AND sr.trigger = 'auto'
       ORDER BY sr.input_sequence_no DESC, sr.created_at DESC, sr.id DESC
       LIMIT 1`,
     [target.companyId, target.projectId, target.employeeId, target.sessionId, target.sequenceNo],
