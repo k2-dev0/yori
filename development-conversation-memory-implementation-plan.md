@@ -758,7 +758,7 @@ M6追加後の検証: srcテスト353件、typecheck/lint/buildが成功。M6 AP
 
 M7追加後の検証: srcテスト421件、typecheck/lint/buildが成功。M7単独61件で、session linkの保存制約・外部identity解決・認証社員の引き継ぎ先境界・冪等性・根拠revision競合、HTTP/MCP `link_session`、代表根拠の前後2発言、別sessionを起点とする明示linkの両方向3 hop・合計10 session・循環検知、同社員の前後各3 sessionと共通Issue／PR候補のJev判定、撤回／訂正chain、複数target relation、訂正を優先する約6,000 token予算、保存直前とGET時のrevision・relation・active link再検証、並行入力を分離し訂正を優先するUserPromptSubmit非同期hook補助通知を実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。補助通知は安全な次のmodel入力へ追加するだけで、新しいturnを強制開始せず、MCPの明示取得を置き換えない。実端末へのhook・MCP登録は未実施。
 
-M8追加後の検証: srcテスト441件、配置契約5件、typecheck/lint/buildが成功。M8再索引16件とschema 4件で、旧activeを維持したcandidate再索引、全現行文書完了後の原子的切替、追加・改訂・除外追従、承認待ち・retry可能障害からの再開、恒久provider違反、会社・案件境界、完了済み文書の非重複、検索要求の開始世代固定、参照中世代の削除拒否、案件別vector容量・残件・DB検索p50/p95・job件数、初回世代設定・source改訂・pointer変更との競合を実PostgreSQLとloopback fixtureで検証。Caddy production profileは固定digest、80/443公開、API loopback、DB非公開、永続volume、log rotationをCompose設定で検証した。実Lightsail、実domain/DNS、実証明書取得、Caddy image pull・実起動、実Jev/Voyage・実会話、高負荷性能試験は未実施。
+M8追加後の検証: srcテスト447件、配置・永続化10件、typecheck/lint/buildが成功。M8再索引22件とschema 4件で、旧activeを維持したcandidate再索引、全現行文書完了後の原子的切替、追加・改訂・除外追従、承認待ち・retry可能障害からの再開、恒久provider違反、会社・案件境界、未完了runの再開と完了後のno-op、検索要求の開始世代固定、参照中世代の削除拒否とfailed検索retryの直列化、案件別vector容量・source現行性を含む残件・DB検索p50/p95・job件数、初回世代設定・source改訂・pointer変更・マイクロ秒時刻cursorとの競合を実PostgreSQLとloopback fixtureで検証。Caddy production profileは固定digest、80/443公開、API loopback、DB非公開、永続volume、log rotationをCompose設定で検証し、既存M1のAPI起動・DB再作成E2Eも含めて成功した。実Lightsail、実domain/DNS、実証明書取得、Caddy image pull・実起動、実Jev/Voyage・実会話、高負荷性能試験は未実施。
 
 ## 13. 必須の受け入れ条件
 
