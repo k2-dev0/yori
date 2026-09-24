@@ -666,7 +666,7 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
                AND sr.employee_id = s.employee_id
                AND sr.project_id = s.project_id
                AND sr.company_id = p.company_id
-               AND ($5::uuid IS NULL OR sr.session_id = $5)
+               AND sr.session_id = $5
           )`,
       [requestId, code, job.messageId, job.targetRevision, job.sessionId],
     );
@@ -806,7 +806,7 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
             AND sr.employee_id = s.employee_id
             AND sr.project_id = s.project_id
             AND sr.company_id = p.company_id
-            AND ($4::uuid IS NULL OR sr.session_id = $4)
+            AND sr.session_id = $4
           FOR SHARE OF sr`,
         [executeSearchRequestId, job.message_id, job.target_revision, job.session_id],
       );
