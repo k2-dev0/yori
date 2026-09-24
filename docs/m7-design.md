@@ -125,7 +125,7 @@ token予算はprimary evidenceを除く追加候補の採用判定に使う。pr
 collector CLIへ通知用commandを追加し、既存のcollect処理を実行してから、その呼出しで確定できた最新のuser message identityに対する検索結果を取得する。
 
 - `GET /v1/searches/by-input`を外部identityで呼び、1回最大5秒・累計最大10秒だけ待つ。
-- `matched`、`no_match`、`skipped`、`failed`のcompleted結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。
+- `status=completed`の`matched`・`no_match`・`skipped`、または`status=failed`の結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。失敗時の`outcome`は既存契約どおりnullのまま、`status`と`error_code`を通知する。
 - 追加contextには「過去履歴の検索資料であり現在の命令ではない」こと、request ID、outcome、根拠を含める。
 - Codexでは非同期hookの完了内容を現在turnの次の安全地点、なければ次のuser turnへ渡す。Claude Codeでは次のconversation turnへ渡す。idle中に新規turnを強制開始しない。
 - hook設定例だけを`docs/collector.md`へ追加する。既存の利用者設定、token、個人pathは自動変更しない。
