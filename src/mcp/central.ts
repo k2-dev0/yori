@@ -29,6 +29,17 @@ const evidenceResponseSchema = z.looseObject({
   text: z.string(),
 });
 
+// M7 link_sessionの成功応答。statusは公開APIのactiveだけを成功として受理する。
+const linkSessionResponseSchema = z.looseObject({
+  link_id: z.uuid(),
+  project_id: z.uuid(),
+  from_session_id: z.uuid(),
+  to_session_id: z.uuid(),
+  evidence_message_id: z.uuid(),
+  evidence_revision: z.int().min(1),
+  status: z.literal('active'),
+});
+
 const eventsResponseSchema = z.looseObject({
   results: z
     .array(
@@ -84,6 +95,20 @@ export interface GetEvidenceInput {
   project_id: string;
   message_id: string;
   revision: number;
+}
+
+export interface LinkSessionIdentity {
+  source: string;
+  source_scope: string;
+  source_session_id: string;
+}
+
+export interface LinkSessionInput {
+  project_id: string;
+  idempotency_key: string;
+  from: LinkSessionIdentity;
+  to: LinkSessionIdentity;
+  evidence: LinkSessionIdentity & { source_message_id: string; revision: number };
 }
 
 export interface RecordCaseEvent {
@@ -144,6 +169,15 @@ export class CentralApiClient {
   async getEvidence(input: GetEvidenceInput): Promise<unknown> {
     const params = new URLSearchParams({ project_id: input.project_id, revision: String(input.revision) });
     return parseResponse(evidenceResponseSchema, await this.request('GET', `/v1/evidence/${input.message_id}?${params.toString()}`));
+  }
+
+  async linkSession(input: LinkSessionInput): Promise<unknown> {
+    const response = parseResponse(linkSessionResponseSchema, await this.request('POST', '/v1/session-links', input));
+    // 応答schemaだけでなく、要求した案件のlinkが返ったことを照合する。
+    if (response.project_id.toLowerCase() !== input.project_id.toLowerCase()) {
+      throw new CentralApiError('中央APIの応答project_idが入力と一致しません');
+    }
+    return response;
   }
 
   async recordCase(projectId: string, event: RecordCaseEvent): Promise<unknown> {
