@@ -646,11 +646,29 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
     if (requestId === null) {
       return;
     }
+    // payloadのIDだけでなく、jobのmessage/revisionとrequestのscope（message→session→project→company）が
+    // DB正本で一致する場合だけfailedにする。payload側のscopeを信用しない。
     await client.query(
-      `UPDATE search_requests
+      `UPDATE search_requests sr
           SET status = 'failed', error_code = $2, outcome = NULL, updated_at = now()
-        WHERE id = $1 AND status IN ('running', 'pending', 'failed')`,
-      [requestId, code],
+        WHERE sr.id = $1
+          AND sr.status IN ('running', 'pending', 'failed')
+          AND EXISTS (
+            SELECT 1
+              FROM messages m
+              JOIN sessions s ON s.id = m.session_id
+              JOIN projects p ON p.id = s.project_id
+             WHERE m.id = sr.input_id
+               AND sr.input_id = $3
+               AND sr.input_revision = $4
+               AND sr.input_sequence_no = m.sequence_no
+               AND sr.session_id = m.session_id
+               AND sr.employee_id = s.employee_id
+               AND sr.project_id = s.project_id
+               AND sr.company_id = p.company_id
+               AND ($5::uuid IS NULL OR sr.session_id = $5)
+          )`,
+      [requestId, code, job.messageId, job.targetRevision, job.sessionId],
     );
   }
 }
@@ -731,10 +749,11 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
     id: string;
     kind: string;
     status: string;
+    session_id: string | null;
     message_id: string | null;
     target_revision: number | null;
     payload: unknown;
-  }>('SELECT id, kind, status, message_id, target_revision, payload FROM jobs WHERE id = $1', [jobId]);
+  }>('SELECT id, kind, status, session_id, message_id, target_revision, payload FROM jobs WHERE id = $1', [jobId]);
   const job = jobResult.rows[0];
   if (!job || (job.status !== 'failed' && job.status !== 'blocked_policy') || job.message_id === null || job.target_revision === null) {
     return false;
@@ -770,6 +789,32 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (job.kind === 'execute_search' && executeSearchRequestId !== null) {
+      // payloadのrequestがjobのmessage/revisionとDB正本のscopeに一致する場合だけ再開する。
+      // 不一致ならjobもrequestも変更せずrollbackする。
+      const scoped = await client.query(
+        `SELECT 1
+           FROM search_requests sr
+           JOIN messages m ON m.id = sr.input_id
+           JOIN sessions s ON s.id = m.session_id
+           JOIN projects p ON p.id = s.project_id
+          WHERE sr.id = $1
+            AND sr.input_id = $2
+            AND sr.input_revision = $3
+            AND sr.input_sequence_no = m.sequence_no
+            AND sr.session_id = m.session_id
+            AND sr.employee_id = s.employee_id
+            AND sr.project_id = s.project_id
+            AND sr.company_id = p.company_id
+            AND ($4::uuid IS NULL OR sr.session_id = $4)
+          FOR SHARE OF sr`,
+        [executeSearchRequestId, job.message_id, job.target_revision, job.session_id],
+      );
+      if (scoped.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+    }
     const updated = await client.query(
       `UPDATE jobs
           SET status = 'pending', error_code = NULL, lease_token = NULL, lease_expires_at = NULL, next_run_at = now(), updated_at = now()
@@ -789,12 +834,18 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
         [job.message_id, job.target_revision, WORKER_POLICY_VERSION],
       );
     } else if (job.kind === 'execute_search' && executeSearchRequestId !== null) {
-      await client.query(
+      // scope一致でもrequestの状態が復帰対象でなければ、jobだけpendingにせずrollbackする。
+      const reset = await client.query(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, stage = NULL, updated_at = now()
-          WHERE id = $1 AND status IN ('running', 'pending', 'failed')`,
+          WHERE id = $1 AND status IN ('running', 'pending', 'failed')
+          RETURNING id`,
         [executeSearchRequestId],
       );
+      if (reset.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return false;
+      }
     }
     await client.query('COMMIT');
     return true;
