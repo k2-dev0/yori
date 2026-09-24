@@ -125,7 +125,13 @@ async function loadGeneration(client: Pool | PoolClient, generationId: string): 
   return result.rows[0] ? toGeneration(result.rows[0]) : null;
 }
 
-const GENERATION_LOCK_NAMESPACE = 20260927;
+const COMPANY_GENERATION_LOCK_NAMESPACE = 20260927;
+
+// company単位のgeneration整合（初回紐付け・cutoverのretire判定）を直列化する。
+// project行を触る前に必ず取得し、lock順序を company generation lock → project row に統一してdeadlockを避ける。
+export async function acquireCompanyGenerationLock(client: PoolClient, companyId: string): Promise<void> {
+  await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [COMPANY_GENERATION_LOCK_NAMESPACE, companyId]);
+}
 
 // projectの初回だけ、会社+完全なprovider specのactive generationを再利用/作成して原子的に紐付ける。
 // 既存active generationがconfigと一致しなければ自動切替せず恒久エラーにする（世代切替はM8）。
@@ -138,7 +144,7 @@ export async function ensureActiveGeneration(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [GENERATION_LOCK_NAMESPACE, input.companyId]);
+    await acquireCompanyGenerationLock(client, input.companyId);
     const project = await client.query<{ active_generation_id: string | null }>(
       'SELECT active_generation_id FROM projects WHERE id = $1 FOR UPDATE',
       [input.projectId],
@@ -225,32 +231,70 @@ export async function ensureActiveGeneration(
   }
 }
 
-// 検索開始時にprojectのactive generationを固定して返す。NULLならnullを返し、外部送信せずno_matchにする。
-// 会社不一致・activeでない・provider spec不一致は自動切替せずGenerationMismatchErrorにする（世代切替はM8）。
-export async function loadFixedGeneration(
-  pool: Pool,
-  input: { companyId: string; projectId: string },
-  config: WorkerConfig,
+// 現在のconfigと完全なprovider specが一致するか。再索引のresume・cutover検証で使う。
+export function generationSpecMatches(generation: EmbeddingGeneration, config: WorkerConfig): boolean {
+  return specMatches(generation, config);
+}
+
+// 世代IDを会社境界つきで読む。statusを問わず返し、利用可否は呼出元が決める。
+export async function loadGenerationById(
+  client: Pool | PoolClient,
+  input: { companyId: string; generationId: string },
 ): Promise<EmbeddingGeneration | null> {
-  const project = await pool.query<{ active_generation_id: string | null }>(
-    'SELECT active_generation_id FROM projects WHERE id = $1 AND company_id = $2',
-    [input.projectId, input.companyId],
-  );
-  if (project.rows.length === 0) {
-    throw new GenerationMismatchError('projectがありません');
-  }
-  const activeId = project.rows[0].active_generation_id;
-  if (activeId === null) {
+  const generation = await loadGeneration(client, input.generationId);
+  if (generation === null || generation.companyId !== input.companyId) {
     return null;
   }
-  const generation = await loadGeneration(pool, activeId);
+  return generation;
+}
+
+// current specの再索引target候補を新規作成する。project pointerはcutoverでだけ変更する。
+export async function createCandidateGeneration(
+  client: Pool | PoolClient,
+  companyId: string,
+  config: WorkerConfig,
+): Promise<EmbeddingGeneration> {
+  const spec = specOf(config);
+  const inserted = await client.query<GenerationRow>(
+    `INSERT INTO embedding_generations
+       (id, company_id, provider, account_ref, endpoint, model, model_revision, dimensions, metric,
+        tokenizer_version, document_input_type, query_input_type, normalization, status)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, 'candidate')
+     RETURNING id, company_id, provider, account_ref, endpoint, model, model_revision, dimensions, metric,
+               tokenizer_version, document_input_type, query_input_type, normalization, status`,
+    [
+      uuidv7(),
+      companyId,
+      spec.provider,
+      spec.accountRef,
+      spec.endpoint,
+      spec.model,
+      spec.dimensions,
+      spec.metric,
+      spec.tokenizerVersion,
+      spec.documentInputType,
+      spec.queryInputType,
+      spec.normalization,
+    ],
+  );
+  return toGeneration(inserted.rows[0]);
+}
+
+// 検索要求が固定した世代を読む。同company・完全spec一致ならretiredでも利用でき、failed/candidateは拒否する。
+export async function loadPinnedGeneration(
+  pool: Pool,
+  input: { companyId: string; generationId: string },
+  config: WorkerConfig,
+): Promise<EmbeddingGeneration> {
+  const generation = await loadGeneration(pool, input.generationId);
   if (
     generation === null ||
     generation.companyId !== input.companyId ||
-    generation.status !== 'active' ||
+    generation.status === 'failed' ||
+    generation.status === 'candidate' ||
     !specMatches(generation, config)
   ) {
-    throw new GenerationMismatchError('active generationが現在のprovider specと一致しません');
+    throw new GenerationMismatchError('固定したgenerationが利用できません');
   }
   return generation;
 }
