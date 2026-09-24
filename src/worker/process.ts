@@ -32,7 +32,13 @@ import {
   type JobTarget,
   type PriorSearch,
 } from './context.js';
-import { JevCallError, callJev, validateJevResponse } from './jev.js';
+import {
+  JevCallError,
+  callJev,
+  extractJevResponseModel,
+  extractJevUsage,
+  validateJevResponse,
+} from './jev.js';
 import { aggregateEvaluations, type AggregatedEvaluation, type PartEvaluation } from './analysis.js';
 import { resolveReuse } from './reuse.js';
 import {
@@ -43,10 +49,10 @@ import {
   planDocumentChunks,
 } from './documents.js';
 import { ensureActiveGeneration, VoyageEmbeddingProvider } from './embedding.js';
-import { GenerationMismatchError, LeaseLostError, PolicyBlockedError, StaleApplyError } from './errors.js';
+import { processExecuteSearch, searchRequestIdFromPayload } from './search.js';
+import { GenerationMismatchError, LeaseLostError, PolicyBlockedError, StaleApplyError, TargetMissingError } from './errors.js';
 import { VoyageCallError } from './voyage.js';
-
-class TargetMissingError extends Error {}
+import { hasActiveProviderApproval } from './approvals.js';
 
 type RouteDecision = { kind: 'new_search' | 'skip' } | { kind: 'reuse'; priorSearch: PriorSearch };
 
@@ -57,32 +63,22 @@ interface CachedEvaluation {
 
 // 承認条件を満たす有効な承認があるか。各HTTP送信の直前に呼ぶ。
 async function hasActiveApproval(pool: Pool, companyId: string, config: WorkerConfig): Promise<boolean> {
-  const result = await pool.query(
-    `SELECT 1
-       FROM provider_policy_approvals
-      WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND active AND learning_disabled
-        AND confirmed_at <= now()
-        AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
-      LIMIT 1`,
-    [companyId, JEV_PROVIDER, config.accountRef, config.apiUrl],
-  );
-  return result.rows.length > 0;
+  return hasActiveProviderApproval(pool, {
+    companyId,
+    provider: JEV_PROVIDER,
+    accountRef: config.accountRef,
+    endpoint: config.apiUrl,
+  });
 }
 
 // Voyage送信の承認確認。build_documentsのretryも同じ条件を使う。
 async function hasActiveVoyageApproval(pool: Pool, companyId: string, config: WorkerConfig): Promise<boolean> {
-  const result = await pool.query(
-    `SELECT 1
-       FROM provider_policy_approvals
-      WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND active AND learning_disabled
-        AND confirmed_at <= now()
-        AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
-      LIMIT 1`,
-    [companyId, VOYAGE_PROVIDER, config.voyageAccountRef, config.voyageApiUrl],
-  );
-  return result.rows.length > 0;
+  return hasActiveProviderApproval(pool, {
+    companyId,
+    provider: VOYAGE_PROVIDER,
+    accountRef: config.voyageAccountRef,
+    endpoint: config.voyageApiUrl,
+  });
 }
 
 // 応答modelが不明な旧cache行は再利用せず、実評価で更新するまでcache-hitにしない。
@@ -145,31 +141,6 @@ async function saveCachedEvaluation(
       responseModel,
     ],
   );
-}
-
-// 応答本文を取得できた場合だけ、検証結果とは独立に応答modelを取り出す。推測補完はしない。
-function extractResponseModel(raw: unknown): string | null {
-  if (typeof raw !== 'object' || raw === null) {
-    return null;
-  }
-  const model = (raw as { model?: unknown }).model;
-  return typeof model === 'string' && model.length > 0 ? model : null;
-}
-
-function extractUsage(raw: unknown): JevUsage {
-  if (typeof raw !== 'object' || raw === null) {
-    return { input_tokens: null, output_tokens: null };
-  }
-  const usage = (raw as { usage?: unknown }).usage;
-  if (typeof usage !== 'object' || usage === null) {
-    return { input_tokens: null, output_tokens: null };
-  }
-  const input = (usage as { input_tokens?: unknown }).input_tokens;
-  const output = (usage as { output_tokens?: unknown }).output_tokens;
-  return {
-    input_tokens: typeof input === 'number' && Number.isInteger(input) && input >= 0 ? input : null,
-    output_tokens: typeof output === 'number' && Number.isInteger(output) && output >= 0 ? output : null,
-  };
 }
 
 // usage_eventsは試行ごとに1行。原文・key・外部error bodyは保存しない。
@@ -288,7 +259,7 @@ async function evaluatePlan(
     } catch (error) {
       const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
       // 応答本文からmodelを取得できた場合は、検証失敗でも取得できた値だけを記録する。
-      await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractUsage(json), extractResponseModel(json));
+      await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractJevUsage(json), extractJevResponseModel(json));
       throw error instanceof JevCallError ? error : new JevCallError('provider_contract_invalid', false);
     }
   }
@@ -655,21 +626,39 @@ function errorCodeOf(error: unknown): { code: string; retryable: boolean; retryA
 }
 
 // 障害時もsearch受付はfailedとcodeを持ち、no_matchにしない。所有喪失時は状態を変えない。
+// route_searchは既存のauto入力更新を維持し、execute_searchはpayloadが指す1件だけを更新する。
 async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: string): Promise<void> {
-  if (job.kind !== 'route_search' || job.messageId === null || job.targetRevision === null) {
+  if (job.kind === 'route_search') {
+    if (job.messageId === null || job.targetRevision === null) {
+      return;
+    }
+    await client.query(
+      `UPDATE search_requests
+          SET status = 'failed', error_code = $4, outcome = NULL, updated_at = now()
+        WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
+      [job.messageId, job.targetRevision, WORKER_POLICY_VERSION, code],
+    );
     return;
   }
-  await client.query(
-    `UPDATE search_requests
-        SET status = 'failed', error_code = $4, outcome = NULL, updated_at = now()
-      WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
-    [job.messageId, job.targetRevision, WORKER_POLICY_VERSION, code],
-  );
+  if (job.kind === 'execute_search') {
+    // payloadが不正ならどのrequestの障害か特定できないため、無関係requestを更新しない。
+    const requestId = searchRequestIdFromPayload(job.payload);
+    if (requestId === null) {
+      return;
+    }
+    await client.query(
+      `UPDATE search_requests
+          SET status = 'failed', error_code = $2, outcome = NULL, updated_at = now()
+        WHERE id = $1 AND status IN ('running', 'pending', 'failed')`,
+      [requestId, code],
+    );
+  }
 }
 
 async function handleProcessError(pool: Pool, job: ClaimedJob, error: unknown): Promise<void> {
   if (error instanceof LeaseLostError || error instanceof StaleApplyError) {
     // 所有喪失・状態変化時は公開もjob状態変更もせず、lease期限後の回収へ委ねる。
+    // execute_searchのsearch_requestも更新しない（lease喪失時はrunningのまま残し、回収後のownerに委ねる）。
     return;
   }
   const client = await pool.connect();
@@ -726,6 +715,10 @@ export async function processJob(pool: Pool, job: ClaimedJob, config: WorkerConf
       await processBuild(pool, job, config);
       return;
     }
+    if (job.kind === 'execute_search') {
+      await processExecuteSearch(pool, job, config);
+      return;
+    }
     throw new TargetMissingError('未対応のjob種別です');
   } catch (error) {
     await handleProcessError(pool, job, error);
@@ -740,7 +733,8 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
     status: string;
     message_id: string | null;
     target_revision: number | null;
-  }>('SELECT id, kind, status, message_id, target_revision FROM jobs WHERE id = $1', [jobId]);
+    payload: unknown;
+  }>('SELECT id, kind, status, message_id, target_revision, payload FROM jobs WHERE id = $1', [jobId]);
   const job = jobResult.rows[0];
   if (!job || (job.status !== 'failed' && job.status !== 'blocked_policy') || job.message_id === null || job.target_revision === null) {
     return false;
@@ -757,12 +751,20 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
   if (companyId === undefined) {
     return false;
   }
-  // build_documentsはVoyage、classify/routeはJevの承認だけを使う。別providerの承認を流用しない。
+  // build_documentsはVoyage、execute_searchはVoyageとJev両方、classify/routeはJevの承認を使う。
+  // 別providerの承認を流用しない。
   const approved =
     job.kind === 'build_documents'
       ? await hasActiveVoyageApproval(pool, companyId, config)
-      : await hasActiveApproval(pool, companyId, config);
+      : job.kind === 'execute_search'
+        ? (await hasActiveVoyageApproval(pool, companyId, config)) && (await hasActiveApproval(pool, companyId, config))
+        : await hasActiveApproval(pool, companyId, config);
   if (!approved) {
+    return false;
+  }
+  // execute_searchはpayloadが指すrequestだけをpendingへ戻す。payload不正なら再開しない。
+  const executeSearchRequestId = job.kind === 'execute_search' ? searchRequestIdFromPayload(job.payload) : null;
+  if (job.kind === 'execute_search' && executeSearchRequestId === null) {
     return false;
   }
   const client = await pool.connect();
@@ -785,6 +787,13 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
             SET status = 'pending', outcome = NULL, error_code = NULL, stage = NULL, updated_at = now()
           WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
         [job.message_id, job.target_revision, WORKER_POLICY_VERSION],
+      );
+    } else if (job.kind === 'execute_search' && executeSearchRequestId !== null) {
+      await client.query(
+        `UPDATE search_requests
+            SET status = 'pending', outcome = NULL, error_code = NULL, stage = NULL, updated_at = now()
+          WHERE id = $1 AND status IN ('running', 'pending', 'failed')`,
+        [executeSearchRequestId],
       );
     }
     await client.query('COMMIT');
