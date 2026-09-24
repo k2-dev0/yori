@@ -38,15 +38,17 @@ interface ResumableRun {
   target: EmbeddingGeneration;
 }
 
+// cursorはDBのtimestamptz精度（マイクロ秒）を失わない文字列表現で保持し、そのまま::timestamptzへ戻す。
+// node-postgresのJS Dateへ変換すると桁が丸められ、同一timestamptzの末尾行を再取得し続ける。
 interface DocumentCursor {
-  createdAt: Date;
+  createdAtText: string;
   id: string;
 }
 
 interface DocumentRow {
   id: string;
   desired_revision: number;
-  created_at: Date;
+  created_at_text: string;
   content: string;
   content_hash: Buffer;
   target_hash: Buffer | null;
@@ -278,7 +280,16 @@ async function embedMissing(
       break;
     }
     const last = page[page.length - 1];
-    cursor = { createdAt: last.created_at, id: last.id };
+    const nextCursor: DocumentCursor = { createdAtText: last.created_at_text, id: last.id };
+    if (
+      cursor !== null &&
+      cursor.createdAtText === nextCursor.createdAtText &&
+      cursor.id === nextCursor.id
+    ) {
+      // 通常経路ではcursorはpage末尾より必ず進む。進まない異常時だけ無限取得を避けて打ち切る。
+      break;
+    }
+    cursor = nextCursor;
     const missing = page.filter((row) => !hasCompleteTarget(row));
     for (let offset = 0; offset < missing.length; offset += REINDEX_BATCH_SIZE) {
       const batch = missing.slice(offset, offset + REINDEX_BATCH_SIZE);
@@ -305,7 +316,7 @@ async function loadDocumentPage(
   input: { companyId: string; projectId: string; targetGenerationId: string; cursor: DocumentCursor | null },
 ): Promise<DocumentRow[]> {
   const result = await pool.query<DocumentRow>(
-    `SELECT d.id, d.desired_revision, d.created_at, r.content, r.content_hash,
+    `SELECT d.id, d.desired_revision, d.created_at::text AS created_at_text, r.content, r.content_hash,
             e.input_hash AS target_hash, p.revision AS target_revision, p.stale AS target_stale
        FROM search_documents d
        JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
@@ -317,7 +328,14 @@ async function loadDocumentPage(
         AND ($4::timestamptz IS NULL OR (d.created_at, d.id) > ($4::timestamptz, $5::uuid))
       ORDER BY d.created_at, d.id
       LIMIT $6`,
-    [input.companyId, input.projectId, input.targetGenerationId, input.cursor?.createdAt ?? null, input.cursor?.id ?? null, REINDEX_BATCH_SIZE],
+    [
+      input.companyId,
+      input.projectId,
+      input.targetGenerationId,
+      input.cursor?.createdAtText ?? null,
+      input.cursor?.id ?? null,
+      REINDEX_BATCH_SIZE,
+    ],
   );
   return result.rows;
 }
