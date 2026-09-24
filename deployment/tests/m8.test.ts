@@ -169,7 +169,7 @@ describe('M8 配置: production profileのCaddy HTTPS gateway', () => {
     const docFiles = (await readdir(docsDir)).filter((file) => file.endsWith('.md')).map((file) => path.join(docsDir, file));
     const files = [path.join(REPO_ROOT, 'deployment', 'README.md'), ...docFiles];
     const text = (await Promise.all(files.map((file) => readFile(file, 'utf8')))).join('\n');
-    for (const term of ['worker:reindex', 'worker:generation-delete', 'worker:metrics', 'Caddy', '増設']) {
+    for (const term of ['worker:reindex', 'worker:generation-delete', 'worker:metrics', 'Caddy', '増設', '--force-recreate', 'forward-only']) {
       assert.ok(text.includes(term), `運用・性能手順に${term}がない`);
     }
   });
