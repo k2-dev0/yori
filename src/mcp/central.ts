@@ -115,7 +115,14 @@ export class CentralApiClient {
       }
       const query = params.toString();
       const path = `/v1/searches/${input.request_id}${query === '' ? '' : `?${query}`}`;
-      return parseResponse(searchResultResponseSchema, await this.request('GET', path));
+      const view = parseResponse(searchResultResponseSchema, await this.request('GET', path));
+      // request_id branchはproject_idをqueryへ送れないため、応答側の案件identityを入力と照合する。
+      // 両案件memberでも別案件の受付を返さない。
+      const responseProjectId = 'project_id' in view ? view.project_id : undefined;
+      if (typeof responseProjectId !== 'string' || responseProjectId.toLowerCase() !== input.project_id.toLowerCase()) {
+        throw new CentralApiError('中央APIの応答project_idが入力と一致しません');
+      }
+      return view;
     }
     const params = new URLSearchParams({ project_id: input.project_id });
     if (input.wait_ms !== undefined) {
