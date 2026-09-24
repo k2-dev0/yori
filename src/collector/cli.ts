@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { EVENT_SOURCES, type EventSource } from '../api/contract.js';
 import { collectFromHook, flushCollector } from './collect.js';
+import { notifyFromHook } from './notify.js';
 import { loadCollectorConfig, type CollectorConfig } from './config.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from './state.js';
 
@@ -19,7 +20,7 @@ function fail(code: string): never {
 
 function parseCommandLine(argv: string[]): { command: string; source?: string; configPath: string } {
   const [command, ...rest] = argv;
-  if (command === undefined || (command !== 'collect' && command !== 'flush' && command !== 'diagnostics')) {
+  if (command === undefined || (command !== 'collect' && command !== 'notify' && command !== 'flush' && command !== 'diagnostics')) {
     fail('unknown_command');
   }
   let source: string | undefined;
@@ -41,7 +42,7 @@ function parseCommandLine(argv: string[]): { command: string; source?: string; c
   if (configPath === undefined) {
     fail('invalid_arguments');
   }
-  if (command === 'collect' && (source === undefined || !EVENT_SOURCES.includes(source as EventSource))) {
+  if ((command === 'collect' || command === 'notify') && (source === undefined || !EVENT_SOURCES.includes(source as EventSource))) {
     fail('invalid_source');
   }
   return { command, source, configPath };
@@ -65,7 +66,7 @@ async function main(): Promise<void> {
   }
   const token = readToken(config);
 
-  if (command === 'collect') {
+  if (command === 'collect' || command === 'notify') {
     let hookInput: unknown;
     try {
       hookInput = JSON.parse(readFileSync(0, 'utf8'));
@@ -76,7 +77,11 @@ async function main(): Promise<void> {
     if (!hook.success) {
       fail('invalid_hook_input');
     }
-    await collectFromHook({ source: source as EventSource, hook: hook.data, config, token });
+    if (command === 'collect') {
+      await collectFromHook({ source: source as EventSource, hook: hook.data, config, token });
+    } else {
+      await notifyFromHook({ source: source as EventSource, hook: hook.data, config, token });
+    }
     return;
   }
   if (command === 'flush') {
