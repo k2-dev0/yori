@@ -10,7 +10,7 @@ M1のサーバーとテスト専用Compose、M2の端末収集の導入先。既
 |---|---|---|
 | compose.yaml | db | pgvector/pgvector:0.8.6-pg18-trixie。ポート公開なし。volume `yori-pgdata` を `/var/lib/postgresql` (PG18 layout) へマウント |
 | compose.yaml | api | Fastifyアプリ。loopbackのみ `${YORI_API_PORT:-39119}` で公開 |
-| compose.yaml | worker | M3のJev分類・検索振り分けworker。apiのhealthcheck後に起動し、共有volumeへの同時npm ciを避ける |
+| compose.yaml | worker | M3〜M7の分類・検索・周辺探索worker。apiのhealthcheck後に起動し、共有volumeへの同時npm ciを避ける |
 | compose.yaml | migrate | tools profile。`npm run migrate` でmigrationを適用 |
 | compose.test.yaml | db | テスト専用DB。ポート公開なし。volumeはnameを指定せずCompose projectスコープで隔離 |
 | compose.test.yaml | api | テスト専用API。loopbackのみ `${YORI_API_PORT:-39120}` で公開 |
@@ -36,7 +36,7 @@ curl -sS http://127.0.0.1:39119/health/ready
 ```
 
 - APIは `YORI_API_PORT`（既定39119、loopbackのみ）で公開する。`YORI_API_PORT` を変えた場合、curlのportも合わせる。
-- `npm run migrate` はmigrate service内で `src/db/migrations/*.sql` をファイル名昇順に1トランザクションで適用し、適用済みversionを`schema_migrations`で管理する。再実行しても適用済みmigrationは実行しない。M1は`0001_init.sql`、M3は`0002_m3.sql`。
+- `npm run migrate` はmigrate service内で `src/db/migrations/*.sql` をファイル名昇順に1トランザクションで適用し、適用済みversionを`schema_migrations`で管理する。再実行しても適用済みmigrationは実行しない。M1は`0001_init.sql`、M3は`0002_m3.sql`、M7は`0007_m7.sql`。
 - migrationを先に適用してから `api worker` を起動する。workerは`JEV_API_KEY`/`VOYAGE_API_KEY`等が無い場合、偽の判定・送信へ進まず起動に失敗する（`invalid_worker_config`）。設定と運用手順は [docs/worker.md](../docs/worker.md)、M4仕様は [docs/m4-design.md](../docs/m4-design.md) を参照する。
 - DBはホストへ公開しない。手動で見る場合は `docker compose -p yori -f deployment/compose.yaml exec db psql -U yori -d yori` を使う。
 - コンテナを通常停止しても `yori-pgdata` の原文は残る。消す場合だけ `docker compose -p yori -f deployment/compose.yaml down -v` を明示する。
@@ -83,7 +83,11 @@ M4実装済み: 決定的な文書分割、VoyageEmbeddingProvider（学習利�
 
 M5実装済み: `execute_search`、案件内の厳密vector検索、明示識別子完全一致検索、RRF、Jev候補判定、原文根拠付き結果保存。仕様は [docs/m5-design.md](../docs/m5-design.md) を参照する。
 
-未実装（M6以降）: MCPサーバーと検索結果取得API、前後・引き継ぎ・撤回探索、再索引・世代切替、クラウド配置。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
+M6実装済み: 自動検索結果と追加検索のHTTP API、原文取得、短い対応記録、ローカルstdio MCP。仕様は [docs/m6-design.md](../docs/m6-design.md)、設定は [docs/mcp.md](../docs/mcp.md) を参照する。
+
+M7実装済み: `session_links`、`POST /v1/session-links`、MCP `link_session`、代表根拠の前後・引き継ぎ・訂正／撤回探索、上限・循環検知、結果取得時の再検証、collector補助通知。仕様は [docs/m7-design.md](../docs/m7-design.md) を参照する。
+
+未実装（M8）: 再索引・世代切替、クラウド配置、資源監視、性能検証。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
 
 ## テスト
 
