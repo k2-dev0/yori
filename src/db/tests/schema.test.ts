@@ -43,6 +43,8 @@ const REQUIRED_TABLES = [
   'document_embeddings',
   'document_publications',
   'embedding_cache',
+  // M5: 明示識別子の完全一致検索。
+  'document_entities',
 ];
 
 before(async () => {
@@ -105,7 +107,13 @@ describe('migration管理', () => {
     }
 
     const versions = await pool.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    assert.deepEqual(versions.rows.map((row) => row.version), ['0001_init.sql', '0002_m3.sql', '0003_m3_response_model.sql', '0004_m4.sql']);
+    assert.deepEqual(versions.rows.map((row) => row.version), [
+      '0001_init.sql',
+      '0002_m3.sql',
+      '0003_m3_response_model.sql',
+      '0004_m4.sql',
+      '0005_m5.sql',
+    ]);
   });
 
   it('並行実行でもadvisory lockで1回だけ適用される', async () => {
@@ -113,7 +121,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '4');
+    assert.equal(versions.rows[0].count, '5');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -122,6 +130,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0002_m3.sql'), '0002_m3.sql がない');
     assert.ok(files.includes('0003_m3_response_model.sql'), '0003_m3_response_model.sql がない');
     assert.ok(files.includes('0004_m4.sql'), '0004_m4.sql がない');
+    assert.ok(files.includes('0005_m5.sql'), '0005_m5.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
