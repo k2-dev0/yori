@@ -1,12 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
-import { AUTO_SEARCH_POLICY_VERSION, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
+import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
 import { CLASSIFY_MESSAGE_PRIORITY, ROUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import type { EventsRequest, ParsedEvent } from './schema.js';
-
-// 同一社員のイベント受付を直列化するadvisory lock key1。key2は会社・社員から導出する。
-const EVENT_WRITE_LOCK_NAMESPACE = 20260922;
 
 export interface AuthContext {
   companyId: string;
