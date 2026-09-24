@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
+import { validate as validateUuid } from 'uuid';
 import { completeJob, type ClaimedJob } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import {
@@ -30,7 +30,6 @@ import {
   type JevChoiceQuestion,
   type JevRequest,
   type JevState,
-  type JevUsage,
 } from './contract.js';
 import { InputBudgetError, loadJobTarget, type JobTarget } from './context.js';
 import { loadFixedGeneration, VoyageEmbeddingProvider, type EmbeddingGeneration } from './embedding.js';
@@ -47,6 +46,13 @@ import {
 } from './jev.js';
 import { hasActiveProviderApproval } from './approvals.js';
 import { loadVoyageTokenizer } from './tokenizer.js';
+import { recordJevUsage } from './usage.js';
+import {
+  exploreSearchContext,
+  revalidateRelatedEvidence,
+  type ExplorationResult,
+  type RelatedEvidenceDraft,
+} from './exploration.js';
 
 // M5のexecute_search処理。開始時に固定した世代で質問を埋め込み、案件内の厳密vector検索と
 // 明示識別子の完全一致検索をRRFで統合し、候補をJevで判定して原文evidence付きの結果を保存する。
@@ -420,38 +426,6 @@ function buildCandidateQuestions(candidates: readonly Candidate[]): {
   return { questions, index };
 }
 
-// usage_eventsは試行ごとに1行。原文・key・外部error bodyは保存しない。
-async function recordJevUsage(
-  pool: Pool,
-  input: { companyId: string; config: WorkerConfig; jobKind: string },
-  success: boolean,
-  durationMs: number,
-  errorCode: string | null,
-  usage: JevUsage,
-  responseModel: string | null,
-): Promise<void> {
-  await pool.query(
-    `INSERT INTO usage_events
-       (id, company_id, provider, account_ref, endpoint, operation, model, response_model, input_tokens, output_tokens, duration_ms, success, error_code)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-    [
-      uuidv7(),
-      input.companyId,
-      JEV_PROVIDER,
-      input.config.accountRef,
-      input.config.apiUrl,
-      input.jobKind,
-      input.config.model,
-      responseModel,
-      usage.input_tokens,
-      usage.output_tokens,
-      Math.max(0, Math.round(durationMs)),
-      success,
-      errorCode,
-    ],
-  );
-}
-
 // Jevへ候補本文と質問を送り、回答を候補ごとのrelevance・relevance_kindへ写す。
 async function evaluateCandidates(
   pool: Pool,
@@ -640,7 +614,12 @@ async function loadValidCandidate(
   return { stale: document.rows[0].stale, evidence: sources.rows };
 }
 
-function buildMatch(assessment: CandidateAssessment, valid: { stale: boolean; evidence: readonly EvidenceRow[] }): unknown {
+function buildMatch(
+  assessment: CandidateAssessment,
+  valid: { stale: boolean; evidence: readonly EvidenceRow[] },
+  related: readonly RelatedEvidenceDraft[],
+  truncated: boolean,
+): unknown {
   const seen = new Set<string>();
   const evidence: unknown[] = [];
   for (const source of valid.evidence) {
@@ -659,6 +638,25 @@ function buildMatch(assessment: CandidateAssessment, valid: { stale: boolean; ev
     });
   }
   const agentReported = valid.evidence.some((source) => source.role === 'assistant' || source.role === 'agent_report');
+  const relatedEvidence = related.map((draft) => ({
+    message_id: draft.messageId,
+    revision: draft.revision,
+    employee_id: draft.employeeId,
+    role: draft.role,
+    occurred_at: draft.occurredAt.toISOString(),
+    text: draft.text,
+    source_kind: draft.sourceKind,
+    // relation/related_to_*は訂正・撤回だけが返す。
+    ...(draft.relation === undefined
+      ? {}
+      : {
+          relation: draft.relation,
+          related_to_message_id: draft.relatedToMessageId,
+          related_to_revision: draft.relatedToRevision,
+        }),
+    // 結果取得時のlink active再検証に使う内部field。API view組立時に除去する。
+    ...(draft.linkId === undefined ? {} : { _link_id: draft.linkId }),
+  }));
   return {
     case_or_document_id: assessment.candidate.documentId,
     relevance: assessment.relevance,
@@ -667,8 +665,9 @@ function buildMatch(assessment: CandidateAssessment, valid: { stale: boolean; ev
     // claim_statusは報告の種類。reported_verifiedをツール実証済みへ格上げしない。
     claim_status: agentReported ? 'agent_reported' : 'not_reported',
     evidence,
-    related_evidence_ids: [],
-    truncated: false,
+    related_evidence: relatedEvidence,
+    related_evidence_ids: [...new Set(relatedEvidence.map((item) => item.message_id))],
+    truncated,
   };
 }
 
@@ -828,6 +827,32 @@ async function completeExistingJob(pool: Pool, job: ClaimedJob): Promise<void> {
   }
 }
 
+// 探索前の代表候補選定。loadValidCandidateと同じ再検証を短いTXで行い、外部HTTPの前に確定する。
+// 保存TXでも同じ選定をやり直すため、探索中に候補が無効化された場合は保存されない。
+async function selectPrimaryCandidate(
+  pool: Pool,
+  input: { target: JobTarget; generation: EmbeddingGeneration; evaluations: readonly CandidateAssessment[] },
+): Promise<{ assessment: CandidateAssessment; valid: { stale: boolean; evidence: EvidenceRow[] }; primaryKey: string } | null> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const assessment of rankAccepted(input.evaluations)) {
+      const valid = await loadValidCandidate(client, input.target, input.generation, assessment.candidate);
+      if (valid !== null) {
+        await client.query('COMMIT');
+        return { assessment, valid, primaryKey: candidateKey(assessment.candidate) };
+      }
+    }
+    await client.query('COMMIT');
+    return null;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // 保存TXでlease・request・input revisionを再検証し、有効な代表1件のevidenceだけを保存する。
 // 無効候補だけならno_match。lease喪失時はsearch_request/jobとも旧ownerは更新しない（回収後に委ねる）。
 // 保存時に入力revisionが改訂されていた場合は、old inputの結果を保存せずexpiredで終端する。
@@ -840,6 +865,7 @@ async function saveSearchResult(
     generation: EmbeddingGeneration | null;
     warnings: readonly SearchWarning[];
     evaluations: readonly CandidateAssessment[];
+    exploration: ExplorationResult | null;
   },
 ): Promise<void> {
   const client = await pool.connect();
@@ -940,7 +966,14 @@ async function saveSearchResult(
             revision: assessment.candidate.revision,
           });
         }
-        match = buildMatch(assessment, valid);
+        let related: RelatedEvidenceDraft[] = [];
+        let truncated = false;
+        if (input.exploration !== null && input.exploration.primaryKey === candidateKey(assessment.candidate)) {
+          related = await revalidateRelatedEvidence(client, input.target, input.exploration.related);
+          truncated = input.exploration.truncated;
+          warnings.push(...input.exploration.warnings);
+        }
+        match = buildMatch(assessment, valid, related, truncated);
         adoptedKey = candidateKey(assessment.candidate);
         outcome = 'matched';
         break;
@@ -1070,7 +1103,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   await markSearchRunning(pool, job, target, request);
   const generation = await loadFixedGeneration(pool, { companyId: target.companyId, projectId: target.projectId }, config);
   if (generation === null) {
-    await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], evaluations: [] });
+    await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], evaluations: [], exploration: null });
     return;
   }
   // Jev本文予算は現在質問と候補本文の合計。質問だけで使い切る場合はno_matchに偽装せず恒久failedにする。
@@ -1088,10 +1121,30 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
       // 候補は存在するが全件が質問込みtoken予算に収まらない。no_matchに偽装せず恒久failedにする。
       throw new InputBudgetError();
     }
-    await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [] });
+    await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [], exploration: null });
     return;
   }
   const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, question });
+  let exploration: ExplorationResult | null = null;
+  if (generation !== null && assessments.length > 0) {
+    const primary = await selectPrimaryCandidate(pool, { target, generation, evaluations: assessments });
+    // 代表根拠の一意なsession群を起点に、別sessionの過去事例でも周辺・継続探索を行う。
+    if (primary !== null) {
+      exploration = await exploreSearchContext({
+        pool,
+        target,
+        config,
+        tokenizer,
+        generationId: generation.id,
+        primaryKey: primary.primaryKey,
+        primaryDocumentId: primary.assessment.candidate.documentId,
+        primaryDocumentRevision: primary.assessment.candidate.revision,
+        primaryEvidence: primary.valid.evidence,
+        question,
+        jobKind: job.kind,
+      });
+    }
+  }
   await saveSearchResult(pool, {
     job,
     target,
@@ -1099,5 +1152,6 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     generation,
     warnings,
     evaluations: assessments,
+    exploration,
   });
 }
