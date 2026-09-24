@@ -37,7 +37,7 @@ curl -sS http://127.0.0.1:39119/health/ready
 
 - APIは `YORI_API_PORT`（既定39119、loopbackのみ）で公開する。`YORI_API_PORT` を変えた場合、curlのportも合わせる。
 - `npm run migrate` はmigrate service内で `src/db/migrations/*.sql` をファイル名昇順に1トランザクションで適用し、適用済みversionを`schema_migrations`で管理する。再実行しても適用済みmigrationは実行しない。M1は`0001_init.sql`、M3は`0002_m3.sql`。
-- migrationを先に適用してから `api worker` を起動する。workerは`JEV_API_KEY`等が無い場合、偽の判定へ進まず起動に失敗する（`invalid_worker_config`）。設定と運用手順は [docs/worker.md](../docs/worker.md) を参照する。
+- migrationを先に適用してから `api worker` を起動する。workerは`JEV_API_KEY`/`VOYAGE_API_KEY`等が無い場合、偽の判定・送信へ進まず起動に失敗する（`invalid_worker_config`）。設定と運用手順は [docs/worker.md](../docs/worker.md)、M4仕様は [docs/m4-design.md](../docs/m4-design.md) を参照する。
 - DBはホストへ公開しない。手動で見る場合は `docker compose -p yori -f deployment/compose.yaml exec db psql -U yori -d yori` を使う。
 - コンテナを通常停止しても `yori-pgdata` の原文は残る。消す場合だけ `docker compose -p yori -f deployment/compose.yaml down -v` を明示する。
 
@@ -77,9 +77,11 @@ M1実装済み: Compose、PostgreSQL 18+pgvector、migration、`POST /v1/events`
 
 M2実装済み: `src/collector/`の端末収集（Codex/Claude Codeアダプター、設定Zod検証、SQLite outbox/cursor/診断、project対応表・remote正規化、送信batch・backoff・明示再送、`collect`/`flush`/`diagnostics` CLI）。導入・設定例・対応版・再送手順は [docs/collector.md](../docs/collector.md) を参照する。
 
-M3実装済み: `src/worker/`のJev分類・選別・承認/撤回関係・検索振り分けworker（route/classifyの2 lane、lease更新・期限切れ回収、承認確認、評価キャッシュ、usage記録、`worker:start`/`worker:retry`/`provider:approve`/`provider:revoke` CLI）。分類後は`build_documents`、new_searchは`execute_search`をpendingで保存するところまで。
+M3実装済み: `src/worker/`のJev分類・選別・承認/撤回関係・検索振り分けworker（route/classifyの2 lane、lease更新・期限切れ回収、承認確認、評価キャッシュ、usage記録、`worker:start`/`worker:retry`/`provider:approve`/`provider:revoke` CLI）。new_searchは`execute_search`をpendingで保存するところまで。
 
-未実装（M4以降）: MCPサーバー、`build_documents`/`execute_search`の実行、VoyageEmbeddingProvider、決定的文書分割・埋め込み・検索・周辺探索。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
+M4実装済み: 決定的な文書分割、VoyageEmbeddingProvider（学習利用条件の送信ゲート、世代管理、原文対応、embedding_cache、runner/retry対応）。仕様は [docs/m4-design.md](../docs/m4-design.md) を参照する。
+
+未実装（M5以降）: MCPサーバー、`execute_search`の実行、案件内検索・周辺探索。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
 
 ## テスト
 
