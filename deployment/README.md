@@ -81,7 +81,9 @@ M3実装済み: `src/worker/`のJev分類・選別・承認/撤回関係・検�
 
 M4実装済み: 決定的な文書分割、VoyageEmbeddingProvider（学習利用条件の送信ゲート、世代管理、原文対応、embedding_cache、runner/retry対応）。仕様は [docs/m4-design.md](../docs/m4-design.md) を参照する。
 
-未実装（M5以降）: MCPサーバー、`execute_search`の実行、案件内検索・周辺探索。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
+M5実装済み: `execute_search`、案件内の厳密vector検索、明示識別子完全一致検索、RRF、Jev候補判定、原文根拠付き結果保存。仕様は [docs/m5-design.md](../docs/m5-design.md) を参照する。
+
+未実装（M6以降）: MCPサーバーと検索結果取得API、前後・引き継ぎ・撤回探索、再索引・世代切替、クラウド配置。収集工程を含め、外部Jev/Voyageへ実データを送信しない。
 
 ## テスト
 
