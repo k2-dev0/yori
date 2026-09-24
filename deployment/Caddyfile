@@ -1,0 +1,6 @@
+# M8 production profileのHTTPS終端。YORI_DOMAINで指定したdomainをautomatic HTTPSの対象にする。
+# 外部からは80/tcp（ACME/HTTP redirect）と443/tcp・443/udp（HTTP/3）だけを受け、
+# APIはloopback公開のままCaddyからapi:3210へreverse proxyする。実クラウドや外部APIへは送信しない。
+{$YORI_DOMAIN} {
+reverse_proxy api:3210
+}
