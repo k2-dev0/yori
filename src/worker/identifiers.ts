@@ -6,8 +6,10 @@ export interface EntityReference {
   entityKey: string;
 }
 
-// 拡張子付きのpath/ファイル名。./ ../ / の先頭表記を保持し、前後の識別子文字やURLへ食い込まない。
-const FILE_REFERENCE = /(?<![A-Za-z0-9_./:-])((?:\.{1,2}\/|\/)?[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z][A-Za-z0-9]{0,9})(?![A-Za-z0-9_./-])/g;
+// 拡張子付きのpath/ファイル名。./・../の複数階層・/・hidden directoryの先頭表記を保持し、
+// URL内部の部分pathや末尾の句読点をentity_keyへ含めない。先頭を捨てた部分文字列も抽出しない。
+const FILE_REFERENCE =
+  /(?<![A-Za-z0-9_/.:-])((?:(?:\.\.\/)+|\.\/|\/)?(?:\.[A-Za-z0-9_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/(?:\.[A-Za-z0-9_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*))*\.[A-Za-z][A-Za-z0-9]{0,9})(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_/-])/g;
 // name()形式の関数呼出し。
 const FUNCTION_REFERENCE = /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\(\)/g;
 // Issue #123形式。PRと区別するため接頭語を含めて読む。
