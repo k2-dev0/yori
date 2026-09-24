@@ -443,6 +443,14 @@ export async function planDocumentChunks(sessionId: string, messages: readonly S
       overlapSeeded = false;
       continue;
     }
+    // current全体がoverlap予算以下なら、ここで確定すると次chunkへ全文複製される。
+    // provider上限に収まる場合はtargetを超えても次atomと結合し、短いchunkの重複保存を避ける。
+    if (partsBudget(current) <= CHUNK_OVERLAP_TOKENS && budget <= MAX_LOCAL) {
+      current.push(toPart(atom, 'original'));
+      atoms.shift();
+      overlapSeeded = false;
+      continue;
+    }
     chunks.push({ parts: current });
     current = overlapParts(tokenizer, current);
     overlapSeeded = current.length > 0;
