@@ -6,6 +6,7 @@ import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contra
 import type { AuthContext } from './events.js';
 import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
 import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
+import { WORKER_POLICY_VERSION } from '../worker/contract.js';
 
 // M6の明示検索受付・結果取得・入力照合・原文取得。認証はroute側で行い、
 // ここでは会社・案件membershipを含むscope照合と固定codeへ写せる失敗だけを返す。
@@ -136,19 +137,8 @@ export async function createSearch(pool: Pool, auth: AuthContext, request: Parse
     if (target.current_revision !== request.input_revision) {
       throw new SearchConflictError();
     }
-    if (!request.force_refresh && request.query === target.text) {
-      const auto = await client.query<{ id: string }>(
-        `SELECT id
-           FROM search_requests
-          WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND employee_id = $4`,
-        [target.id, target.current_revision, AUTO_SEARCH_POLICY_VERSION, auth.employeeId],
-      );
-      const reused = auto.rows[0];
-      if (reused !== undefined) {
-        await client.query('COMMIT');
-        return { requestId: reused.id, reused: true };
-      }
-    }
+    // 冪等キーの既存manual照合は自動受付再利用より先に行う。input原文と同条件のrequestでも、
+    // 同じkeyの内容違いをauto再利用で迂回して成功させない。
     const conditionHash = manualConditionHash(request);
     const existing = await client.query<{ id: string; condition_hash: Buffer }>(
       `SELECT id, condition_hash
@@ -164,6 +154,20 @@ export async function createSearch(pool: Pool, auth: AuthContext, request: Parse
       }
       await client.query('COMMIT');
       return { requestId: duplicate.id, reused: true };
+    }
+    // 初回でkey未使用かつquestionが現在入力の原文と同じなら、既存の自動受付を再利用する。
+    if (!request.force_refresh && request.query === target.text) {
+      const auto = await client.query<{ id: string }>(
+        `SELECT id
+           FROM search_requests
+          WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND employee_id = $4`,
+        [target.id, target.current_revision, AUTO_SEARCH_POLICY_VERSION, auth.employeeId],
+      );
+      const reused = auto.rows[0];
+      if (reused !== undefined) {
+        await client.query('COMMIT');
+        return { requestId: reused.id, reused: true };
+      }
     }
     const requestId = uuidv7();
     await client.query(
@@ -301,7 +305,7 @@ async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise
   );
 }
 
-// reuse先のmatched根拠を現在の原文revisionと案件所属で再検証し、無効なmatchを落とす。
+// reuse先のmatched根拠を現在の原文revision・案件所属・現在policyの分類・撤回/変更で再検証し、無効なmatchを落とす。
 async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: unknown): Promise<unknown[]> {
   const kept: unknown[] = [];
   for (const match of resultMatches(result)) {
@@ -328,6 +332,30 @@ async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: u
         [messageId, revision, origin.project_id, origin.company_id],
       );
       if (current.rows.length === 0) {
+        valid = false;
+        break;
+      }
+      // 現在policyの分類がprogress_only・非searchableへ再分類された根拠はmatchedとして返さない。
+      const analysis = await pool.query<{ retention: string; is_searchable: boolean }>(
+        `SELECT retention, is_searchable
+           FROM message_analysis
+          WHERE message_id = $1 AND revision = $2 AND policy_version = $3`,
+        [messageId, revision, WORKER_POLICY_VERSION],
+      );
+      const classification = analysis.rows[0];
+      if (classification !== undefined && (classification.retention === 'progress_only' || !classification.is_searchable)) {
+        valid = false;
+        break;
+      }
+      // 明示的なrevoke/changeで無効化された根拠はmatchedとして返さない。
+      const invalidated = await pool.query(
+        `SELECT 1
+           FROM message_relations
+          WHERE target_message_id = $1 AND target_revision = $2 AND relation IN ('revoke', 'change')
+          LIMIT 1`,
+        [messageId, revision],
+      );
+      if (invalidated.rows.length > 0) {
         valid = false;
         break;
       }
@@ -374,8 +402,19 @@ async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView>
   };
   const parts = completedResultParts(origin);
   if (origin.status === 'completed' && origin.outcome === 'matched') {
-    const inputValid = await currentInputValid(pool, row);
-    const matches = inputValid ? await revalidateMatches(pool, origin, origin.result) : [];
+    if (!(await currentInputValid(pool, row))) {
+      // 現在入力のrevision・scopeが変わったreuse元はmatchedを引き継がず、no_matchと区別したexpiredで返す。
+      return {
+        ...tracking,
+        status: 'expired',
+        outcome: null,
+        error_code: 'input_revision_stale',
+        matches: [],
+        warnings: parts.warnings,
+        index_status: parts.index_status,
+      };
+    }
+    const matches = await revalidateMatches(pool, origin, origin.result);
     if (matches.length === 0) {
       return { ...tracking, outcome: 'no_match', matches: [], warnings: parts.warnings, index_status: parts.index_status };
     }
