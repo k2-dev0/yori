@@ -3,8 +3,9 @@ import { DEFAULT_JOB_LEASE_MS, claimJobs, recoverExpiredJobs, renewJobLease, typ
 import type { WorkerConfig } from './config.js';
 import { processJob } from './process.js';
 
-// M3 runnerはclassify/routeの2 kindだけをclaimする。build_documents/execute_searchはM4/M5が担当する。
-const CLASSIFY_KINDS: readonly JobKind[] = ['classify_message'];
+// route/search laneはroute_searchだけ、外部処理laneはclassify_messageとbuild_documentsを1並列で扱う。
+// M5のexecute_searchはまだclaimしない。
+const EXTERNAL_KINDS: readonly JobKind[] = ['classify_message', 'build_documents'];
 const ROUTE_KINDS: readonly JobKind[] = ['route_search'];
 const RECOVER_INTERVAL_MS = 30_000;
 
@@ -84,5 +85,5 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
     }
   };
 
-  await Promise.all([runLane(CLASSIFY_KINDS), runLane(ROUTE_KINDS), recoverLoop()]);
+  await Promise.all([runLane(EXTERNAL_KINDS), runLane(ROUTE_KINDS), recoverLoop()]);
 }
