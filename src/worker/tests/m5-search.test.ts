@@ -569,7 +569,15 @@ async function appendRevisionContent(pool: Pool, documentId: string, revision: n
 // 検索対象sessionのuser発言と自動検索受付・execute_search jobを、route_searchの保存形に近づけて作る。
 async function seedExecuteSearch(
   pool: Pool,
-  input: { workspace: WorkspaceFixture; sessionId: string; sequenceNo: number; text: string; occurredAt?: Date },
+  input: {
+    workspace: WorkspaceFixture;
+    sessionId: string;
+    sequenceNo: number;
+    text: string;
+    occurredAt?: Date;
+    trigger?: 'auto' | 'manual';
+    question?: string;
+  },
 ): Promise<{ requestId: string; jobId: string; messageId: string; revision: number }> {
   const message = await seedMessage(pool, {
     sessionId: input.sessionId,
@@ -584,6 +592,8 @@ async function seedExecuteSearch(
     inputId: message.messageId,
     inputRevision: message.revision,
     sequenceNo: input.sequenceNo,
+    trigger: input.trigger,
+    question: input.question,
     searchAction: 'new_search',
   });
   await pool.query('UPDATE search_requests SET stage = $2, condition_hash = $3 WHERE id = $1', [
@@ -1087,6 +1097,53 @@ describe('M5 案件内厳密検索', () => {
     assert.equal(queryRequest.truncation, false);
     assert.ok((queryRequest.input ?? []).join('\n').includes('MARK-B'), 'query inputへ現在の質問を入れていない');
     assert.ok(allJevRawBody(jev).includes('MARK-A'), 'JevへAの候補本文が渡っていない');
+  });
+
+  it('manual受付は受付へ保存した質問をVoyage queryとJev現在質問へ使い、input原文を使わない', async () => {
+    const queryVector = basisVector(0, 1);
+    const { jev, voyage, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const session = await seedSession(pool, workspace);
+    const answerText = '過去の対応文書 QUESTION-MARK キャッシュ更新の記録';
+    const answer = await seedMessage(pool, { sessionId: session, sequenceNo: 1, role: 'assistant', text: answerText });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: session,
+      documentKey: 'doc-manual',
+      content: answerText,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: answer.messageId, messageRevision: 1, startOffset: 0, endOffset: answerText.length }],
+    });
+    const seeded = await seedExecuteSearch(pool, {
+      workspace,
+      sessionId: session,
+      sequenceNo: 2,
+      text: 'INPUT-MARK 入力原文の検索語',
+      trigger: 'manual',
+      question: 'QUESTION-MARK キャッシュ更新の質問',
+    });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const queryRequest = voyage.requests.find((item) => item.body.input_type === 'query');
+    assert.ok(queryRequest, 'manual検索でVoyage query埋め込みが行われていない');
+    const queryInput = (queryRequest.body.input ?? []).join('\n');
+    assert.ok(queryInput.includes('QUESTION-MARK'), 'query inputへ受付の質問を使っていない');
+    assert.ok(!queryInput.includes('INPUT-MARK'), 'query inputへinput原文を使っている');
+
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes('QUESTION-MARK'), 'Jevへ受付の質問を現在質問として渡していない');
+    assert.ok(!jevBody.includes('INPUT-MARK'), 'Jevへinput原文を現在質問として渡している');
+
+    const stored = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(stored.status, 'completed');
+    const result = await readStoredResult(pool, seeded.requestId);
+    assert.equal(result.trigger, 'manual');
+    assert.equal(result.input_id, seeded.messageId);
   });
 
   it('別案件・別会社・現在input自身・現在input以降の同session発言を候補とevidenceから除外する', async () => {
