@@ -148,6 +148,10 @@ async function countLinks(): Promise<number> {
   return Number(result.rows[0]?.count ?? '0');
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // evidenceのrevisionを1つ進める。旧revisionの根拠を弾く境界を作る。
 async function advanceMessageRevision(messageId: string, nextText: string): Promise<void> {
   const current = await pool.query<{ current_revision: number }>('SELECT current_revision FROM messages WHERE id = $1', [messageId]);
@@ -485,6 +489,50 @@ describe('M7 POST /v1/session-links', () => {
     assert.equal(duplicateActive.statusCode, 409, `同じactive linkの再作成を409にしない: ${duplicateActive.statusCode} ${duplicateActive.body}`);
     assert.equal(errorCode(duplicateActive), 'conflict');
     assert.equal(await countLinks(), 1, 'conflict時にlinkが保存されている');
+  });
+
+  it('根拠revision更新と競合した作成は、更新先行なら400にしてstale linkを残さない', async () => {
+    const toSessionId = await seedSessionFor('claude_code', 'race-to');
+    await seedSessionFor('codex', 'race-from');
+    const evidence = await insertMessage(pool, { sessionId: toSessionId, sourceMessageId: 'race-evidence', sequenceNo: 1 });
+    const body = buildLinkBody({
+      from: { source: 'codex', source_scope: SCOPE, source_session_id: 'race-from' },
+      to: { source: 'claude_code', source_scope: SCOPE, source_session_id: 'race-to' },
+      evidence: {
+        source: 'claude_code',
+        source_scope: SCOPE,
+        source_session_id: 'race-to',
+        source_message_id: 'race-evidence',
+        revision: 1,
+      },
+    });
+
+    const holder = await pool.connect();
+    try {
+      await holder.query('BEGIN');
+      // eventsのrevision更新と同じ順でmessages行を排他lockする。link作成はFOR SHAREで待つ。
+      await holder.query(
+        `INSERT INTO message_revisions (message_id, revision, text, content_hash) VALUES ($1, 2, $2, $3)`,
+        [evidence.messageId, 'race-evidence-revised', sha256Bytes('race-evidence-revised')],
+      );
+      await holder.query('UPDATE messages SET current_revision = 2, updated_at = now() WHERE id = $1', [evidence.messageId]);
+
+      const pending = postSessionLink({ token: workspace.token, body });
+      const settledEarly = await Promise.race([
+        pending.then(() => true),
+        sleep(300).then(() => false),
+      ]);
+      assert.equal(settledEarly, false, '根拠revision更新のcommit前にlink作成が完了した（row lockがない）');
+      await holder.query('COMMIT');
+
+      const response = await pending;
+      assert.equal(response.statusCode, 400, `stale revisionのlink作成を400にしない: ${response.statusCode} ${response.body}`);
+      assert.equal(errorCode(response), 'invalid_request');
+      assert.equal(await countLinks(), 0, '競合時にstaleなsession_linksが保存されている');
+    } finally {
+      await holder.query('ROLLBACK').catch(() => undefined);
+      holder.release();
+    }
   });
 
   it('未認証は401、案件memberでないtokenは403にする', async () => {
