@@ -401,19 +401,19 @@ async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView>
     error_code: origin.error_code,
   };
   const parts = completedResultParts(origin);
+  // 入力失効は元検索の状態より優先する。originがpending/running等でも旧revision受付への待機を続けない。
+  if (!(await currentInputValid(pool, row))) {
+    return {
+      ...tracking,
+      status: 'expired',
+      outcome: null,
+      error_code: 'input_revision_stale',
+      matches: [],
+      warnings: parts.warnings,
+      index_status: parts.index_status,
+    };
+  }
   if (origin.status === 'completed' && origin.outcome === 'matched') {
-    if (!(await currentInputValid(pool, row))) {
-      // 現在入力のrevision・scopeが変わったreuse元はmatchedを引き継がず、no_matchと区別したexpiredで返す。
-      return {
-        ...tracking,
-        status: 'expired',
-        outcome: null,
-        error_code: 'input_revision_stale',
-        matches: [],
-        warnings: parts.warnings,
-        index_status: parts.index_status,
-      };
-    }
     const matches = await revalidateMatches(pool, origin, origin.result);
     if (matches.length === 0) {
       return { ...tracking, outcome: 'no_match', matches: [], warnings: parts.warnings, index_status: parts.index_status };
