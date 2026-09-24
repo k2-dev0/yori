@@ -553,12 +553,26 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
   if (target === null) {
     throw new TargetMissingError('対象message/revisionがありません');
   }
+  // 対象messageが既に改訂されたstale workerは、現在の文書計画へ古いjobを適用せずlease条件付きで完了する。
+  if (target.currentRevision !== target.targetRevision) {
+    const completed = await completeJob(pool, {
+      jobId: job.id,
+      leaseToken: job.leaseToken,
+      targetRevision: job.targetRevision,
+    });
+    if (!completed) {
+      throw new LeaseLostError('jobを完了できません');
+    }
+    return;
+  }
   const generation = await ensureActiveGeneration(pool, target, config);
-  const messages = await loadSessionMessages(pool, target.sessionId);
+  const { messages, snapshot } = await loadSessionMessages(pool, target.sessionId);
   const chunks = await planDocumentChunks(target.sessionId, messages);
   const pending = await applyDocumentPlan(
     pool,
+    job,
     { companyId: target.companyId, projectId: target.projectId, sessionId: target.sessionId },
+    snapshot,
     chunks,
   );
   if (pending.length === 0) {
