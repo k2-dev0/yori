@@ -82,13 +82,29 @@ interface SessionStateRow {
   state_hash: Buffer | null;
   is_searchable: boolean | null;
   retention: string | null;
+  invalidating_relations: [string, string, number, number][];
 }
 
-// session全messageと、その現行revisionに対する現行policyのanalysisをsequence順に読む。
+// session全messageと、その現行revisionに対する現行policyのanalysis・有効revoke/change relationをsequence順に読む。
+// relationは同一案件（会社）内のmessage間に限定し、source/targetとも現行revision・現行policyの時だけ有効とする。
 // searchableな発言の抽出とsnapshot作成を同じ結果から行う。
 const SESSION_STATE_SQL = `
   SELECT m.id AS message_id, m.current_revision, r.text,
-         a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention
+         a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention,
+         COALESCE((
+           SELECT jsonb_agg(jsonb_build_array(mr.relation, mr.source_message_id, mr.source_revision, mr.target_revision)
+                            ORDER BY mr.source_message_id, mr.source_revision, mr.relation, mr.target_revision)
+             FROM message_relations mr
+             JOIN messages sm ON sm.id = mr.source_message_id
+             JOIN sessions ss ON ss.id = sm.session_id
+             JOIN sessions ts ON ts.id = m.session_id
+            WHERE mr.target_message_id = m.id
+              AND mr.target_revision = m.current_revision
+              AND mr.policy_version = $2
+              AND mr.relation IN ('revoke', 'change')
+              AND sm.current_revision = mr.source_revision
+              AND ss.project_id = ts.project_id
+         ), '[]'::jsonb) AS invalidating_relations
     FROM messages m
     LEFT JOIN message_revisions r ON r.message_id = m.id AND r.revision = m.current_revision
     LEFT JOIN message_analysis a ON a.message_id = m.id AND a.revision = m.current_revision AND a.policy_version = $2
@@ -101,8 +117,8 @@ async function loadSessionState(client: PoolClient, sessionId: string): Promise<
   return result.rows;
 }
 
-// 新規message追加・原文revision・analysisの再分類のどれでも変化する決定的fingerprint。
-// textは含めず、同じ計画前提ならbuildと適用直前の再確認で同じ値になる。
+// 新規message追加・原文revision・analysisの再分類・有効revoke/change relationの追加/変更の
+// どれでも変化する決定的fingerprint。textは含めず、同じ計画前提ならbuildと適用直前の再確認で同じ値になる。
 function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
   const state = rows.map((row) => ({
     message_id: row.message_id,
@@ -112,18 +128,26 @@ function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
     state_hash: row.state_hash === null ? null : row.state_hash.toString('hex'),
     is_searchable: row.is_searchable,
     retention: row.retention,
+    invalidating_relations: row.invalidating_relations,
   }));
   return createHash('sha256').update(JSON.stringify(state), 'utf8').digest();
 }
 
-// 現行revisionのsearchableな発言だけをsequence順に読む。progress_only/is_searchable=falseは除外する。
+// 現行revisionのsearchableな発言だけをsequence順に読む。progress_only/is_searchable=falseと
+// 現行policyで有効なrevoke/change relationのtargetは除外する。原文・relationは保持する。
 export async function loadSessionMessages(pool: Pool, sessionId: string): Promise<SessionPlanInput> {
   const client = await pool.connect();
   try {
     const rows = await loadSessionState(client, sessionId);
     const messages: SessionMessage[] = [];
     for (const row of rows) {
-      if (row.text !== null && row.text.length > 0 && row.is_searchable === true && row.retention !== 'progress_only') {
+      if (
+        row.text !== null &&
+        row.text.length > 0 &&
+        row.is_searchable === true &&
+        row.retention !== 'progress_only' &&
+        row.invalidating_relations.length === 0
+      ) {
         messages.push({ messageId: row.message_id, revision: row.current_revision, text: row.text });
       }
     }
