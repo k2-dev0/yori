@@ -2,13 +2,16 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { v7 as uuidv7 } from 'uuid';
+import { searchByInputQuerySchema, searchDetailQuerySchema } from '../../api/schema.js';
 import {
   findNonLoopbackIpv4,
   McpSession,
   requestUrl,
   startFakeCentralApi,
   type FakeCentralApi,
+  type FakeCentralReply,
   type McpToolCallResult,
+  type RecordedCentralRequest,
 } from './support.js';
 
 // M6採用シナリオ6・7: 公式SDK v2のstdio MCPアダプターの公開tool、strict入力、stdout非汚染、
@@ -67,6 +70,24 @@ function withoutKey(args: Record<string, unknown>, key: string): Record<string, 
   const copy = { ...args };
   delete copy[key];
   return copy;
+}
+
+// 中央APIのevents応答は受付した冪等キーをそのまま返す。record_caseは要求eventとの一致を検証する。
+function recordCaseReply(request: RecordedCentralRequest): FakeCentralReply {
+  const body = request.body as { events?: Array<{ idempotency_key?: string }> } | undefined;
+  return {
+    status: 202,
+    body: {
+      results: [
+        {
+          idempotency_key: body?.events?.[0]?.idempotency_key,
+          message_id: uuidv7(),
+          revision: 1,
+          request_id: null,
+        },
+      ],
+    },
+  };
 }
 
 // 中央APIの失敗・timeoutがtool errorとして返り、no_matchや空結果へ変換されていないことを確認する。
@@ -207,6 +228,12 @@ describe('M6 MCP toolから中央APIへの契約', () => {
       assert.equal(request.method, 'GET');
       assert.equal(url.pathname, `/v1/searches/${requestId}`);
       assert.equal(url.searchParams.get('wait_ms'), '1000');
+      assert.equal(url.searchParams.has('project_id'), false, 'request_id branchへproject_idを送っている');
+      assert.equal(
+        searchDetailQuerySchema.safeParse(Object.fromEntries(url.searchParams)).success,
+        true,
+        `request_id branchのqueryが中央API schemaと不一致: ${url.search}`,
+      );
       const structured = result.structuredContent as { status?: string; outcome?: string | null } | undefined;
       assert.equal(structured?.status, 'running');
       assert.equal(structured?.outcome ?? null, null);
@@ -250,6 +277,56 @@ describe('M6 MCP toolから中央APIへの契約', () => {
     }
   });
 
+  it('get_search_resultは外部入力IDでもwait_msをby-inputへ渡し、API schemaに適合するSearchViewを返す', async () => {
+    const requestId = uuidv7();
+    central.requests.length = 0;
+    central.setResponder(() => ({
+      status: 200,
+      body: {
+        lookup_status: 'found',
+        request_id: requestId,
+        input_id: uuidv7(),
+        input_revision: 1,
+        trigger: 'auto',
+        status: 'completed',
+        outcome: 'matched',
+        project_id: uuidv7(),
+        matches: [],
+        warnings: [],
+      },
+    }));
+    const session = await startSession();
+    try {
+      const result = await session.callTool('get_search_result', {
+        project_id: uuidv7(),
+        source: 'codex',
+        source_scope: 'scope-a',
+        source_session_id: 'session-a',
+        source_message_id: 'message-a',
+        revision: 1,
+        wait_ms: 1000,
+      });
+      assert.notEqual(result.isError, true, `by-inputのget_search_resultが失敗: ${JSON.stringify(result)}`);
+      const request = central.requests[0];
+      assert.ok(request);
+      const url = requestUrl(request);
+      assert.equal(request.method, 'GET');
+      assert.equal(url.pathname, '/v1/searches/by-input');
+      assert.equal(url.searchParams.get('wait_ms'), '1000', 'by-inputへwait_msを渡していない');
+      assert.equal(
+        searchByInputQuerySchema.safeParse(Object.fromEntries(url.searchParams)).success,
+        true,
+        `by-input branchのqueryが中央API schemaと不一致: ${url.search}`,
+      );
+      const structured = result.structuredContent as { lookup_status?: string; status?: string; outcome?: string | null } | undefined;
+      assert.equal(structured?.lookup_status, 'found');
+      assert.equal(structured?.status, 'completed');
+      assert.equal(structured?.outcome, 'matched');
+    } finally {
+      await session.close();
+    }
+  });
+
   it('get_evidenceはrevision付きで原文APIを呼び、identityとtextを返す', async () => {
     const messageId = uuidv7();
     const projectId = uuidv7();
@@ -287,10 +364,7 @@ describe('M6 MCP toolから中央APIへの契約', () => {
 
   it('record_caseは既存events APIへagent_reportとして固定順に送り、検索APIを呼ばない', async () => {
     central.requests.length = 0;
-    central.setResponder(() => ({
-      status: 202,
-      body: { results: [{ idempotency_key: 'case-1', message_id: uuidv7(), revision: 1, request_id: null }] },
-    }));
+    central.setResponder(recordCaseReply);
     const session = await startSession();
     try {
       const values = {
@@ -361,10 +435,7 @@ describe('M6 MCP toolから中央APIへの契約', () => {
 
   it('record_caseは600文字超でwarningを返して受理し、600文字以内ではwarningを返さない', async () => {
     central.requests.length = 0;
-    central.setResponder(() => ({
-      status: 202,
-      body: { results: [{ idempotency_key: 'case-warn', message_id: uuidv7(), revision: 1, request_id: null }] },
-    }));
+    central.setResponder(recordCaseReply);
     const session = await startSession();
     try {
       const shortResult = await session.callTool(
@@ -385,6 +456,87 @@ describe('M6 MCP toolから中央APIへの契約', () => {
       assert.notEqual(longResult.isError, true, `600文字超を拒否している: ${JSON.stringify(longResult)}`);
       assert.ok(JSON.stringify(longResult).includes('600'), '600文字超のwarningを返していない');
       assert.equal(central.requests.length, 2, '600文字超の記録が中央APIへ送られていない');
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('record_caseは要求eventと異なるidempotency_keyの応答を成功扱いしない', async () => {
+    central.requests.length = 0;
+    central.setResponder(() => ({
+      status: 202,
+      body: { results: [{ idempotency_key: 'different-key', message_id: uuidv7(), revision: 1, request_id: null }] },
+    }));
+    const session = await startSession();
+    try {
+      const result = await session.callTool('record_case', validRecordArgs());
+      assert.equal(result.isError, true, `異なるidempotency_keyの応答を成功扱いした: ${JSON.stringify(result)}`);
+      assert.ok(!JSON.stringify(result).includes(TOKEN), 'tokenがtool結果へ出ている');
+      assert.equal(central.requests.length, 1, '中央API呼出しが1回ではない');
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('中央APIの応答schemaが不正ならtool errorにし、token・外部error本文を出さない', async () => {
+    const session = await startSession();
+    const secret = 'external-secret-body';
+    const cases: Array<{ tool: string; args: Record<string, unknown>; body: Record<string, unknown> }> = [
+      { tool: 'search_history', args: validSearchArgs(), body: { trigger: 'manual', error: secret } },
+      {
+        tool: 'get_search_result',
+        args: { project_id: uuidv7(), request_id: uuidv7(), wait_ms: 0 },
+        body: { status: 'running', error: secret },
+      },
+      {
+        tool: 'get_evidence',
+        args: { project_id: uuidv7(), message_id: uuidv7(), revision: 1 },
+        body: { message_id: 'not-a-uuid', revision: 1, employee_id: uuidv7(), role: 'user', occurred_at: '2026-09-21T01:00:00.000Z', text: secret },
+      },
+      { tool: 'record_case', args: validRecordArgs(), body: { results: [], error: secret } },
+      {
+        tool: 'record_case',
+        args: validRecordArgs(),
+        body: { results: [{ idempotency_key: 123, message_id: uuidv7(), revision: 1, request_id: null }] },
+      },
+    ];
+    try {
+      for (const item of cases) {
+        central.requests.length = 0;
+        central.setResponder(() => ({ status: 200, body: item.body }));
+        const result = await session.callTool(item.tool, item.args);
+        assert.equal(result.isError, true, `${item.tool}: 不正な応答schemaを受理した: ${JSON.stringify(result)}`);
+        assert.ok(!JSON.stringify(result).includes(TOKEN), `${item.tool}: tokenがtool結果へ出ている`);
+        assert.ok(!JSON.stringify(result).includes(secret), `${item.tool}: 外部error本文がtool結果へ出ている`);
+      }
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('record_caseは本文上限超を中央APIへ送らず、配列件数上限も境界で拒否する', async () => {
+    central.requests.length = 0;
+    central.setResponder(recordCaseReply);
+    const session = await startSession();
+    try {
+      const oversized = await session.callTool(
+        'record_case',
+        validRecordArgs({
+          problem: `問題：${'あ'.repeat(40_000)}`,
+          action: `対応：${'い'.repeat(40_000)}`,
+          confirmation_status: '未確認',
+        }),
+        { timeoutMs: 20_000 },
+      );
+      assert.equal(oversized.isError, true, `本文上限超を受理した: ${JSON.stringify(oversized)}`);
+      assert.equal(central.requests.length, 0, '本文上限超を中央APIへ送っている');
+
+      const tooMany = await session.callTool(
+        'record_case',
+        validRecordArgs({ investigation_steps: Array.from({ length: 51 }, () => '手順') }),
+      );
+      assert.equal(tooMany.isError, true, `配列件数上限超を受理した: ${JSON.stringify(tooMany)}`);
+      assert.equal(central.requests.length, 0, '配列件数上限超を中央APIへ送っている');
     } finally {
       await session.close();
     }
@@ -459,6 +611,29 @@ describe('M6 MCPの失敗区別と接続先制約', () => {
       }
     } finally {
       await probe.close();
+    }
+  });
+
+  it('MCP設定URLは資格情報・query・fragmentを拒否する', async () => {
+    const invalidUrls = [
+      'http://user:pass@127.0.0.1:1',
+      'http://127.0.0.1:1/?x=1',
+      'http://127.0.0.1:1/#frag',
+    ];
+    for (const apiUrl of invalidUrls) {
+      const session = await McpSession.launch({ apiUrl, token: TOKEN });
+      try {
+        let rejected = false;
+        try {
+          await session.initialize(4000);
+        } catch {
+          rejected = true;
+        }
+        assert.equal(rejected, true, `${apiUrl} を受理した`);
+        assert.ok(!session.stdoutText.includes(TOKEN), `${apiUrl}: stdoutへtokenを出力している`);
+      } finally {
+        await session.close();
+      }
     }
   });
 });
