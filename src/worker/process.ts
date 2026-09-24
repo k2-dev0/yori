@@ -565,7 +565,8 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     }
     return;
   }
-  const generation = await ensureActiveGeneration(pool, target, config);
+  // 文書planの制限的変更（publication削除・is_searchable・revision状態）は、世代spec検証より先に
+  // 外部HTTP前のTXで反映する。世代不一致・retired/failedでも除外対象を残さない。
   const { messages, snapshot } = await loadSessionMessages(pool, target.sessionId);
   const chunks = await planDocumentChunks(target.sessionId, messages);
   const pending = await applyDocumentPlan(
@@ -576,12 +577,15 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     chunks,
   );
   if (pending.length === 0) {
+    // 埋め込み待ちが無ければ世代の作成/検証は不要。lease条件付きで完了する。
     const completed = await completeJob(pool, { jobId: job.id, leaseToken: job.leaseToken, targetRevision: job.targetRevision });
     if (!completed) {
       throw new LeaseLostError('jobを完了できません');
     }
     return;
   }
+  // 埋め込み待ちがある時だけ世代を検証/作成する。spec不一致・retired/failedは自動切替せず恒久失敗にする。
+  const generation = await ensureActiveGeneration(pool, target, config);
   const provider = new VoyageEmbeddingProvider(pool, config);
   let vectors: number[][];
   try {
