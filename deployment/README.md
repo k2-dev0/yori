@@ -131,7 +131,9 @@ Lightsail等のLinux VMへ配置する手順の出発点:
 2. DNSで `YORI_DOMAIN` をVMの公開IPへ向ける。`YORI_DOMAIN` を実domainにしてproduction profileを起動すると、Caddyがautomatic HTTPSで証明書を取得する。80はACMEとHTTPS redirectに使う。
 3. `docker compose -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用してから、`docker compose -p yori -f deployment/compose.yaml --profile production up -d` でapi・worker・db・caddyを起動する。apiのhost公開はloopbackのみ、caddy data/configとPostgreSQLはnamed volumeへ永続化される。
 4. `curl -sS https://<YORI_DOMAIN>/health/live` と `/health/ready`、`docker compose -p yori -f deployment/compose.yaml ps` でhealthを確認する。
-5. 更新は対象fileの変更後にmigrationとworkerを先に更新し、`docker compose ... up -d` で再作成する。問題時は直前のimage digestとmigrationへ戻し、DBは `down -v` を実行しない（volumeを保持する）。ただし単一VM・バックアップなしのため、rollbackの保証範囲はこのVM内に限る。
+5. 更新・rollback: このComposeのnode serviceはホストのsource treeを `/app` へbind mountするため、Node imageのdigestは**アプリ版を固定しない**（依存導入と実行環境の版）。アプリ版はGit commitで管理する。更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。`docker compose -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用し、`docker compose -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy` のようにserviceを明示再作成して新しいsourceを読み直させる。`down -v` は実行しない（volumeを保持する）。
+   - migrationはforward-onlyで、down migrationは提供しない。適用済みschemaは旧migration fileや旧base imageへ戻しても戻らない。
+   - rollbackできるのは、適用済みschemaと後方互換な旧sourceへ戻し、依存を復元し、api/worker/caddyを同じく明示再作成する場合だけ。非互換なschema変更後はこの手順だけではrollbackできず、事前に取得した管理者snapshotからのrestoreまたはforward fixが必要。自動backupは今回の実装対象外で、単一VM・バックアップなしのため保証範囲はこのVM内に限る。
 6. 資源は `docker stats`、`df -h`、`docker system df`、composeのjson-file log rotation（max-size 10m / max-file 3）で監視する。metricsの `search_duration_ms.p50/p95` と `reindex.pending_documents`、job滞留を確認する。
 7. 2 GBでOOM・継続的スワップ・待ち行列増加が出た場合は、4 GBへ増設してからDB・workerを再起動する。スワップを性能改善の中心にしない。DBは `shared_buffers=256MB` / `work_mem=4MB` / `maintenance_work_mem=64MB` を出発点とする。
 8. 外部Jev/Voyageへ実データを送る前に、管理者が学習利用条件・保持条件を確認し、`provider:approve` で承認を登録する。未承認の間は再索引も `blocked_policy` で外部送信しない。
