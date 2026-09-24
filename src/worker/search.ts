@@ -654,8 +654,8 @@ function buildMatch(
           related_to_message_id: draft.relatedToMessageId,
           related_to_revision: draft.relatedToRevision,
         }),
-    // 結果取得時のlink active再検証に使う内部field。API view組立時に除去する。
-    ...(draft.linkId === undefined ? {} : { _link_id: draft.linkId }),
+    // 結果取得時のlink経路再検証に使う内部field。API view組立時に除去する。
+    ...(draft.linkIds === undefined || draft.linkIds.length === 0 ? {} : { _link_ids: draft.linkIds }),
   }));
   return {
     case_or_document_id: assessment.candidate.documentId,
