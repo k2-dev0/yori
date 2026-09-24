@@ -61,6 +61,7 @@ interface SearchRequestRow {
   input_id: string;
   input_revision: number;
   input_sequence_no: number;
+  question: string | null;
 }
 
 interface CandidateSource {
@@ -286,9 +287,10 @@ async function selectCandidates(
 
 async function loadCandidates(
   pool: Pool,
-  input: { target: JobTarget; generation: EmbeddingGeneration; queryVector: readonly number[] },
+  input: { target: JobTarget; generation: EmbeddingGeneration; queryVector: readonly number[]; question: string },
 ): Promise<Candidate[]> {
-  const identifiers = extractEntityReferences(input.target.text);
+  // 検索の識別子経路は検索質問から抽出する。autoはinput原文、manualは受付へ保存した質問を使う。
+  const identifiers = extractEntityReferences(input.question);
   const client = await pool.connect();
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
@@ -453,9 +455,10 @@ async function recordJevUsage(
 // Jevへ候補本文と質問を送り、回答を候補ごとのrelevance・relevance_kindへ写す。
 async function evaluateCandidates(
   pool: Pool,
-  input: { target: JobTarget; config: WorkerConfig; candidates: readonly Candidate[]; jobKind: string },
+  input: { target: JobTarget; config: WorkerConfig; candidates: readonly Candidate[]; jobKind: string; question: string },
 ): Promise<CandidateAssessment[]> {
   const { questions, index } = buildCandidateQuestions(input.candidates);
+  // Jevの現在質問はmanual受付の質問、autoはinput原文。入力identityは検索対象messageのまま固定する。
   const state: JevState = {
     policy_version: WORKER_POLICY_VERSION,
     current: {
@@ -463,7 +466,7 @@ async function evaluateCandidates(
       revision: input.target.targetRevision,
       role: input.target.role,
       occurred_at: input.target.occurredAt,
-      parts: [{ offset: 0, length: input.target.text.length, text: input.target.text }],
+      parts: [{ offset: 0, length: input.question.length, text: input.question }],
     },
     prior_messages: [],
     prior_search: null,
@@ -1008,7 +1011,7 @@ export function searchRequestIdFromPayload(payload: unknown): string | null {
 // jobのmessage/revisionとsearch_requestのscope・input revision・new_searchを照合する。
 async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
-    `SELECT id, trigger, search_action, status, result, input_id, input_revision, input_sequence_no
+    `SELECT id, trigger, search_action, status, result, input_id, input_revision, input_sequence_no, question
        FROM search_requests
       WHERE id = $1
         AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
@@ -1058,6 +1061,11 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   if (request.search_action !== 'new_search') {
     throw new TargetMissingError('new_search以外のexecute_searchは処理しません');
   }
+  // 検索質問はmanual受付へ保存した質問、autoは固定input revisionの原文を使う。
+  const question = request.trigger === 'manual' ? request.question : target.text;
+  if (question === null) {
+    throw new TargetMissingError('manual検索の質問がありません');
+  }
   // 外部HTTPへ進む前に、対象requestだけをrunningにする。
   await markSearchRunning(pool, job, target, request);
   const generation = await loadFixedGeneration(pool, { companyId: target.companyId, projectId: target.projectId }, config);
@@ -1067,13 +1075,13 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   }
   // Jev本文予算は現在質問と候補本文の合計。質問だけで使い切る場合はno_matchに偽装せず恒久failedにする。
   const tokenizer = await loadVoyageTokenizer();
-  const questionTokens = tokenizer.encode(target.text).ids.length;
+  const questionTokens = tokenizer.encode(question).ids.length;
   if (questionTokens >= SEARCH_CANDIDATE_BUDGET_TOKENS) {
     throw new InputBudgetError();
   }
   const provider = new VoyageEmbeddingProvider(pool, config);
-  const queryVector = await provider.embedQuery(target.text, generation);
-  const candidates = await loadCandidates(pool, { target, generation, queryVector });
+  const queryVector = await provider.embedQuery(question, generation);
+  const candidates = await loadCandidates(pool, { target, generation, queryVector, question });
   const { selected, warnings } = await selectCandidates(candidates, questionTokens);
   if (selected.length === 0) {
     if (candidates.length > 0) {
@@ -1083,7 +1091,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [] });
     return;
   }
-  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind });
+  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, question });
   await saveSearchResult(pool, {
     job,
     target,
