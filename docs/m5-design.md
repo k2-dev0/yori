@@ -6,12 +6,12 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 ## schemaと識別子
 
 - `0005_m5.sql`は`document_entities`を追加する。文書ID・revision、会社・案件、種別、文字大小を保持したkeyを持ち、文書revisionへの複合FK、`(document_id, revision, entity_type, entity_key)`の一意制約、`(company_id, project_id, entity_type, entity_key)`の検索indexを持つ。
-- `build_documents`の文書計画適用TXで、文書revisionの本文から明示識別子を決定的に抽出し、当該revisionの行を置換する。再実行で増殖させない。
-- 初期の識別子は拡張子付きファイルpath/ファイル名（`./`、`../`、絶対pathを含む）、`name()`形式の関数、`Issue #123`、`PR #123`。文字大小と先頭表記を変えず、推定・部分一致・日本語全文検索は行わない。
+- `build_documents`の文書計画適用TXで、文書revisionの本文から明示識別子を決定的に抽出し、当該revisionの行を置換する。本文不変のready文書も同期対象にし、0005適用前から存在する文書を通常の再処理でbackfillする。revision・publication・embeddingは作り直さず、再実行でentityを増殖させない。
+- 初期の識別子は拡張子付きファイルpath/ファイル名（複数階層の`../`、`./`、絶対path、`.github/`等のhidden directoryを含む）、`name()`形式の関数、`Issue #123`、`PR #123`。文字大小と先頭表記を変えず、文末句読点やURL内部の部分pathを含めない。推定・部分一致・日本語全文検索は行わない。
 
 ## 検索開始と世代
 
-- `execute_search`はjob payloadの`search_request_id`とjob対象message/revision、会社・案件・社員・session、`new_search`を照合する。他の受付を入力IDから推測しない。
+- `execute_search`はjob payloadの`search_request_id`とjob対象message/revision、会社・案件・社員・session、`new_search`をDB正本で照合する。他の受付を入力IDから推測せず、障害更新とretryも同じscope一致を必須にする。不一致payloadで実在する別受付を更新しない。
 - 完了済みresultの再実行はresultを変更せず、同じjobだけをlease条件付きで完了する。
 - 外部送信前にjob leaseとscopeを再確認し、対象受付だけを`running`にする。失敗・retry・明示再開もpayloadの受付1件だけを更新する。
 - 開始時にprojectの`active_generation_id`を固定する。NULLなら外部送信せず`completed/no_match`。会社、status、provider/model、次元、metric、tokenizer、document/query前処理が現在configと一致しなければ`embedding_generation_mismatch`でfailedにし、自動切替しない。
