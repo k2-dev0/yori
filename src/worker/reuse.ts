@@ -106,7 +106,18 @@ async function chainRowEligible(pool: Pool, target: JobTarget, row: PriorSearch)
 // 直接のnew_search元へ解決する。chainの各受付が同じ適格性を満たさなければnew_searchへ戻す。
 export async function resolveReuse(pool: Pool, target: JobTarget, prior: PriorSearch | undefined): Promise<ReuseDecision> {
   const ineligible: ReuseDecision = { eligible: false, originRequestId: null };
-  if (!prior || !(await chainRowEligible(pool, target, prior))) {
+  if (!prior) {
+    return ineligible;
+  }
+  // 外部評価中に先行入力が改訂・失効するため、評価した受付を同じIDで読み直す。
+  // 別の受付へ切り替えず、Jevが比較した入力revisionが今も有効な場合だけ再利用する。
+  const refreshed = await loadPriorSearchById(pool, target, prior.requestId);
+  if (
+    refreshed === undefined ||
+    refreshed.inputId !== prior.inputId ||
+    refreshed.inputRevision !== prior.inputRevision ||
+    !(await chainRowEligible(pool, target, refreshed))
+  ) {
     return ineligible;
   }
   const member = await pool.query(
@@ -120,14 +131,14 @@ export async function resolveReuse(pool: Pool, target: JobTarget, prior: PriorSe
     return ineligible;
   }
   const visited = new Set<string>();
-  let current = prior;
+  let current = refreshed;
   for (let depth = 0; depth <= MAX_REUSE_CHAIN; depth += 1) {
     if (visited.has(current.requestId) || depth === MAX_REUSE_CHAIN) {
       return ineligible;
     }
     visited.add(current.requestId);
     if (current.reusedFromRequestId === null) {
-      return current.searchAction === null || current.searchAction === 'new_search'
+      return current.searchAction === 'new_search'
         ? { eligible: true, originRequestId: current.requestId }
         : ineligible;
     }
