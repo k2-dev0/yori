@@ -320,6 +320,7 @@ export interface SearchRequestSeed {
   outcome?: string | null;
   searchAction?: string | null;
   policyVersion?: string;
+  question?: string;
   reusedFromRequestId?: string | null;
   result?: unknown;
   createdAt?: Date;
@@ -331,8 +332,8 @@ export async function seedSearchRequest(pool: Pool, input: SearchRequestSeed): P
   await pool.query(
     `INSERT INTO search_requests
        (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger,
-        status, outcome, search_action, policy_version, reused_from_request_id, result, created_at, updated_at, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $16, $17)`,
+        status, outcome, search_action, policy_version, question, reused_from_request_id, result, created_at, updated_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $17, $18)`,
     [
       id,
       input.workspace.companyId,
@@ -347,6 +348,7 @@ export async function seedSearchRequest(pool: Pool, input: SearchRequestSeed): P
       input.outcome ?? null,
       input.searchAction ?? null,
       input.policyVersion ?? WORKER_POLICY_VERSION,
+      input.question ?? null,
       input.reusedFromRequestId ?? null,
       input.result === undefined ? null : JSON.stringify(input.result),
       input.createdAt ?? new Date(),
