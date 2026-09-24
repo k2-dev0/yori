@@ -694,6 +694,15 @@ function allJevRawBody(server: FakeJevServer): string {
   return server.requests.map((request) => request.rawBody).join('\n');
 }
 
+// M5の候補判定Jev requestだけを対象にする。M7の推定探索request（m7_context_*）は
+// 候補抽出の対象外で、周辺原文を含み得るため、entity guardの検証から分離する。
+function candidateEvaluationJevBody(server: FakeJevServer): string {
+  return server.requests
+    .filter((request) => request.rawBody.includes('"candidate_relevance:'))
+    .map((request) => request.rawBody)
+    .join('\n');
+}
+
 function evidenceFor(result: M5SearchResult, messageId: string): M5Evidence | undefined {
   for (const match of result.matches ?? []) {
     const found = (match.evidence ?? []).find((evidence) => evidence.message_id === messageId);
@@ -997,8 +1006,9 @@ describe('M5 schemaと識別子索引', () => {
     for (const form of entityForms) {
       assert.ok(jevBody.includes(form.marker), `複数階層path ${form.text} がentity routeでJev候補に入っていない`);
     }
+    const candidateJevBody = candidateEvaluationJevBody(jev);
     for (const form of guardForms) {
-      assert.ok(!jevBody.includes(form.marker), `${form.marker}をJev候補へ過剰抽出した`);
+      assert.ok(!candidateJevBody.includes(form.marker), `${form.marker}をM5候補判定へ過剰抽出した`);
     }
     const guardEntityCount = await pool.query<{ count: string }>(
       `SELECT count(*)::text AS count
@@ -2974,8 +2984,17 @@ describe('M5 世代固定と再検証', () => {
     assert.equal(request.outcome, 'matched');
     const result = await readStoredResult(pool, seeded.requestId);
     assert.ok(evidenceFor(result, messageOne.messageId), '検索開始時に固定した旧世代の文書evidenceがない');
-    assert.ok(!JSON.stringify(result).includes('GEN-TWO'), '切替後の新世代文書を結果へ混ぜた');
-    assert.ok(!allJevRawBody(jev).includes('GEN-TWO'), '切替後の新世代文書をJev候補へ渡した');
+    // 固定世代の代表evidenceと元の検索候補JevはGEN-ONEだけにする。M7の周辺原文として
+    // 現行revisionの別世代messageがrelated_evidenceへ入ることは許容する。
+    assert.ok(
+      !(result.matches?.[0]?.evidence ?? []).some((item) => item.message_id === messageTwo.messageId),
+      '切替後の新世代文書を代表evidenceへ混ぜた',
+    );
+    const genOneDocument = await findReadyDocumentByMessage(pool, workspace.projectId, messageOne.messageId);
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{ document_id?: string }>;
+    assert.equal(evaluations.length, 1, '固定世代以外の候補をJevへ渡した');
+    assert.equal(evaluations[0]?.document_id, genOneDocument?.id, 'Jev候補が固定世代のdocumentではない');
+    assert.ok(!candidateEvaluationJevBody(jev).includes('GEN-TWO'), '切替後の新世代文書をM5候補判定Jevへ渡した');
   });
 
   it('候補判定後に原文revisionが変わったevidenceは保存せずno_matchにする', async () => {
