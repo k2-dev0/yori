@@ -780,7 +780,9 @@ describe('M5 schemaと識別子索引', () => {
     const sessionId = await seedSession(pool, workspace);
     const text =
       'src/worker/process.ts、./src/worker/process.ts、../src/worker/process.ts、/repo/src/worker/process.ts を確認し、' +
-      'buildRequest() を直し、Issue #123 と PR #456、CaseSensitive.ts、https://example.com/src/worker/process.ts を参照した';
+      '../../src/process.ts と ../../../src/process.ts、.github/workflows/build.yml、src/process.ts.、pre../../src/unique-suffix.ts を参照し、' +
+      'buildRequest() を直し、Issue #123 と PR #456、CaseSensitive.ts、' +
+      'https://example.com/src/worker/process.ts と http://example.com/.github/workflows/build.yml を確認した';
     const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
     await runBuildJob(pool, message.buildJobId, config);
 
@@ -796,6 +798,26 @@ describe('M5 schemaと識別子索引', () => {
     assert.ok(keys.includes('./src/worker/process.ts'), `./付きpathのentityがない: ${JSON.stringify(keys)}`);
     assert.ok(keys.includes('../src/worker/process.ts'), `../付きpathのentityがない: ${JSON.stringify(keys)}`);
     assert.ok(keys.includes('/repo/src/worker/process.ts'), `絶対pathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('../../src/process.ts'), `複数階層../付きpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('../../../src/process.ts'), `3階層../付きpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('.github/workflows/build.yml'), `hidden directoryのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('src/process.ts'), `末尾句点を除いたpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(!keys.includes('src/process.ts.'), '末尾句点をentity_keyへ含めた');
+    const fileKeys = entities.rows.filter((row) => row.entity_type === 'file').map((row) => row.entity_key);
+    assert.ok(
+      !fileKeys.some((key) => /[.,;:)\]}"'`]$/.test(key)),
+      `区切り記号をentity_keyへ含めた: ${JSON.stringify(fileKeys)}`,
+    );
+    assert.ok(
+      !keys.includes('../../src/unique-suffix.ts') && !keys.includes('src/unique-suffix.ts') && !keys.includes('unique-suffix.ts'),
+      `先頭を捨てた部分文字列を抽出した: ${JSON.stringify(keys)}`,
+    );
+    assert.ok(!keys.includes('../src/process.ts') && !keys.includes('/src/process.ts'), '複数階層の先頭を落とした部分pathを抽出した');
+    assert.equal(
+      keys.filter((key) => key.endsWith('build.yml')).length,
+      1,
+      `URL内部のhidden pathを抽出した: ${JSON.stringify(keys)}`,
+    );
     assert.equal(
       keys.filter((key) => key.endsWith('/src/worker/process.ts')).length,
       3,
@@ -821,7 +843,7 @@ describe('M5 schemaと識別子索引', () => {
     assert.equal(Number(after.rows[0]?.count ?? '0'), before, '再実行でdocument_entitiesが増殖した');
   });
 
-  it('leading path 4形態はvector上位20外でもentity完全一致routeで候補になる', async () => {
+  it('leading path・hidden directoryはvector上位20外でもentity完全一致routeで候補になる', async () => {
     await requireM5Tables(pool);
     const queryVector = basisVector(0, 1);
     const { jev, config } = await startProviders(pool, workspace.companyId, {
@@ -835,6 +857,7 @@ describe('M5 schemaと識別子索引', () => {
       { marker: 'LEAD-TWO', text: '../src/worker/process.ts の修正' },
       { marker: 'LEAD-THREE', text: '/repo/src/worker/process.ts の修正' },
       { marker: 'LEAD-FOUR', text: 'src/worker/process.ts の修正' },
+      { marker: 'LEAD-FIVE', text: '.github/workflows/build.yml の修正' },
     ];
     const entityMessageIds: string[] = [];
     for (const [index, form] of forms.entries()) {
@@ -867,8 +890,9 @@ describe('M5 schemaと識別子索引', () => {
       });
     }
     const sessionB = await seedSession(pool, workspace);
+    // 平文formは末尾句点付きqueryでも句点を除いて同じentity routeへ到達する。
     const queryText =
-      './src/worker/process.ts ../src/worker/process.ts /repo/src/worker/process.ts src/worker/process.ts LEAD-QUERY';
+      './src/worker/process.ts ../src/worker/process.ts /repo/src/worker/process.ts src/worker/process.ts. .github/workflows/build.yml LEAD-QUERY';
     const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: queryText });
     await runExecuteSearch(pool, { jobId: seeded.jobId, config });
 
@@ -885,6 +909,110 @@ describe('M5 schemaと識別子索引', () => {
     for (const form of forms) {
       assert.ok(jevBody.includes(form.marker), `leading path ${form.text} がentity routeでJev候補に入っていない`);
     }
+  });
+
+  it('複数階層../・URL・部分文字列guardはentity routeの候補有無で判定する', async () => {
+    await requireM5Tables(pool);
+    const queryVector = basisVector(0, 1);
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const entityForms = [
+      { marker: 'DEEP-ONE', text: '../../src/worker/process.ts の修正' },
+      { marker: 'DEEP-TWO', text: '../../../src/worker/process.ts の修正' },
+    ];
+    const guardForms = [
+      { marker: 'URL-GUARD', text: 'https://example.com/repo/unique-url.ts の修正' },
+      { marker: 'SUFFIX-GUARD', text: 'pre../../src/unique-suffix.ts の修正' },
+    ];
+    const entityMessageIds: string[] = [];
+    for (const [index, form] of entityForms.entries()) {
+      const seededMessage = await seedSearchableMessage(pool, {
+        sessionId: sessionA,
+        sequenceNo: index + 1,
+        text: `${form.marker} ${form.text}`,
+      });
+      await runBuildJob(pool, seededMessage.buildJobId, config);
+      entityMessageIds.push(seededMessage.messageId);
+    }
+    // guard文書はentity文書と同じchunkへ混ざらないよう別sessionでbuildする。
+    const guardSessionId = await seedSession(pool, workspace);
+    for (const [index, form] of guardForms.entries()) {
+      const seededMessage = await seedSearchableMessage(pool, {
+        sessionId: guardSessionId,
+        sequenceNo: index + 1,
+        text: `${form.marker} ${form.text}`,
+      });
+      await runBuildJob(pool, seededMessage.buildJobId, config);
+    }
+    const formCount = entityForms.length + guardForms.length;
+    for (let index = 0; index < 21; index += 1) {
+      const text = `DEEP-VEC-${String(index + 1).padStart(2, '0')} 近傍候補`;
+      const message = await seedMessage(pool, {
+        sessionId: sessionA,
+        sequenceNo: formCount + index + 1,
+        role: 'assistant',
+        text: `近傍発言-${index + 1}`,
+      });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `deep-vector-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const sessionB = await seedSession(pool, workspace);
+    const queryText =
+      '../../src/worker/process.ts ../../../src/worker/process.ts https://example.com/repo/unique-url.ts pre../../src/unique-suffix.ts DEEP-QUERY';
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: queryText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const result = await readStoredResult(pool, seeded.requestId);
+    const topEvidence = result.matches?.[0]?.evidence ?? [];
+    assert.ok(
+      topEvidence.some((evidence) => entityMessageIds.includes(evidence.message_id)),
+      '複数階層../のentity route候補が代表evidenceになっていない',
+    );
+    const jevBody = allJevRawBody(jev);
+    for (const form of entityForms) {
+      assert.ok(jevBody.includes(form.marker), `複数階層path ${form.text} がentity routeでJev候補に入っていない`);
+    }
+    for (const form of guardForms) {
+      assert.ok(!jevBody.includes(form.marker), `${form.marker}をJev候補へ過剰抽出した`);
+    }
+    const guardEntityCount = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM document_entities e
+         JOIN search_documents d ON d.id = e.document_id
+        WHERE d.project_id = $1 AND d.session_id = $2`,
+      [workspace.projectId, guardSessionId],
+    );
+    assert.equal(
+      guardEntityCount.rows[0]?.count,
+      '0',
+      `URLや部分文字列のguard文書へentityを索引した: ${String(guardEntityCount.rows[0]?.count)}`,
+    );
+    const entityKeys = await pool.query<{ entity_key: string }>(
+      `SELECT entity_key FROM document_entities e JOIN search_documents d ON d.id = e.document_id
+        WHERE d.project_id = $1 AND d.session_id = $2 ORDER BY entity_key`,
+      [workspace.projectId, sessionA],
+    );
+    const distinctEntityKeys = [...new Set(entityKeys.rows.map((row) => row.entity_key))].sort();
+    assert.deepEqual(
+      distinctEntityKeys,
+      ['../../../src/worker/process.ts', '../../src/worker/process.ts'].sort(),
+      `複数階層pathのentity_keyが完全一致でない: ${JSON.stringify(entityKeys.rows.map((row) => row.entity_key))}`,
+    );
   });
 });
 
