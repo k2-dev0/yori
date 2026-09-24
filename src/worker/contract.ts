@@ -167,6 +167,14 @@ export interface JevPriorSearch {
   input_text: string;
 }
 
+// M5の候補判定でJevへ渡す検索文書revision。candidate_idは呼出し内で一意なdocument_id:revision。
+export interface JevStateCandidate {
+  candidate_id: string;
+  document_id: string;
+  revision: number;
+  text: string;
+}
+
 export interface JevState {
   policy_version: string;
   current: JevCurrentMessage;
@@ -179,6 +187,8 @@ export interface JevState {
     split_current: boolean;
     prior_search_omitted: boolean;
   };
+  // M5の候補判定だけが入れる。M3の分類・振り分けstateは省略し、cache keyを変えない。
+  candidates?: JevStateCandidate[];
 }
 
 export interface JevUsage {
@@ -205,3 +215,33 @@ export interface JevRequest {
   // Jevの公式契約では配列でなくmapで送る。keyが質問ID、answersも同じkeyで返る。
   questions: Record<string, JevChoiceQuestion>;
 }
+
+// ---- M5 検索・候補判定の固定契約（計画9.2.1、9.3、10.3） ----
+// vector/識別子の各経路の取得上限と、Jevへ渡す候補上限・本文予算。
+export const SEARCH_VECTOR_LIMIT = 20;
+export const SEARCH_ENTITY_LIMIT = 20;
+export const SEARCH_CANDIDATE_LIMIT = 10;
+export const SEARCH_CANDIDATE_BUDGET_TOKENS = 8_000;
+// RRFは各経路の順位rに対して1/(60+r)を加算する。
+export const SEARCH_RRF_RANK_CONSTANT = 60;
+// 検索候補取得TXのstatement_timeout。空結果へ読み替えず、超過はエラーとして扱う。
+export const SEARCH_STATEMENT_TIMEOUT_MS = 5_000;
+export const SEARCH_MODE_EXACT_VECTOR_AND_ENTITY = 'exact_vector_and_entity';
+
+// 候補の有用性4段階。useful/directだけを採用する。
+export const CANDIDATE_RELEVANCES = ['unrelated', 'peripheral', 'useful', 'direct'] as const;
+export type CandidateRelevance = (typeof CANDIDATE_RELEVANCES)[number];
+export const CANDIDATE_RELEVANCE_CRITERIA: Record<CandidateRelevance, string> = {
+  unrelated: '現在の質問と無関係',
+  peripheral: '周辺的で答えの根拠にならない',
+  useful: '再利用できる手順・根拠がある',
+  direct: '現在の質問へ直接答える',
+};
+
+// 候補判定の質問ID接頭辞。candidate_id（document_id:revision）付きで呼出し内に一意にする。
+export const CANDIDATE_RELEVANCE_QUESTION_PREFIX = 'candidate_relevance';
+export const CANDIDATE_SIMILAR_SYMPTOM_QUESTION_PREFIX = 'candidate_similar_symptom';
+export const CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX = 'candidate_reusable_procedure';
+export const CANDIDATE_YES_NO_CRITERIA = { yes: '当てはまる', no: '当てはまらない' };
+export const CANDIDATE_RELEVANCE_KINDS = ['similar_symptom', 'reusable_procedure'] as const;
+export type CandidateRelevanceKind = (typeof CANDIDATE_RELEVANCE_KINDS)[number];
