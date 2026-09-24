@@ -6,6 +6,7 @@ import { createPool, requireDatabaseUrl } from '../pool.js';
 import { runMigrations } from '../migrator.js';
 import {
   addProjectMember,
+  insertCompany,
   resetDatabase,
   seedWorkspace,
   sha256Bytes,
@@ -104,7 +105,7 @@ describe('migration管理', () => {
     }
 
     const versions = await pool.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    assert.deepEqual(versions.rows.map((row) => row.version), ['0001_init.sql', '0002_m3.sql', '0003_m3_response_model.sql']);
+    assert.deepEqual(versions.rows.map((row) => row.version), ['0001_init.sql', '0002_m3.sql', '0003_m3_response_model.sql', '0004_m4.sql']);
   });
 
   it('並行実行でもadvisory lockで1回だけ適用される', async () => {
@@ -112,7 +113,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '3');
+    assert.equal(versions.rows[0].count, '4');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -120,6 +121,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0001_init.sql'), '0001_init.sql がない');
     assert.ok(files.includes('0002_m3.sql'), '0002_m3.sql がない');
     assert.ok(files.includes('0003_m3_response_model.sql'), '0003_m3_response_model.sql がない');
+    assert.ok(files.includes('0004_m4.sql'), '0004_m4.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
@@ -368,7 +370,7 @@ function expectColumnType(
 
 async function m4UniqueColumnSets(table: string): Promise<string[][]> {
   const result = await pool.query<{ columns: string[] }>(
-    `SELECT array_agg(a.attname ORDER BY key.ordinality) AS columns
+    `SELECT array_agg(a.attname::text ORDER BY key.ordinality) AS columns
        FROM pg_index i
        JOIN pg_class c ON c.oid = i.indrelid
        JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -403,7 +405,7 @@ describe('M4 schema契約', () => {
   it('projects.active_generation_idはembedding_generations(id)を参照する', async () => {
     await requireM4Columns('embedding_generations', ['id']);
     const constraints = await pool.query<{ columns: string[]; ref_table: string }>(
-      `SELECT array_agg(a.attname) AS columns, c.confrelid::regclass::text AS ref_table
+      `SELECT array_agg(a.attname::text) AS columns, c.confrelid::regclass::text AS ref_table
          FROM pg_constraint c
          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
         WHERE c.conrelid = to_regclass('projects') AND c.contype = 'f'
@@ -521,6 +523,71 @@ describe('M4 schema契約', () => {
       `embedding_cacheの一意キーがcompany+generation+operation+input hashでない。実際: ${uniqueKeys.map((columns) => `(${columns.join(', ')})`).join(' ') || 'なし'}`,
     );
   });
+
+  it('search_document_sourcesは(message_id, message_revision)をmessage_revisionsへ複合FKで保証する', async () => {
+    await requireM4Columns('search_document_sources', ['message_id', 'message_revision']);
+    const constraints = await pool.query<{ columns: string[]; ref_table: string }>(
+      `SELECT array_agg(a.attname::text ORDER BY key.ordinality) AS columns, c.confrelid::regclass::text AS ref_table
+         FROM pg_constraint c
+         JOIN unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinality) ON true
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum
+        WHERE c.conrelid = to_regclass('search_document_sources') AND c.contype = 'f'
+        GROUP BY c.oid, c.confrelid`,
+    );
+    const target = constraints.rows.find(
+      (row) =>
+        row.ref_table === 'message_revisions' &&
+        row.columns.includes('message_id') &&
+        row.columns.includes('message_revision'),
+    );
+    assert.ok(
+      target,
+      `message_revisionsへの複合FK(message_id, message_revision)がない。実際: ${
+        constraints.rows.map((row) => `${row.ref_table}(${row.columns.join(', ')})`).join(' ') || 'なし'
+      }`,
+    );
+  });
+
+  it('embedding_generations.dimensionsは1..2000だけを許す', async () => {
+    const boundary = await insertEmbeddingGeneration({ companyId: workspace.companyId, dimensions: 2_000 });
+    assert.ok(boundary, 'dimensions=2000が登録できない');
+    await expectDbError(
+      insertEmbeddingGeneration({ companyId: workspace.companyId, dimensions: 0 }),
+      '23514',
+      'dimensions=0',
+    );
+    await expectDbError(
+      insertEmbeddingGeneration({ companyId: workspace.companyId, dimensions: 2_001 }),
+      '23514',
+      'dimensions=2001',
+    );
+  });
+
+  it('projectsは別会社のgenerationをactive世代にできず、同一会社だけを複合FKで許す', async () => {
+    const ownGenerationId = await insertEmbeddingGeneration({ companyId: workspace.companyId });
+    await pool.query('UPDATE projects SET active_generation_id = $2 WHERE id = $1', [workspace.projectId, ownGenerationId]);
+
+    const otherCompanyId = await insertCompany(pool, 'company-other');
+    const otherGenerationId = await insertEmbeddingGeneration({ companyId: otherCompanyId });
+    await expectDbError(
+      pool.query('UPDATE projects SET active_generation_id = $2 WHERE id = $1', [workspace.projectId, otherGenerationId]),
+      '23503',
+      '別会社generationのactive参照',
+    );
+  });
+
+  async function insertEmbeddingGeneration(input: { companyId: string; dimensions?: number; status?: string }): Promise<string> {
+    const id = uuidv7();
+    await pool.query(
+      `INSERT INTO embedding_generations
+         (id, company_id, provider, account_ref, endpoint, model, dimensions, metric, tokenizer_version,
+          document_input_type, query_input_type, normalization, status)
+       VALUES ($1, $2, 'voyage_direct', 'acct-a', 'https://api.voyageai.com/v1/embeddings', 'voyage-4-lite', $3, 'cosine',
+               'test-tokenizer', 'document', 'query', 'provider_default', $4)`,
+      [id, input.companyId, input.dimensions ?? 1024, input.status ?? 'active'],
+    );
+    return id;
+  }
 
   it('search_documents/search_document_revisions/document_publicationsの必須カラム型', async () => {
     const documents = await requireM4Columns('search_documents', [
