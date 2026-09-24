@@ -756,7 +756,7 @@ M5追加後の検証: srcテスト310件、配置・永続化7件、typecheck/li
 
 M6追加後の検証: srcテスト353件、typecheck/lint/buildが成功。M6 API 26件とstdio MCP 16件で、検索状態・outcomeの区別、reuse元追跡と根拠revision再検証、内部／外部入力ID照合、not_received、最大5秒のlong-poll、manual検索の冪等性・force refresh・質問本文のVoyage/Jev利用、案件・認証境界、4ツール、strict入力、中央API応答検証、HTTPS／loopback制約、標準出力非汚染、短い対応記録と600文字警告を実PostgreSQLとloopback fixtureで検証。原文取得は同一案件の保存済みrevisionを返すsmokeを実施。公式TypeScript SDK `@modelcontextprotocol/server` 2.1.0を固定した。実端末へのMCP登録、実Jev・実Voyage・実会話送信、M7の探索・通知は未実施。
 
-M7追加後の検証: srcテスト404件、typecheck/lint/buildが成功。M7単独44件で、session linkの保存制約・外部identity解決・認証社員の引き継ぎ先境界・冪等性・根拠revision競合、HTTP/MCP `link_session`、代表根拠の前後2発言、別sessionを起点とする明示linkの両方向3 hop・合計10 session・循環検知、同社員の前後各3 sessionと共通Issue／PR候補のJev判定、撤回／訂正chain、約6,000 token予算、保存直前とGET時のrevision・relation・active link再検証、UserPromptSubmit非同期hook用の補助通知を実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。補助通知は安全な次のmodel入力へ追加するだけで、新しいturnを強制開始せず、MCPの明示取得を置き換えない。実端末へのhook・MCP登録は未実施。
+M7追加後の検証: srcテスト419件、typecheck/lint/buildが成功。M7単独59件で、session linkの保存制約・外部identity解決・認証社員の引き継ぎ先境界・冪等性・根拠revision競合、HTTP/MCP `link_session`、代表根拠の前後2発言、別sessionを起点とする明示linkの両方向3 hop・合計10 session・循環検知、同社員の前後各3 sessionと共通Issue／PR候補のJev判定、撤回／訂正chain、複数target relation、約6,000 token予算、保存直前とGET時のrevision・relation・active link再検証、並行入力を分離し訂正を優先するUserPromptSubmit非同期hook補助通知を実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。補助通知は安全な次のmodel入力へ追加するだけで、新しいturnを強制開始せず、MCPの明示取得を置き換えない。実端末へのhook・MCP登録は未実施。
 
 ## 13. 必須の受け入れ条件
 
