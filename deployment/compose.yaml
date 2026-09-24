@@ -97,6 +97,30 @@ services:
       VOYAGE_API_URL: ${VOYAGE_API_URL:-https://api.voyageai.com/v1/embeddings}
       VOYAGE_REQUEST_TIMEOUT_MS: ${VOYAGE_REQUEST_TIMEOUT_MS:-20000}
 
+  # M8: production profileのHTTPS gateway。通常起動には含めず、apiのhealthcheck後に起動する。
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    profiles:
+      - production
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      YORI_DOMAIN: ${YORI_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - yori-caddy-data:/data
+      - yori-caddy-config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   migrate:
     <<: *node-service
     profiles:
@@ -110,6 +134,10 @@ services:
 volumes:
   yori-pgdata:
     name: ${YORI_PGDATA_VOLUME:-yori-pgdata}
+  yori-caddy-data:
+    name: ${YORI_CADDY_DATA_VOLUME:-yori-caddy-data}
+  yori-caddy-config:
+    name: ${YORI_CADDY_CONFIG_VOLUME:-yori-caddy-config}
   yori-node-modules:
     name: ${YORI_NODE_MODULES_VOLUME:-yori-node-modules}
   yori-npm-cache:
