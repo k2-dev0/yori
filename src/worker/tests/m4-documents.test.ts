@@ -373,6 +373,33 @@ async function upsertAnalysis(
   );
 }
 
+async function insertMessageRelation(
+  pool: Pool,
+  input: {
+    sourceMessageId: string;
+    sourceRevision: number;
+    targetMessageId: string;
+    targetRevision: number;
+    relation: string;
+    policyVersion?: string;
+  },
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO message_relations
+       (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, policy_version, evidence_ranges)
+     VALUES ($1, $2, $3, $4, $5, $6, true, $7, '[]'::jsonb)`,
+    [
+      uuidv7(),
+      input.sourceMessageId,
+      input.sourceRevision,
+      input.targetMessageId,
+      input.targetRevision,
+      input.relation,
+      input.policyVersion ?? WORKER_POLICY_VERSION,
+    ],
+  );
+}
+
 async function seedSearchableMessage(
   pool: Pool,
   input: {
@@ -1352,6 +1379,220 @@ describe('M4 progress_onlyの索引除外', () => {
         'progress_onlyへ再分類されたBが公開revisionに残っている',
       );
     }
+  });
+});
+
+describe('M4 revoke/change relationの索引除外', () => {
+  it('現行policyのrevokeで撤回された発言Aは、Voyage未承認でもpublicationごと即時除外される', async () => {
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const revoked = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '撤回対象として公開される発言A' });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: revoked.buildJobId, config })).status,
+      'completed',
+      '撤回対象Aのbuild_documentsがcompletedでない',
+    );
+    const document = (await readDocuments(pool, workspace.projectId))[0];
+    assert.ok(document, 'Aの公開文書がない');
+    assert.ok(
+      (await readPublications(pool, workspace.projectId)).some(
+        (publication) => publication.documentId === document.id && !publication.stale,
+      ),
+      'Aの公開publicationがない',
+    );
+
+    // 後続BからAの現行revisionへのrevoke relationを保存する。A自身のrevision/analysisは変更しない。
+    const revoker = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: 'Aを撤回する後続発言B',
+    });
+    await insertMessageRelation(pool, {
+      sourceMessageId: revoker.messageId,
+      sourceRevision: revoker.revision,
+      targetMessageId: revoked.messageId,
+      targetRevision: revoked.revision,
+      relation: 'revoke',
+    });
+
+    // Voyage未承認でも、外部HTTP前の文書plan TXで旧publicationを削除する。
+    await pool.query(
+      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      [workspace.companyId, VOYAGE_PROVIDER],
+    );
+    const requestsBefore = server.requests.length;
+    const blocked = await runBuildJob(pool, { buildJobId: revoker.buildJobId, config });
+    assert.equal(blocked.status, 'blocked_policy', `撤回後の再buildがblocked_policyでない: ${blocked.status}/${blocked.errorCode ?? ''}`);
+    assert.equal(server.requests.length, requestsBefore, 'Voyage未承認なのに送信している');
+
+    const afterDocument = (await readDocuments(pool, workspace.projectId)).find((item) => item.id === document.id);
+    assert.ok(afterDocument, '撤回後もdocument行が消えた');
+    assert.equal(afterDocument.isSearchable, false, '撤回済みAのdocumentがis_searchable=falseでない');
+    assert.equal(
+      (await readPublications(pool, workspace.projectId)).filter((publication) => publication.documentId === document.id).length,
+      0,
+      '撤回済みAを含むpublicationが残っている',
+    );
+    assert.equal(await currentMessageRevision(pool, revoked.messageId), revoked.revision, 'Aのcurrent revisionが変わった');
+    assert.equal(await messageRevisionText(pool, revoked.messageId, revoked.revision), revoked.text, 'Aの原文が消えた');
+    const relations = await pool.query<{ relation: string }>(
+      'SELECT relation FROM message_relations WHERE target_message_id = $1',
+      [revoked.messageId],
+    );
+    assert.equal(relations.rows.length, 1, 'relationが保持されていない');
+    const analysis = await pool.query<{ is_searchable: boolean; retention: string }>(
+      'SELECT is_searchable, retention FROM message_analysis WHERE message_id = $1 AND revision = $2',
+      [revoked.messageId, revoked.revision],
+    );
+    assert.equal(analysis.rows[0]?.is_searchable, true, 'Aのanalysisが変更された');
+    assert.equal(analysis.rows[0]?.retention, 'substantive', 'Aのretentionが変更された');
+  });
+
+  it('現行policyのchange relationも対象messageを索引対象から除外する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const target = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'changeの対象になる発言A' });
+    const source = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: 'Aを変更する後続発言B',
+    });
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: source.revision,
+      targetMessageId: target.messageId,
+      targetRevision: target.revision,
+      relation: 'change',
+    });
+
+    const loaded = await loadSessionMessages(pool, sessionId);
+    const ids = loaded.messages.map((message) => message.messageId);
+    assert.ok(!ids.includes(target.messageId), 'change relationのtargetが索引対象に残っている');
+    assert.ok(ids.includes(source.messageId), 'relation sourceの現行Bを誤除外した');
+  });
+
+  it('古いsource/target revision・別policy・revoke/change以外のrelationは現行messageを除外しない', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const target = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '誤除外されてはならない現行発言A' });
+    const source = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: 'relation sourceになる発言B',
+    });
+
+    // 両messageのcurrent revisionを進め、relationの有効revisionと異なる古いrevisionを作る。
+    const targetRevision2 = await advanceRevision(pool, target.messageId, '誤除外されてはならない現行発言Aの改訂版');
+    await upsertAnalysis(pool, { messageId: target.messageId, revision: targetRevision2 });
+    const sourceRevision2 = await advanceRevision(pool, source.messageId, 'relation sourceになる発言Bの改訂版');
+    await upsertAnalysis(pool, { messageId: source.messageId, revision: sourceRevision2 });
+
+    // 古いsource revisionからのrevoke。
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: source.revision,
+      targetMessageId: target.messageId,
+      targetRevision: targetRevision2,
+      relation: 'revoke',
+    });
+    // 古いtarget revisionへのrevoke。
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: sourceRevision2,
+      targetMessageId: target.messageId,
+      targetRevision: target.revision,
+      relation: 'revoke',
+    });
+    // 別policy版のrevoke。
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: sourceRevision2,
+      targetMessageId: target.messageId,
+      targetRevision: targetRevision2,
+      relation: 'revoke',
+      policyVersion: 'older-policy',
+    });
+    // revoke/change以外のrelation。
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: sourceRevision2,
+      targetMessageId: target.messageId,
+      targetRevision: targetRevision2,
+      relation: 'accept',
+    });
+    // 別案件・別会社のsource messageからのrevoke。
+    const otherWorkspace = await seedWorkspace(pool, {
+      name: 'company-relation-boundary',
+      repositoryIdentifier: 'repo-relation-boundary',
+    });
+    const otherSessionId = await seedSession(pool, otherWorkspace);
+    const otherSource = await seedMessage(pool, { sessionId: otherSessionId, sequenceNo: 1, text: '別案件からの撤回元' });
+    await insertMessageRelation(pool, {
+      sourceMessageId: otherSource.messageId,
+      sourceRevision: otherSource.revision,
+      targetMessageId: target.messageId,
+      targetRevision: targetRevision2,
+      relation: 'revoke',
+    });
+
+    const loaded = await loadSessionMessages(pool, sessionId);
+    const current = loaded.messages.find((message) => message.messageId === target.messageId);
+    assert.ok(current, '古い/別policy/対象外relationで現行Aを誤除外した');
+    assert.equal(current.revision, targetRevision2, 'Aの現行revisionでない');
+    assert.ok(
+      loaded.messages.some((message) => message.messageId === source.messageId),
+      'relation sourceの現行Bまで除外した',
+    );
+  });
+
+  it('snapshot後に有効revoke relationを追加したapplyDocumentPlanはStaleApplyErrorで文書状態を変えない', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const target = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 1,
+      text: 'snapshot後に撤回relationが追加される発言A',
+    });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: target.buildJobId, config })).status,
+      'completed',
+      'snapshot対象Aのbuild_documentsがcompletedでない',
+    );
+    const source = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: '撤回relationを追加する発言B',
+    });
+    const job = await claimBuildJob(pool, source.buildJobId);
+    const before = await loadSessionMessages(pool, sessionId);
+    const chunks = await planDocumentChunks(sessionId, before.messages);
+
+    await insertMessageRelation(pool, {
+      sourceMessageId: source.messageId,
+      sourceRevision: source.revision,
+      targetMessageId: target.messageId,
+      targetRevision: target.revision,
+      relation: 'revoke',
+    });
+    const stateBefore = await snapshotSearchState(pool, workspace.projectId);
+    await assert.rejects(
+      applyDocumentPlan(
+        pool,
+        job,
+        { companyId: workspace.companyId, projectId: workspace.projectId, sessionId },
+        before.snapshot,
+        chunks,
+      ),
+      (error: unknown) => error instanceof StaleApplyError,
+      'relation追加後のplan適用がStaleApplyErrorで拒否されない',
+    );
+    assert.deepEqual(
+      await snapshotSearchState(pool, workspace.projectId),
+      stateBefore,
+      'relation追加後の旧plan適用が文書状態を変えた',
+    );
   });
 });
 
