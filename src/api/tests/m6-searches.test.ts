@@ -136,6 +136,15 @@ function buildSearchBody(input: {
   };
 }
 
+interface ByInputFullBody extends SearchByInputResponseBody {
+  input_id?: string;
+  input_revision?: number;
+  trigger?: string;
+  matches?: Array<{ evidence: Array<{ message_id?: string; text?: string }> }>;
+  warnings?: Array<{ code?: string }>;
+  index_status?: { search_mode?: string; embedding_generation_id?: string };
+}
+
 function evidenceFor(input: IngestedEvent, text: string) {
   return {
     messageId: input.messageId,
@@ -562,6 +571,138 @@ describe('M6 GET /v1/searches/by-input 入力照合', () => {
       assert.equal(response.statusCode, 400, `不正query ${index} を受理した: ${response.statusCode} ${response.body}`);
       assert.equal(errorCode(response), 'invalid_request', `不正query ${index} の固定code`);
     }
+  });
+});
+
+describe('M6 GET /v1/searches/by-input wait_msと完全な結果', () => {
+  it('by-inputはwait_msで状態変更を待ち、completed matchedのmatches/index_status/warningsをlookup_status付きで返す', async () => {
+    const input = await ingestUserInput('by-input待機の入力');
+    const evidence = await ingestEvent('assistant', 'by-inputの根拠原文');
+    const started = Date.now();
+    const pending = getSearchByInput(app, {
+      token: workspace.token,
+      query: { project_id: workspace.projectId, input_id: input.messageId, input_revision: 1, wait_ms: 5000 },
+    });
+    await sleep(150);
+    await updateSearchRequest(pool, input.requestId, {
+      status: 'completed',
+      outcome: 'matched',
+      searchAction: 'new_search',
+      stage: 'completed',
+      result: buildMatchedResult({
+        requestId: input.requestId,
+        inputId: input.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: evidence.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:03:00.000Z',
+            text: 'by-inputの根拠原文',
+          },
+        ],
+      }),
+    });
+    const response = await pending;
+    const elapsed = Date.now() - started;
+
+    assert.equal(response.statusCode, 200, `by-input待機に失敗: ${response.statusCode} ${response.body}`);
+    const body = response.json<ByInputFullBody>();
+    assert.equal(body.lookup_status, 'found');
+    assert.equal(body.request_id, input.requestId, '現在入力のrequest_idを返していない');
+    assert.equal(body.input_id, input.messageId);
+    assert.equal(body.input_revision, 1);
+    assert.equal(body.status, 'completed', 'long-poll後にcompletedを返していない');
+    assert.equal(body.outcome, 'matched');
+    assert.equal(body.matches?.[0]?.evidence[0]?.message_id, evidence.messageId, 'matchesのevidenceを返していない');
+    assert.equal(body.index_status?.search_mode, 'exact_vector_and_entity', 'index_statusを返していない');
+    assert.equal(body.warnings?.length ?? 0, 0);
+    assert.ok(elapsed < 2500, `状態変更後もby-inputが復帰しない: ${elapsed}ms`);
+  });
+
+  it('by-inputとrequest_id取得はcompleted no_matchでもindex_status/warningsを欠かさない', async () => {
+    const input = await ingestUserInput('no_match完全結果の入力');
+    const generationId = uuidv7();
+    await updateSearchRequest(pool, input.requestId, {
+      status: 'completed',
+      outcome: 'no_match',
+      searchAction: 'new_search',
+      stage: 'completed',
+      result: {
+        request_id: input.requestId,
+        input_id: input.messageId,
+        input_revision: 1,
+        status: 'completed',
+        outcome: 'no_match',
+        project_id: workspace.projectId,
+        index_status: {
+          pending_documents: 0,
+          failed_documents: 0,
+          embedding_generation_id: generationId,
+          search_mode: 'exact_vector_and_entity',
+        },
+        matches: [],
+        warnings: [{ code: 'candidate_limit_exceeded', excluded_count: 1 }],
+      },
+    });
+
+    const byId = await getSearchById(app, { token: workspace.token, id: input.requestId });
+    assert.equal(byId.statusCode, 200, `request_id取得に失敗: ${byId.body}`);
+    const byIdBody = byId.json<{
+      outcome?: string;
+      matches?: unknown[];
+      index_status?: { search_mode?: string; embedding_generation_id?: string };
+      warnings?: Array<{ code?: string }>;
+    }>();
+    assert.equal(byIdBody.outcome, 'no_match');
+    assert.equal(byIdBody.matches?.length ?? 0, 0, 'no_matchでmatchesを返している');
+    assert.equal(byIdBody.index_status?.search_mode, 'exact_vector_and_entity', 'no_matchでindex_statusを落としている');
+    assert.equal(byIdBody.index_status?.embedding_generation_id, generationId);
+    assert.equal(byIdBody.warnings?.[0]?.code, 'candidate_limit_exceeded', 'no_matchでwarningsを落としている');
+
+    const byInput = await getSearchByInput(app, {
+      token: workspace.token,
+      query: { project_id: workspace.projectId, input_id: input.messageId, input_revision: 1 },
+    });
+    assert.equal(byInput.statusCode, 200, `by-input取得に失敗: ${byInput.body}`);
+    const byInputBody = byInput.json<ByInputFullBody>();
+    assert.equal(byInputBody.lookup_status, 'found');
+    assert.equal(byInputBody.status, 'completed');
+    assert.equal(byInputBody.outcome, 'no_match');
+    assert.equal(byInputBody.matches?.length ?? 0, 0);
+    assert.equal(byInputBody.index_status?.search_mode, 'exact_vector_and_entity');
+    assert.equal(byInputBody.warnings?.[0]?.code, 'candidate_limit_exceeded');
+  });
+
+  it('by-inputのwait_msも0〜5000の整数だけを受理し、未受付はwait_msでもnot_receivedのまま返す', async () => {
+    const input = await ingestUserInput('by-input wait_ms境界の入力');
+    for (const rawWaitMs of ['5001', '-1', '1.5', 'abc', '']) {
+      const response = await getSearchByInput(app, {
+        token: workspace.token,
+        query: { project_id: workspace.projectId, input_id: input.messageId, input_revision: 1, wait_ms: rawWaitMs },
+      });
+      assert.equal(response.statusCode, 400, `by-input wait_ms=${rawWaitMs} を受理した: ${response.statusCode} ${response.body}`);
+      assert.equal(errorCode(response), 'invalid_request', `by-input wait_ms=${rawWaitMs} の固定code`);
+    }
+
+    const zero = await getSearchByInput(app, {
+      token: workspace.token,
+      query: { project_id: workspace.projectId, input_id: input.messageId, input_revision: 1, wait_ms: 0 },
+    });
+    assert.equal(zero.statusCode, 200, `by-input wait_ms=0を拒否した: ${zero.body}`);
+
+    const started = Date.now();
+    const unknown = await getSearchByInput(app, {
+      token: workspace.token,
+      query: { project_id: workspace.projectId, input_id: uuidv7(), input_revision: 1, wait_ms: 5000 },
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(unknown.statusCode, 200, `未受付のby-input: ${unknown.body}`);
+    assert.equal(unknown.json<SearchByInputResponseBody>().lookup_status, 'not_received');
+    assert.ok(elapsed < 1000, `未受付なのにwait_ms待機した: ${elapsed}ms`);
   });
 });
 
