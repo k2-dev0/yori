@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1〜M7)",
+  "description": "社内開発会話の共有検索基盤 (M1〜M8)",
   "engines": {
     "node": ">=24"
   },
@@ -23,6 +23,9 @@
     "worker:retry": "tsx src/worker/cli.ts retry",
     "provider:approve": "tsx src/worker/cli.ts approve",
     "provider:revoke": "tsx src/worker/cli.ts revoke",
+    "worker:reindex": "tsx src/worker/cli.ts reindex",
+    "worker:generation-delete": "tsx src/worker/cli.ts generation:delete",
+    "worker:metrics": "tsx src/worker/cli.ts metrics",
     "mcp:start": "tsx src/mcp/server.ts"
   },
   "dependencies": {
