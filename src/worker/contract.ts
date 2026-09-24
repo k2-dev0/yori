@@ -69,6 +69,14 @@ export const SAME_CONDITION_VALUES = ['yes', 'no', 'unknown'] as const;
 export type SameCondition = (typeof SAME_CONDITION_VALUES)[number];
 export const JEV_SAME_CONDITIONS_QUESTION_ID = 'same_conditions';
 
+// relationの明示/推定を判定するChoice質問。既存fixtureはcriteria先頭を選ぶためexplicitを先頭にする。
+export const JEV_RELATION_EXPLICIT_QUESTION_ID = 'relation_explicit';
+export const RELATION_ACTIONS = ['accept', 'reject', 'revoke', 'change'] as const;
+export type RelationAction = (typeof RELATION_ACTIONS)[number];
+
+// 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
+export const JEV_QUESTIONS_VERSION = 'm3-1';
+
 // partごとに独立して質問するfield。検索振り分けもpart単位で確認して集約する。
 export const JEV_PART_FIELDS = [
   'retention',
@@ -120,14 +128,27 @@ export interface JevCurrentMessage {
   parts: JevStatePart[];
 }
 
+// 直近の先行検索の比較対象。条件同一の判定に必要な固定的なidentityと元入力だけをstateへ入れる。
+// 受付status/outcomeのような可変値は、route/classifyでstateとcache keyが揺れないよう含めない。
+export interface JevPriorSearch {
+  request_id: string;
+  input_id: string;
+  input_revision: number;
+  input_sequence_no: number;
+  input_text: string;
+}
+
 export interface JevState {
   policy_version: string;
   current: JevCurrentMessage;
   // 対象sequenceより前の同session発言だけを新しい順に最大6件入れる。
   prior_messages: JevStateMessage[];
+  // 直近の先行検索。予算に入らない場合はnullにし、reuseしない（same_conditionsはunknown扱い）。
+  prior_search: JevPriorSearch | null;
   truncation: {
     omitted_prior_messages: number;
     split_current: boolean;
+    prior_search_omitted: boolean;
   };
 }
 
