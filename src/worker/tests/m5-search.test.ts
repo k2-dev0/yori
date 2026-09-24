@@ -1448,6 +1448,47 @@ describe('M5 順位統合とJev投入量', () => {
     assert.equal(jev.requests.length, 0, '質問だけで予算超過なのにJevへ送信した');
   });
 
+  it('候補が存在しても全件が質問込みtoken予算に収まらない場合はinput_budget_exceededにする', async () => {
+    const queryVector = basisVector(0, 1);
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const tokenizer = await loadVoyageTokenizer();
+    const questionText = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 3_500)}`;
+    const questionTokens = tokenizer.encode(questionText).ids.length;
+    assert.ok(questionTokens < 8_000 && questionTokens > 7_000, `質問単独で予算を使い切らないfixtureにできない: ${questionTokens}`);
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    for (const [index, marker] of ['ALLOC-ONE', 'ALLOC-TWO'].entries()) {
+      const text = `${marker} ${exactTokenText(tokenizer, 800)}`;
+      const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: index + 1, role: 'assistant', text: `全候補除外-${index + 1}` });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `allocation-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const job = await readJob(pool, seeded.jobId);
+    assert.equal(job.status, 'failed', '全候補予算外をcompletedにした');
+    assert.equal(job.error_code, 'input_budget_exceeded');
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'failed');
+    assert.equal(request.error_code, 'input_budget_exceeded');
+    assert.notEqual(request.outcome, 'no_match');
+    assert.equal(request.result, null);
+    assert.equal(jev.requests.length, 0, '全候補予算外なのにJevへ送信した');
+  });
+
   it('同じ原文範囲の重複候補はJevへ1件にまとめ、結果evidenceにも重複させない', async () => {
     const queryVector = basisVector(0, 1);
     const { jev, config } = await startProviders(pool, workspace.companyId, {
@@ -2122,6 +2163,48 @@ describe('M5 実行状態と障害対象', () => {
     assert.equal(otherAfter.status, 'pending', '別案件payloadで無関係requestを更新した');
     assert.equal(otherAfter.error_code, null);
     assert.equal(otherAfter.result, null);
+  });
+
+  it('job.session_idがmessage所属sessionと異なる場合は処理せず、payload requestを更新しない', async () => {
+    const { jev, voyage, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
+    const messageSessionId = await seedSession(pool, workspace);
+    const otherSessionId = await seedSession(pool, workspace);
+    const message = await seedMessage(pool, { sessionId: messageSessionId, sequenceNo: 1, role: 'user', text: 'SESSION-MISMATCH' });
+    const requestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId: messageSessionId,
+      inputId: message.messageId,
+      inputRevision: message.revision,
+      sequenceNo: 1,
+      searchAction: 'new_search',
+    });
+    const jobId = await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:session-mismatch:${requestId}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: otherSessionId,
+      messageId: message.messageId,
+      targetRevision: message.revision,
+      payload: { search_request_id: requestId },
+    });
+    await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+    await runExecuteSearch(pool, { jobId, config });
+
+    const job = await readJob(pool, jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error_code, 'target_missing');
+    const request = await readSearchRequest(pool, requestId);
+    assert.equal(request.status, 'pending', 'session不一致jobが無関係requestを更新した');
+    assert.equal(request.error_code, null);
+    assert.equal(request.result, null);
+    assert.equal(voyage.requests.length, 0, 'session不一致jobでVoyageへ送信した');
+    assert.equal(jev.requests.length, 0, 'session不一致jobでJevへ送信した');
+
+    assert.equal(await retryJob(pool, jobId, config), false, 'session不一致jobでretryJobが再開した');
+    const jobAfter = await readJob(pool, jobId);
+    assert.equal(jobAfter.status, 'failed');
+    assert.equal(jobAfter.error_code, 'target_missing');
+    assert.equal((await readSearchRequest(pool, requestId)).status, 'pending');
   });
 });
 
