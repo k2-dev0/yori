@@ -1,10 +1,10 @@
 import {
   JEV_PART_SEPARATOR,
-  JEV_RELATION_EXPLICIT_QUESTION_ID,
   JEV_SAME_CONDITIONS_QUESTION_ID,
   RELATION_ACTIONS,
   RETENTIONS,
   jevQuestionId,
+  jevRelationExplicitQuestionId,
   jevTechnicalLabelQuestionId,
   TECHNICAL_LABELS,
   type JevAnswer,
@@ -97,7 +97,7 @@ function adoptedRelations(parts: readonly PartEvaluation[], threshold: number): 
     if (target === undefined || candidate === undefined) {
       continue;
     }
-    const explicitChoice = highChoice(part, `${JEV_RELATION_EXPLICIT_QUESTION_ID}${JEV_PART_SEPARATOR}0`, threshold);
+    const explicitChoice = highChoice(part, jevRelationExplicitQuestionId(candidate.messageId, 0), threshold);
     if (explicitChoice === undefined) {
       continue;
     }
