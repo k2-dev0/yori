@@ -1,13 +1,13 @@
 # worker（Jev分類・検索振り分け）
 
-M3の`src/worker/`は、`classify_message`と`route_search`のjobをJevで評価し、分類・原文位置・承認/撤回関係・検索振り分けを保存する。外向きのHTTP先は承認済みJev endpointだけで、実会話をテストへ使わない。M4の`build_documents`とM5の`execute_search`はpendingで登録するところまでで、workerはclaimしない。
+`src/worker/`はM3の`classify_message`/`route_search`（Jev）とM4の`build_documents`（Voyage埋め込み）を処理する。外向きのHTTP先は承認済みJev/Voyage endpointだけで、実会話をテストへ使わない。M5の`execute_search`はpendingで登録するところまでで、まだclaimしない。
 
 ## 前提
 
-- `0003_m3_response_model.sql`適用済みのPostgreSQL（M3の`0002_m3.sql`を含む）。workerはmigrationを実行しない。
-- `JEV_API_KEY`と`JEV_ACCOUNT_REF`。未設定・不正なら偽の判定へ進まず`invalid_worker_config`で起動に失敗する。
-- `JEV_API_URL`はHTTPS（開発用loopback HTTPのみ）で、pathは`/v1/systemone`固定。userinfo・query・fragmentは拒否する。3xxは追従せず、承認外endpointへ資格情報や本文を送らない。
-- 実データを送る前に、管理者がTypeSafe側のアカウント設定を確認する。この承認記録は設定を変更・証明しない。
+- `0004_m4.sql`適用済みのPostgreSQL（M3の`0002_m3.sql`/`0003_m3_response_model.sql`を含む）。workerはmigrationを実行しない。
+- `JEV_API_KEY`/`JEV_ACCOUNT_REF`と`VOYAGE_API_KEY`/`VOYAGE_ACCOUNT_REF`。未設定・不正なら偽の判定・送信へ進まず`invalid_worker_config`で起動に失敗する。
+- `JEV_API_URL`はHTTPS（開発用loopback HTTPのみ）で、pathは`/v1/systemone`固定。`VOYAGE_API_URL`は`/v1/embeddings`固定。userinfo・query・fragmentは拒否する。3xxは追従せず、承認外endpointへ資格情報や本文を送らない。
+- 実データを送る前に、管理者がTypeSafe/Voyage側のアカウント設定を確認する。この承認記録は設定を変更・証明しない。
 
 ## 環境変数
 
@@ -23,6 +23,10 @@ M3の`src/worker/`は、`classify_message`と`route_search`のjobをJevで評価
 | `JEV_REQUEST_TIMEOUT_MS` | `20000` | 1回の外部呼出しtimeout。`JEV_JOB_LEASE_MS`より短くする |
 | `JEV_JOB_LEASE_MS` | `60000` | job lease。処理中は半分の間隔で延長する |
 | `JEV_WORKER_POLL_MS` | `1000` | 新規jobが無い時のpoll間隔 |
+| `VOYAGE_API_KEY` | 必須 | VoyageのBearer credential。ログ・引数へ出さない |
+| `VOYAGE_ACCOUNT_REF` | 必須 | Voyage承認とusageのaccount参照 |
+| `VOYAGE_API_URL` | `https://api.voyageai.com/v1/embeddings` | 完全endpoint。loopback HTTPは開発用のみ |
+| `VOYAGE_REQUEST_TIMEOUT_MS` | `20000` | Voyage 1回の外部呼出しtimeout。`JEV_JOB_LEASE_MS`より短くする |
 
 ## 起動
 
@@ -66,7 +70,7 @@ npm run provider:approve -- /path/to/approval.json
 npm run provider:revoke -- <approval-id>
 ```
 
-- `terms_checked_at`は管理者が規約を確認した日時で必須。既存seedとの互換のため、未設定行は`confirmed_at`を確認日として扱う。
+- `terms_checked_at`は管理者が規約を確認した日時で必須。NULL（未設定）は未確認として扱い、外部送信0件・blocked_policyにする（`confirmed_at`での代用はしない）。
 - 各HTTP送信の直前にDBの承認を確認する。part・再試行・評価キャッシュ再利用でも同じ。lease更新などDB待機の後も送信直前へ再確認し、待機中に失効していれば送信せず`blocked_policy`にする。
 - 未承認は`classify_message`/`route_search`とも`blocked_policy`として保持し、検索受付は`failed`/`provider_policy_unverified`にする。`no_match`にはしない。
 - account・endpointを変えた承認は継承しない。承認失効後は再登録するまで外部送信しない。
@@ -75,7 +79,7 @@ npm run provider:revoke -- <approval-id>
 
 | command | 動作 |
 |---|---|
-| `npm run worker:start` | route/classifyの2 laneでjobを処理する |
+| `npm run worker:start` | route lane 1 + classify/buildの外部処理lane 1（計2並列）でjobを処理する |
 | `npm run worker:retry -- <jobId>` | `failed`/`blocked_policy`のjobを、現在の承認を確認してpendingへ戻す。routeは検索受付も同一TXで戻す |
 | `npm run provider:approve -- <approval.json>` | 承認を登録し、同じendpointの旧承認を失効させる |
 | `npm run provider:revoke -- <approval-id>` | 承認を失効させる |
@@ -84,7 +88,7 @@ npm run provider:revoke -- <approval-id>
 
 ## 処理内容
 
-workerはroute laneとclassify laneを各1、合計2並列で走らせ、各laneは同時に1jobだけclaimする。`build_documents`/`execute_search`はclaimしない。
+workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、各laneは同時に1jobだけclaimする。`execute_search`はM5までclaimしない。
 
 ### classify_message
 
@@ -107,6 +111,15 @@ workerはroute laneとclassify laneを各1、合計2並列で走らせ、各lane
 - `pending`/`running`の先行検索は共有できる。`completed`は`matched`かつ10分以内の時だけ。`failed`/`expired`/`skipped`/`no_match`・対象不明・失効・条件変更・不確実・低信頼は`new_search`。
 - matchedの根拠はevidenceのmessage_id/revisionが現行revision・同案件であること、最新分析がprogress_onlyでないこと、revoke/change関係で無効化されていないことを検証する。不明な形式・根拠なしは再利用しない。
 
+### build_documents
+
+- sessionの現行message revisionと`initial-v1`の現行analysisだけを使い、is_searchable=false/progress_onlyを除外して決定的な検索文書を作る。詳細は[m4-design.md](m4-design.md)。
+- 目標800・上限1200・重複100トークン（provider document prefix予約32トークン込み）。message→paragraph→code block境界を優先し、上限超過blockだけをUTF-16 range付きで分割する。
+- projectの初回だけactive generationを作成/再利用して紐付ける。既存世代がconfigと不一致なら`embedding_generation_mismatch`の恒久失敗。
+- 文書構築TXの後、承認済みVoyageへ`voyage-4-lite`/input_type=document/1024/float/truncation=falseで送信する。応答index・件数・model・次元・finite・非ゼロを検証し、不正は`provider_contract_invalid`、他の4xxは`provider_rejected`でfailedにする。恒久エラー時はそのjobが保持するpending/embedding revisionだけをfailedにし、明示retryで同じrevisionをpendingへ戻して再埋め込みする。
+- 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にstale=falseへ戻し、以前のready revisionはsupersededにする。
+- `embedding_cache`（company+generation+operation+input hash）はvector結果だけを再利用し、document/sourceのidentityを統合しない。cache hitでも承認を再確認し、未承認はblocked_policyにする。
+
 ### 評価キャッシュ
 
 同一会社・provider/account/endpoint・要求model・閾値・policy版・質問版・state hashが一致する完了済み評価だけを`jev_evaluations`から再利用する。実応答model（`response_model`）がNULLの旧行は応答model不明として再利用せず、再評価して同keyの行を実応答model付きで更新する。cache利用でも承認を再確認する。同時missでの二重外部評価は許容する。
@@ -119,12 +132,14 @@ workerはroute laneとclassify laneを各1、合計2並列で走らせ、各lane
 
 - 429/529/5xx/timeout/通信障害: jobはpendingへ戻し、Retry-Afterと指数バックオフ+jitterで再試行する。検索受付はfailedとcodeを持ち、自動再試行のclaim時にpendingへ戻す。
 - 401/422/応答契約不正: `failed`で保持する。自動では再送しない。
-- 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す。
+- 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev）。
+- Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
+- 外部待ち中に原文revision・desired_revision・generation・leaseが変化した応答は保存・公開せず、lease期限後の回収へ委ねる。
 - 検索受付の`failed`は`no_match`ではない。M5の検索完了を偽らない。
 
-## M4/M5待ちの見分け
+## M5待ちの見分け
 
-`build_documents`と`execute_search`がpendingのまま残っているのはM4/M5未実装のためで、分類失敗や検索のno_matchではない。原文は`message_revisions`に保持され、`message_analysis`と`message_relations`は再実行で増殖しない。
+`execute_search`がpendingのまま残っているのはM5未実装のためで、検索のno_matchではない。`build_documents`の失敗・blocked_policyは分類失敗や検索結果なしとは区別し、原文は`message_revisions`に保持する。`message_analysis`と`message_relations`は再実行で増殖しない。
 
 ## 既知の保留事項
 
