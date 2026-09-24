@@ -186,8 +186,11 @@ async function createNotificationFixture(
   };
 }
 
-function searchView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
+function searchView(
+  overrides: Record<string, unknown> = {},
+  relatedEvidence: Array<Record<string, unknown>> = [],
+): Record<string, unknown> {
+  const view: Record<string, unknown> = {
     lookup_status: 'found',
     request_id: uuidv7(),
     input_id: uuidv7(),
@@ -213,13 +216,15 @@ function searchView(overrides: Record<string, unknown> = {}): Record<string, unk
             text: 'M7-EVIDENCE-TEXT 過去の対応記録',
           },
         ],
-        related_evidence_ids: [],
+        ...(relatedEvidence.length === 0 ? {} : { related_evidence: relatedEvidence }),
+        related_evidence_ids: relatedEvidence.map((item) => item.message_id),
         truncated: false,
       },
     ],
     warnings: [],
     ...overrides,
   };
+  return view;
 }
 
 function queryParams(request: RecordedHttpRequest): URLSearchParams {
@@ -415,6 +420,49 @@ describe('M7 collector補助通知', () => {
           assert.equal(result.stdout.trim(), '', 'identity不明なのに追加contextを出力している');
           assert.equal(central.byInputRequests.length, 0, 'identity不明なのにby-inputを呼んでいる');
           assert.ok(!JSON.stringify(central.requests).includes('invented-user-message'), 'promptからmessage IDを発明している');
+        });
+      },
+    );
+  });
+
+  it('matched通知のadditionalContextへ訂正relatedの本文とrelationを含める', async () => {
+    await withCentral(
+      () => ({
+        status: 200,
+        body: searchView({}, [
+          {
+            message_id: uuidv7(),
+            revision: 1,
+            employee_id: uuidv7(),
+            role: 'assistant',
+            occurred_at: '2026-09-21T01:01:00.000Z',
+            text: 'M7-CORRECTION-TEXT 訂正本文',
+            source_kind: 'correction',
+            relation: 'change',
+            related_to_message_id: uuidv7(),
+            related_to_revision: 1,
+          },
+          {
+            message_id: uuidv7(),
+            revision: 1,
+            employee_id: uuidv7(),
+            role: 'assistant',
+            occurred_at: '2026-09-21T01:02:00.000Z',
+            text: 'M7-RELATED-NEIGHBOR 周辺本文',
+            source_kind: 'neighbor',
+          },
+        ]),
+      }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          const context = hookContext(result.stdout);
+          assert.ok(context.includes('M7-EVIDENCE-TEXT'), '元根拠textがadditionalContextにない');
+          assert.ok(context.includes('M7-CORRECTION-TEXT'), '訂正文がadditionalContextにない');
+          assert.ok(context.includes('change'), 'correctionのrelationがadditionalContextにない');
+          assert.ok(context.includes('M7-RELATED-NEIGHBOR'), 'related_evidenceがadditionalContextにない');
+          assert.ok(!result.stdout.includes('token-a'), 'tokenを出力している');
         });
       },
     );
