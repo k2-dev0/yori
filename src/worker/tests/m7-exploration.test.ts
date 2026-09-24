@@ -891,6 +891,74 @@ describe('M7 最終コンテキストのtoken予算', () => {
     }
   });
 
+  it('correctionをneighborより先に予算確保し、予算外の長いneighborを落とす', async () => {
+    const tokenizer = await loadVoyageTokenizer();
+    const neighborBody = exactTokenText(tokenizer, 2_000);
+    const correctionBody = exactTokenText(tokenizer, 200);
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace, { sourceSessionId: 'm7-budget-priority' });
+    await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: `${neighborBody} BUDGET-PRIORITY-N1` });
+    const correction = await seedMessage(pool, { sessionId, sequenceNo: 2, text: `${correctionBody} BUDGET-PRIORITY-CORRECTION` });
+    const primaryText = 'PRIMARY-BUDGET-PRIORITY';
+    const primary = await seedMessage(pool, { sessionId, sequenceNo: 3, role: 'assistant', text: primaryText });
+    await seedMessage(pool, { sessionId, sequenceNo: 4, role: 'assistant', text: `${neighborBody} BUDGET-PRIORITY-N2` });
+    await seedMessage(pool, { sessionId, sequenceNo: 5, role: 'assistant', text: `${neighborBody} BUDGET-PRIORITY-N3` });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 7, text: 'QUERY-M7-BUDGET-PRIORITY' });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId,
+      documentKey: 'm7-budget-priority-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+    await seedRelation(pool, {
+      sourceMessageId: correction.messageId,
+      sourceRevision: 1,
+      targetMessageId: primary.messageId,
+      targetRevision: 1,
+      relation: 'change',
+    });
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const result = await readStoredResult(input.requestId);
+    const match = primaryMatch(result);
+    const correctionItem = relatedWithText(match, 'BUDGET-PRIORITY-CORRECTION');
+    assert.ok(correctionItem, `correctionが予算採用されていない: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+    assert.equal(correctionItem.source_kind, 'correction');
+    assert.equal(correctionItem.relation, 'change');
+    assert.equal(match.truncated, true, '予算除外時にtruncated=trueを返していない');
+    assert.ok(
+      warningCodes(result).includes('context_token_budget_exceeded'),
+      `warningにcontext_token_budget_exceededがない: ${JSON.stringify(result.warnings)}`,
+    );
+    const droppedNeighbors = ['BUDGET-PRIORITY-N1', 'BUDGET-PRIORITY-N2', 'BUDGET-PRIORITY-N3'].filter(
+      (marker) => relatedWithText(match, marker) === undefined,
+    );
+    assert.ok(droppedNeighbors.length >= 1, `予算外の長いneighborが除外されていない: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+    const additionalTokens = relatedEvidence(match).reduce(
+      (total, item) => total + tokenizer.encode(item.text).ids.length,
+      0,
+    );
+    assert.ok(additionalTokens <= 6_000, `追加候補が6,000 tokenを超えている: ${additionalTokens}`);
+    // 出力順は既存契約どおりneighbor→correctionのままにする。
+    const orderKinds = relatedEvidence(match).map((item) => item.source_kind ?? '');
+    assert.ok(
+      orderKinds.indexOf('neighbor') < orderKinds.indexOf('correction'),
+      `採用順の変更で出力順が崩れている: ${JSON.stringify(orderKinds)}`,
+    );
+  });
+
   it('primary単独が6,000 tokenを超えても原文を切り詰めず、truncatedとwarningを返す', async () => {
     const tokenizer = await loadVoyageTokenizer();
     const primaryText = exactTokenText(tokenizer, 6_500);
