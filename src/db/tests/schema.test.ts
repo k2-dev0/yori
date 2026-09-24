@@ -113,6 +113,7 @@ describe('migration管理', () => {
       '0003_m3_response_model.sql',
       '0004_m4.sql',
       '0005_m5.sql',
+      '0006_m6.sql',
     ]);
   });
 
@@ -121,7 +122,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '5');
+    assert.equal(versions.rows[0].count, '6');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -131,6 +132,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0003_m3_response_model.sql'), '0003_m3_response_model.sql がない');
     assert.ok(files.includes('0004_m4.sql'), '0004_m4.sql がない');
     assert.ok(files.includes('0005_m5.sql'), '0005_m5.sql がない');
+    assert.ok(files.includes('0006_m6.sql'), '0006_m6.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
