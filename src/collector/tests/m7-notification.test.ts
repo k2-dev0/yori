@@ -226,6 +226,19 @@ function queryParams(request: RecordedHttpRequest): URLSearchParams {
   return new URL(request.url, 'http://central.test').searchParams;
 }
 
+// 成功通知はUserPromptSubmit hookの1行JSON。containsだけで済ませず全文をparseしcontextを取り出す。
+function hookContext(stdout: string): string {
+  const lines = stdout.trim().split('\n');
+  assert.equal(lines.length, 1, `stdoutが1行JSONではない: ${stdout}`);
+  const parsed = JSON.parse(lines[0] as string) as {
+    hookSpecificOutput?: { hookEventName?: string; additionalContext?: string };
+  };
+  assert.equal(parsed.hookSpecificOutput?.hookEventName, 'UserPromptSubmit', 'hookEventNameが違う');
+  const context = parsed.hookSpecificOutput?.additionalContext;
+  assert.equal(typeof context, 'string', 'additionalContextがない');
+  return context as string;
+}
+
 async function withCentral<T>(byInput: ByInputResponder, fn: (central: FakeCentral) => Promise<T>): Promise<T> {
   const central = await startFakeCentral(byInput);
   try {
@@ -271,10 +284,11 @@ describe('M7 collector補助通知', () => {
             const result = await runNotify(fixture, { token, homeDir });
             assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
             assert.ok(result.stdout.trim().length > 0, '完了結果がstdoutへ出力されていない');
-            assert.ok(result.stdout.includes('matched'), '追加contextにoutcomeがない');
-            assert.ok(result.stdout.includes('M7-EVIDENCE-TEXT'), '追加contextに根拠原文がない');
-            assert.ok(/過去|履歴/.test(result.stdout), '過去履歴の資料であることが追加contextにない');
-            assert.ok(/命令|指示/.test(result.stdout), '現在の命令ではないことが追加contextにない');
+            const context = hookContext(result.stdout);
+            assert.ok(context.includes('matched'), '追加contextにoutcomeがない');
+            assert.ok(context.includes('M7-EVIDENCE-TEXT'), '追加contextに根拠原文がない');
+            assert.ok(/過去|履歴/.test(context), '過去履歴の資料であることが追加contextにない');
+            assert.ok(/命令|指示/.test(context), '現在の命令ではないことが追加contextにない');
             assert.ok(!result.stdout.includes(token) && !result.stderr.includes(token), 'tokenを出力している');
             await assertStateDoesNotContain(fixture.fixture.stateDir, token);
             assert.equal(await readFile(fixture.configPath, 'utf8'), configBefore, 'collector設定を書き換えている');
@@ -312,13 +326,60 @@ describe('M7 collector補助通知', () => {
     await withCentral(
       (_request, index) => replies[Math.min(index, replies.length - 1)] as FakeReply,
       async (central) => {
-        await withFixture(central, {}, async (fixture) => {
-          for (const _reply of replies) {
+        // 各呼出しで新規user inputが確定する状態を作り、by-inputの1回ずつの応答を検証する。
+        for (const _reply of replies) {
+          await withFixture(central, {}, async (fixture) => {
             const result = await runNotify(fixture);
             assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
             assert.equal(result.stdout.trim(), '', `処理中・未受付で追加contextを出力している: ${result.stdout}`);
-          }
-          assert.equal(central.byInputRequests.length, replies.length, 'by-inputの呼出し回数が想定と違う');
+          });
+        }
+        assert.equal(central.byInputRequests.length, replies.length, 'by-inputの呼出し回数が想定と違う');
+      },
+    );
+  });
+
+  it('今回collectで新規・更新されたuser inputがない場合はby-inputを呼ばず無出力で終了する', async () => {
+    await withCentral(
+      () => ({ status: 200, body: searchView() }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const first = await runNotify(fixture);
+          assert.equal(first.code, 0, `notifyが失敗した: ${first.stderr}`);
+          assert.ok(hookContext(first.stdout).includes('matched'), '初回の追加contextがない');
+          assert.equal(central.byInputRequests.length, 1, '初回のby-input呼出しがない');
+          const second = await runNotify(fixture);
+          assert.equal(second.code, 0, `notifyが失敗した: ${second.stderr}`);
+          assert.equal(second.stdout.trim(), '', '新規user inputがないのに追加contextを出力している');
+          assert.equal(central.byInputRequests.length, 1, '新規user inputがないのにby-inputを呼んでいる');
+        });
+      },
+    );
+  });
+
+  it('同じuser messageのrevision更新を今回の入力として通知する', async () => {
+    await withCentral(
+      () => ({ status: 200, body: searchView() }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const first = await runNotify(fixture);
+          assert.equal(first.code, 0, `notifyが失敗した: ${first.stderr}`);
+          assert.equal(central.byInputRequests.length, 1, '初回のby-input呼出しがない');
+          assert.equal(queryParams(central.byInputRequests[0] as RecordedHttpRequest).get('revision'), '1');
+
+          // 同じmessage IDの本文を変更し、collector stateへrevision 2として再取込させる。
+          await writeTranscript(fixture.transcriptPath, [
+            codexSessionLine('session-1'),
+            codexMessageLine({ sessionId: 'session-1', messageId: 'item-user-1', role: 'user', text: '更新された質問本文' }),
+            codexMessageLine({ sessionId: 'session-1', messageId: 'item-assistant-1', role: 'assistant', text: '回答本文' }),
+          ]);
+          const second = await runNotify(fixture);
+          assert.equal(second.code, 0, `notifyが失敗した: ${second.stderr}`);
+          assert.equal(central.byInputRequests.length, 2, 'revision更新でby-inputを呼んでいない');
+          const params = queryParams(central.byInputRequests[1] as RecordedHttpRequest);
+          assert.equal(params.get('source_message_id'), 'item-user-1');
+          assert.equal(params.get('revision'), '2', '更新後revisionでby-inputを呼んでいない');
+          assert.ok(hookContext(second.stdout).includes('matched'), 'revision更新の追加contextがない');
         });
       },
     );
@@ -334,9 +395,10 @@ describe('M7 collector補助通知', () => {
         await withFixture(central, {}, async (fixture) => {
           const result = await runNotify(fixture);
           assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
-          assert.ok(result.stdout.includes('failed'), `status failedが追加contextにない: ${result.stdout}`);
-          assert.ok(result.stdout.includes('provider_unavailable'), `error_codeが追加contextにない: ${result.stdout}`);
-          assert.ok(!result.stdout.includes('no_match'), 'failedをno_matchとして出力している');
+          const context = hookContext(result.stdout);
+          assert.ok(context.includes('failed'), `status failedが追加contextにない: ${context}`);
+          assert.ok(context.includes('provider_unavailable'), `error_codeが追加contextにない: ${context}`);
+          assert.ok(!context.includes('no_match'), 'failedをno_matchとして出力している');
           assert.ok(!central.byInputRequests.some((request) => request.url?.includes('no_match')));
         });
       },
