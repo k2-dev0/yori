@@ -14,9 +14,11 @@ import {
   mergeChoices,
   questionField,
   readAnalysis,
+  readEvaluations,
   readJob,
   readRelations,
   readRevision,
+  readUsageEvents,
   seedMessage,
   seedSession,
   seedUserMessage,
@@ -241,6 +243,35 @@ describe('分類と原文保持', () => {
       assert.equal(await countAnalysis(pool), 0, '契約違反の応答を適用している');
       assert.equal((await readRevision(pool, outside.messageId, 1))?.text, '候補外IDを返す');
       assert.equal((await readRevision(pool, invalid.messageId, 1))?.text, '不正な分布を返す');
+    } finally {
+      await server.close();
+    }
+  });
+  it('要求model（alias）と実応答modelを区別してanalysis・usage・cacheへ保存する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '応答modelの区別確認' });
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: { ...jevReply(request, jevChoices({ retention: 'substantive', primary_intent: 'implementation' })), model: 'jev-actual-7' },
+    }));
+    try {
+      await processClassify(seeded.messageId, server);
+      assert.equal(server.requests.length, 1);
+      assert.equal(server.requests[0].body.model, 'jev-latest', '送信modelが要求aliasでない');
+
+      const analysis = await readAnalysis(pool, seeded.messageId, 1);
+      assert.ok(analysis, 'message_analysisが保存されていない');
+      assert.equal(analysis.model_version, 'jev-actual-7', 'analysisのmodel_versionが実応答modelでない');
+      assert.equal(analysis.parts[0]?.model_version, 'jev-actual-7', 'partのmodel_versionが実応答modelでない');
+
+      const usage = await readUsageEvents(pool, workspace.companyId);
+      assert.equal(usage.length, 1);
+      assert.equal(usage[0].model, 'jev-latest', 'usageの要求modelがaliasでない');
+      assert.equal(usage[0].response_model, 'jev-actual-7', 'usageの応答modelが実応答modelでない');
+
+      const evaluations = await readEvaluations(pool, workspace.companyId);
+      assert.equal(evaluations.length, 1);
+      assert.equal(evaluations[0].model, 'jev-latest', 'cache keyのmodelがaliasでない');
+      assert.equal(evaluations[0].response_model, 'jev-actual-7', 'cacheの応答modelが実応答modelでない');
     } finally {
       await server.close();
     }
