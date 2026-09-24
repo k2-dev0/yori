@@ -40,6 +40,7 @@ interface SearchRequestRow {
   session_id: string;
   input_id: string;
   input_revision: number;
+  input_sequence_no: number;
   trigger: string;
   status: string;
   outcome: string | null;
@@ -210,7 +211,7 @@ export async function createSearch(pool: Pool, auth: AuthContext, request: Parse
 }
 
 const SEARCH_REQUEST_COLUMNS = `sr.id, sr.company_id, sr.project_id, sr.employee_id, sr.session_id, sr.input_id, sr.input_revision,
-       sr.trigger, sr.status, sr.outcome, sr.search_action, sr.reused_from_request_id,
+       sr.input_sequence_no, sr.trigger, sr.status, sr.outcome, sr.search_action, sr.reused_from_request_id,
        sr.original_request_id, sr.result, sr.error_code`;
 
 async function loadSearchRow(pool: Pool, auth: AuthContext, requestId: string): Promise<SearchRequestRow> {
@@ -278,16 +279,17 @@ function completedResultParts(row: SearchRequestRow): { matches: unknown[]; warn
   };
 }
 
-// reuse取得時に現在入力のrevisionとscopeが変わっていないか再検証する。
+// 結果取得時に現在入力のrevision・sequence・scopeが変わっていないか再検証する。
 async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise<boolean> {
   const result = await pool.query<{
     current_revision: number;
+    sequence_no: number;
     session_id: string;
     employee_id: string;
     project_id: string;
     company_id: string;
   }>(
-    `SELECT m.current_revision, m.session_id, s.employee_id, s.project_id, p.company_id
+    `SELECT m.current_revision, m.sequence_no, m.session_id, s.employee_id, s.project_id, p.company_id
        FROM messages m
        JOIN sessions s ON s.id = m.session_id
        JOIN projects p ON p.id = s.project_id
@@ -298,6 +300,7 @@ async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise
   return (
     input !== undefined &&
     input.current_revision === current.input_revision &&
+    input.sequence_no === current.input_sequence_no &&
     input.session_id === current.session_id &&
     input.employee_id === current.employee_id &&
     input.project_id === current.project_id &&
@@ -305,14 +308,150 @@ async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise
   );
 }
 
-// reuse先のmatched根拠を現在の原文revision・案件所属・現在policyの分類・撤回/変更で再検証し、無効なmatchを落とす。
-async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: unknown): Promise<unknown[]> {
+// 保存済みmatchの再検証。primary evidenceはcurrent revision・案件所属・現在policyの分類・
+// 撤回/変更を確認し、M7 related_evidenceはcurrent revision・案件・input境界・relation/link状態を確認する。
+// 無効なrelated itemだけを落とし、primaryが無効なmatchは全体を落とす。
+
+// 内部検証metadata（_link_id等）はAPI応答へ出さない。
+function publicRelatedItem(item: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith('_')));
+}
+
+interface MatchValidationContext {
+  projectId: string;
+  companyId: string;
+  sessionId: string;
+  inputSequenceNo: number;
+}
+
+// current revision・案件所属を検証する。境界はrelated itemだけに適用し、primary evidenceは
+// 現在inputと同じsessionでも許可する（代表根拠は保存時に検証済み）。
+async function revalidateMessage(
+  pool: Pool,
+  context: MatchValidationContext,
+  messageId: string,
+  revision: number,
+  enforceInputBoundary: boolean,
+): Promise<boolean> {
+  const result = await pool.query<{
+    current_revision: number;
+    sequence_no: number;
+    session_id: string;
+    project_id: string;
+    company_id: string;
+  }>(
+    `SELECT m.current_revision, m.sequence_no, m.session_id, s.project_id, p.company_id
+       FROM messages m
+       JOIN sessions s ON s.id = m.session_id
+       JOIN projects p ON p.id = s.project_id
+      WHERE m.id = $1`,
+    [messageId],
+  );
+  const row = result.rows[0];
+  if (row === undefined || row.current_revision !== revision) {
+    return false;
+  }
+  if (row.project_id !== context.projectId || row.company_id !== context.companyId) {
+    return false;
+  }
+  if (enforceInputBoundary && row.session_id === context.sessionId && row.sequence_no >= context.inputSequenceNo) {
+    return false;
+  }
+  return true;
+}
+
+// M7 related item 1件を検証し、有効なら内部metadataだけを除いた公開形を返す。
+async function revalidateRelatedItem(
+  pool: Pool,
+  context: MatchValidationContext,
+  item: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  const messageId = item.message_id;
+  const revision = item.revision;
+  const sourceKind = item.source_kind;
+  if (typeof messageId !== 'string' || typeof revision !== 'number' || typeof sourceKind !== 'string') {
+    return null;
+  }
+  if (!(await revalidateMessage(pool, context, messageId, revision, true))) {
+    return null;
+  }
+  if (sourceKind === 'correction') {
+    const relation = item.relation;
+    const relatedToMessageId = item.related_to_message_id;
+    const relatedToRevision = item.related_to_revision;
+    if (
+      typeof relation !== 'string' ||
+      typeof relatedToMessageId !== 'string' ||
+      typeof relatedToRevision !== 'number'
+    ) {
+      return null;
+    }
+    const row = await pool.query(
+      `SELECT 1
+         FROM message_relations
+        WHERE source_message_id = $1 AND source_revision = $2
+          AND target_message_id = $3 AND target_revision = $4 AND relation = $5`,
+      [messageId, revision, relatedToMessageId, relatedToRevision, relation],
+    );
+    if (row.rows.length === 0) {
+      return null;
+    }
+  } else if (sourceKind === 'explicit_session_link') {
+    const linkId = item._link_id;
+    if (typeof linkId !== 'string') {
+      return null;
+    }
+    const link = await pool.query(
+      `SELECT 1
+         FROM session_links l
+         JOIN messages em ON em.id = l.evidence_message_id
+         JOIN sessions es ON es.id = em.session_id
+         JOIN projects ep ON ep.id = es.project_id
+        WHERE l.id = $1 AND l.status = 'active' AND l.company_id = $2 AND l.project_id = $3
+          AND (em.session_id = l.from_session_id OR em.session_id = l.to_session_id)
+          AND em.current_revision = l.evidence_revision
+          AND es.project_id = l.project_id AND ep.company_id = l.company_id`,
+      [linkId, context.companyId, context.projectId],
+    );
+    if (link.rows.length === 0) {
+      return null;
+    }
+  } else if (sourceKind !== 'neighbor' && sourceKind !== 'inferred_session_link') {
+    return null;
+  }
+  return publicRelatedItem(item);
+}
+
+async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: unknown): Promise<unknown[]> {
+  const context: MatchValidationContext = {
+    projectId: request.project_id,
+    companyId: request.company_id,
+    sessionId: request.session_id,
+    inputSequenceNo: request.input_sequence_no,
+  };
   const kept: unknown[] = [];
   for (const match of resultMatches(result)) {
     const matchObject = asObject(match);
-    const evidence = matchObject !== null && Array.isArray(matchObject.evidence) ? matchObject.evidence : [];
+    if (matchObject === null) {
+      continue;
+    }
+    const evidence = Array.isArray(matchObject.evidence) ? matchObject.evidence : [];
     if (evidence.length === 0) {
       continue;
+    }
+    const relatedRaw = Array.isArray(matchObject.related_evidence) ? matchObject.related_evidence : undefined;
+    const relatedValid: Record<string, unknown>[] = [];
+    if (relatedRaw !== undefined) {
+      for (const item of relatedRaw) {
+        const itemObject = asObject(item);
+        if (itemObject === null) {
+          continue;
+        }
+        const validItem = await revalidateRelatedItem(pool, context, itemObject);
+        if (validItem !== null) {
+          relatedValid.push(validItem);
+        }
+      }
     }
     let valid = true;
     for (const item of evidence) {
@@ -323,15 +462,7 @@ async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: u
         valid = false;
         break;
       }
-      const current = await pool.query(
-        `SELECT 1
-           FROM messages m
-           JOIN sessions s ON s.id = m.session_id
-           JOIN projects p ON p.id = s.project_id
-          WHERE m.id = $1 AND m.current_revision = $2 AND s.project_id = $3 AND p.company_id = $4`,
-        [messageId, revision, origin.project_id, origin.company_id],
-      );
-      if (current.rows.length === 0) {
+      if (!(await revalidateMessage(pool, context, messageId, revision, false))) {
         valid = false;
         break;
       }
@@ -347,7 +478,7 @@ async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: u
         valid = false;
         break;
       }
-      // 明示的なrevoke/changeで無効化された根拠はmatchedとして返さない。
+      // 明示的なrevoke/changeは、currentなM7 correction related_evidenceが同時に残る場合だけ許容する。
       const invalidated = await pool.query(
         `SELECT 1
            FROM message_relations
@@ -356,13 +487,33 @@ async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: u
         [messageId, revision],
       );
       if (invalidated.rows.length > 0) {
-        valid = false;
-        break;
+        const covered = relatedValid.some(
+          (related) =>
+            related.source_kind === 'correction' &&
+            related.related_to_message_id === messageId &&
+            related.related_to_revision === revision,
+        );
+        if (!covered) {
+          valid = false;
+          break;
+        }
       }
     }
-    if (valid) {
-      kept.push(match);
+    if (!valid) {
+      continue;
     }
+    const output: Record<string, unknown> = { ...matchObject };
+    if (relatedRaw !== undefined) {
+      output.related_evidence = relatedValid;
+      output.related_evidence_ids = [
+        ...new Set(
+          relatedValid
+            .map((item) => item.message_id)
+            .filter((messageId): messageId is string => typeof messageId === 'string'),
+        ),
+      ];
+    }
+    kept.push(output);
   }
   return kept;
 }
@@ -387,7 +538,22 @@ function baseView(row: SearchRequestRow): SearchView {
 async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView> {
   const originId = row.original_request_id ?? row.reused_from_request_id;
   if (originId === null) {
-    return { ...baseView(row), ...completedResultParts(row) };
+    const view: SearchView = { ...baseView(row), ...completedResultParts(row) };
+    if (row.status !== 'completed') {
+      return view;
+    }
+    // direct requestでも保存済みmatchedを現在入力・原文・relation/link状態で再検証する。
+    if (!(await currentInputValid(pool, row))) {
+      return { ...view, status: 'expired', outcome: null, error_code: 'input_revision_stale', matches: [] };
+    }
+    if (row.outcome === 'matched') {
+      const matches = await revalidateMatches(pool, row, row.result);
+      if (matches.length === 0) {
+        return { ...view, outcome: 'no_match', matches: [] };
+      }
+      return { ...view, matches };
+    }
+    return view;
   }
   const origin = await loadOriginRow(pool, row, originId);
   if (origin === null) {
