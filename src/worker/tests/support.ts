@@ -18,6 +18,7 @@ import {
   DEFAULT_CONFIDENCE_THRESHOLD,
   DEFAULT_INPUT_BUDGET_BYTES,
   DEFAULT_JEV_MODEL,
+  DEFAULT_VOYAGE_API_URL,
   JEV_API_PATH,
   JEV_PART_SEPARATOR,
   WORKER_POLICY_VERSION,
@@ -49,6 +50,10 @@ export function buildWorkerConfig(baseUrl: string, overrides: Partial<WorkerConf
     confidenceThreshold: DEFAULT_CONFIDENCE_THRESHOLD,
     inputBudgetBytes: DEFAULT_INPUT_BUDGET_BYTES,
     requestTimeoutMs: 2_000,
+    voyageApiUrl: DEFAULT_VOYAGE_API_URL,
+    voyageApiKey: 'test-voyage-key',
+    voyageAccountRef: 'voyage-acct-a',
+    voyageRequestTimeoutMs: 2_000,
     ...overrides,
   };
 }
@@ -297,6 +302,10 @@ export async function enqueueWorkerJobs(
     messageId: input.messageId,
     targetRevision: input.revision,
   });
+  // host時計とDB時計のskewで直後のclaimが未到来扱いになるのを避け、DB時刻へ揃える。
+  await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = ANY($1::uuid[])', [
+    [classifyJobId, routeJobId],
+  ]);
   return { classifyJobId, routeJobId };
 }
 
@@ -497,6 +506,8 @@ export interface ApprovalSeed {
   accountRef?: string;
   provider?: string;
   active?: boolean;
+  // nullは規約確認日が未設定（送信不可）を表す。
+  termsCheckedAt?: Date | null;
 }
 
 export async function seedApproval(pool: Pool, input: ApprovalSeed): Promise<string> {
@@ -504,8 +515,8 @@ export async function seedApproval(pool: Pool, input: ApprovalSeed): Promise<str
   const id = uuidv7();
   await pool.query(
     `INSERT INTO provider_policy_approvals
-       (id, company_id, provider, account_ref, endpoint, terms_url, learning_disabled, retention_terms, confirmed_by, confirmed_at, active)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+       (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, learning_disabled, retention_terms, confirmed_by, confirmed_at, active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       id,
       input.companyId,
@@ -513,6 +524,7 @@ export async function seedApproval(pool: Pool, input: ApprovalSeed): Promise<str
       input.accountRef ?? 'acct-a',
       input.endpoint,
       'https://typesafe.ai/legal/mca',
+      input.termsCheckedAt === undefined ? new Date() : input.termsCheckedAt,
       true,
       'retention-terms',
       'admin-a',
