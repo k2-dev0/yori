@@ -16,6 +16,7 @@ import {
 import {
   JEV_PROVIDER,
   JEV_QUESTIONS_VERSION,
+  VOYAGE_PROVIDER,
   WORKER_POLICY_VERSION,
   type JevAnswer,
   type JevUsage,
@@ -34,9 +35,17 @@ import {
 import { JevCallError, callJev, validateJevResponse } from './jev.js';
 import { aggregateEvaluations, type AggregatedEvaluation, type PartEvaluation } from './analysis.js';
 import { resolveReuse } from './reuse.js';
+import {
+  applyDocumentEmbeddings,
+  applyDocumentPlan,
+  loadSessionMessages,
+  markPendingRevisionsFailed,
+  planDocumentChunks,
+} from './documents.js';
+import { ensureActiveGeneration, VoyageEmbeddingProvider } from './embedding.js';
+import { GenerationMismatchError, LeaseLostError, PolicyBlockedError, StaleApplyError } from './errors.js';
+import { VoyageCallError } from './voyage.js';
 
-class PolicyBlockedError extends Error {}
-class LeaseLostError extends Error {}
 class TargetMissingError extends Error {}
 
 type RouteDecision = { kind: 'new_search' | 'skip' } | { kind: 'reuse'; priorSearch: PriorSearch };
@@ -54,9 +63,24 @@ async function hasActiveApproval(pool: Pool, companyId: string, config: WorkerCo
       WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
         AND active AND learning_disabled
         AND confirmed_at <= now()
-        AND (terms_checked_at IS NULL OR terms_checked_at <= now())
+        AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
       LIMIT 1`,
     [companyId, JEV_PROVIDER, config.accountRef, config.apiUrl],
+  );
+  return result.rows.length > 0;
+}
+
+// Voyage送信の承認確認。build_documentsのretryも同じ条件を使う。
+async function hasActiveVoyageApproval(pool: Pool, companyId: string, config: WorkerConfig): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1
+       FROM provider_policy_approvals
+      WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
+        AND active AND learning_disabled
+        AND confirmed_at <= now()
+        AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
+      LIMIT 1`,
+    [companyId, VOYAGE_PROVIDER, config.voyageAccountRef, config.voyageApiUrl],
   );
   return result.rows.length > 0;
 }
@@ -523,6 +547,49 @@ async function processClassify(pool: Pool, job: ClaimedJob, config: WorkerConfig
   await applyAnalysis(pool, job, target, plan.stateHash, aggregate);
 }
 
+// build_documentsはsessionの現行revisionから決定的な文書を作り、承認済みVoyageで埋め込んで公開する。
+async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): Promise<void> {
+  const target = await loadJobTarget(pool, job);
+  if (target === null) {
+    throw new TargetMissingError('対象message/revisionがありません');
+  }
+  const generation = await ensureActiveGeneration(pool, target, config);
+  const messages = await loadSessionMessages(pool, target.sessionId);
+  const chunks = await planDocumentChunks(target.sessionId, messages);
+  const pending = await applyDocumentPlan(
+    pool,
+    { companyId: target.companyId, projectId: target.projectId, sessionId: target.sessionId },
+    chunks,
+  );
+  if (pending.length === 0) {
+    const completed = await completeJob(pool, { jobId: job.id, leaseToken: job.leaseToken, targetRevision: job.targetRevision });
+    if (!completed) {
+      throw new LeaseLostError('jobを完了できません');
+    }
+    return;
+  }
+  const provider = new VoyageEmbeddingProvider(pool, config);
+  let vectors: number[][];
+  try {
+    vectors = await provider.embedDocuments(
+      pending.map((item) => item.content),
+      generation,
+    );
+  } catch (error) {
+    // 恒久providerエラーだけ、保持しているpending revisionをfailedにする。
+    // policy blocked・retryable・stale・lease喪失はpendingのまま保持する。
+    if (
+      error instanceof VoyageCallError &&
+      !error.retryable &&
+      (error.code === 'provider_rejected' || error.code === 'provider_contract_invalid')
+    ) {
+      await markPendingRevisionsFailed(pool, job, pending);
+    }
+    throw error;
+  }
+  await applyDocumentEmbeddings(pool, job, target, generation, pending, vectors);
+}
+
 async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): Promise<void> {
   const target = await loadJobTarget(pool, job);
   if (target === null) {
@@ -560,7 +627,10 @@ function errorCodeOf(error: unknown): { code: string; retryable: boolean; retryA
   if (error instanceof TargetMissingError) {
     return { code: 'target_missing', retryable: false };
   }
-  if (error instanceof JevCallError) {
+  if (error instanceof GenerationMismatchError) {
+    return { code: 'embedding_generation_mismatch', retryable: false };
+  }
+  if (error instanceof JevCallError || error instanceof VoyageCallError) {
     return { code: error.code, retryable: error.retryable, retryAfterMs: error.retryAfterMs };
   }
   return { code: 'internal_error', retryable: false };
@@ -580,7 +650,8 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
 }
 
 async function handleProcessError(pool: Pool, job: ClaimedJob, error: unknown): Promise<void> {
-  if (error instanceof LeaseLostError) {
+  if (error instanceof LeaseLostError || error instanceof StaleApplyError) {
+    // 所有喪失・状態変化時は公開もjob状態変更もせず、lease期限後の回収へ委ねる。
     return;
   }
   const client = await pool.connect();
@@ -633,6 +704,10 @@ export async function processJob(pool: Pool, job: ClaimedJob, config: WorkerConf
       await processRoute(pool, job, config);
       return;
     }
+    if (job.kind === 'build_documents') {
+      await processBuild(pool, job, config);
+      return;
+    }
     throw new TargetMissingError('未対応のjob種別です');
   } catch (error) {
     await handleProcessError(pool, job, error);
@@ -661,7 +736,15 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
     [job.message_id],
   );
   const companyId = companyResult.rows[0]?.company_id;
-  if (companyId === undefined || !(await hasActiveApproval(pool, companyId, config))) {
+  if (companyId === undefined) {
+    return false;
+  }
+  // build_documentsはVoyage、classify/routeはJevの承認だけを使う。別providerの承認を流用しない。
+  const approved =
+    job.kind === 'build_documents'
+      ? await hasActiveVoyageApproval(pool, companyId, config)
+      : await hasActiveApproval(pool, companyId, config);
+  if (!approved) {
     return false;
   }
   const client = await pool.connect();
