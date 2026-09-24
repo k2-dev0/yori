@@ -13,11 +13,14 @@ import {
   insertMessage,
   insertProject,
   insertSession,
+  issueAuthToken,
   resetDatabase,
   seedWorkspace,
   sha256Bytes,
   type WorkspaceFixture,
 } from '../../db/tests/fixtures.js';
+import { buildEventBatch, buildEventInput, postEvents } from './support.js';
+import type { EventsResponse } from '../contract.js';
 
 // M7採用シナリオ1: POST /v1/session-linksのRedテスト（docs/m7-design.md）。
 // 新規route未実装の間はFastifyの既定404で失敗し、正常・strict入力・外部identity解決・
@@ -92,12 +95,18 @@ async function postSessionLink(options: { token?: string | null; body?: unknown;
   });
 }
 
+// POST /v1/eventsと同じ保存namespace。直接seedする場合もこの形に揃える。
+function storedScope(companyId: string, employeeId: string, externalScope = SCOPE): string {
+  return `v1|${companyId}|${employeeId}|${externalScope}`;
+}
+
 async function seedSessionFor(source: 'codex' | 'claude_code', sourceSessionId: string, options: { projectId?: string; employeeId?: string } = {}): Promise<string> {
+  const employeeId = options.employeeId ?? workspace.employeeId;
   return insertSession(pool, {
     projectId: options.projectId ?? workspace.projectId,
-    employeeId: options.employeeId ?? workspace.employeeId,
+    employeeId,
     source,
-    sourceScope: SCOPE,
+    sourceScope: storedScope(workspace.companyId, employeeId),
     sourceSessionId,
   });
 }
@@ -286,7 +295,7 @@ describe('M7 POST /v1/session-links', () => {
       projectId: otherProject,
       employeeId: workspace.employeeId,
       source: 'claude_code',
-      sourceScope: SCOPE,
+      sourceScope: storedScope(workspace.companyId, workspace.employeeId),
       sourceSessionId: 'other-project-to',
     });
     const otherEmployee = await insertEmployee(pool, workspace.companyId, 'employee-other');
@@ -295,7 +304,7 @@ describe('M7 POST /v1/session-links', () => {
       projectId: workspace.projectId,
       employeeId: otherEmployee,
       source: 'claude_code',
-      sourceScope: SCOPE,
+      sourceScope: storedScope(workspace.companyId, otherEmployee),
       sourceSessionId: 'other-employee-to',
     });
     const otherCompany = await insertCompany(pool, 'company-other');
@@ -305,8 +314,16 @@ describe('M7 POST /v1/session-links', () => {
       projectId: otherCompanyProject,
       employeeId: otherCompanyEmployee,
       source: 'claude_code',
-      sourceScope: SCOPE,
+      sourceScope: storedScope(otherCompany, otherCompanyEmployee),
       sourceSessionId: 'other-company-to',
+    });
+    // 手入力のraw scopeは標準namespaceではないため互換対象にしない。
+    await insertSession(pool, {
+      projectId: workspace.projectId,
+      employeeId: workspace.employeeId,
+      source: 'claude_code',
+      sourceScope: SCOPE,
+      sourceSessionId: 'raw-scope-to',
     });
 
     const cases: Array<{ label: string; toSessionId: string; secret: string }> = [
@@ -314,6 +331,7 @@ describe('M7 POST /v1/session-links', () => {
       { label: '別案件のto', toSessionId: 'other-project-to', secret: otherProject },
       { label: '他社員のto', toSessionId: 'other-employee-to', secret: otherEmployee },
       { label: '別会社のto', toSessionId: 'other-company-to', secret: otherCompany },
+      { label: 'raw scopeのto', toSessionId: 'raw-scope-to', secret: 'raw-scope-to' },
     ];
 
     for (const testCase of cases) {
@@ -489,6 +507,83 @@ describe('M7 POST /v1/session-links', () => {
     assert.equal(duplicateActive.statusCode, 409, `同じactive linkの再作成を409にしない: ${duplicateActive.statusCode} ${duplicateActive.body}`);
     assert.equal(errorCode(duplicateActive), 'conflict');
     assert.equal(await countLinks(), 1, 'conflict時にlinkが保存されている');
+  });
+
+  it('POST /v1/eventsの標準経路で作ったfrom/to/evidenceをraw外部scopeで解決する', async () => {
+    // fromは他社員のsession。標準POST /v1/eventsはその社員のnamespaceでscopeを保存する。
+    const fromEmployee = await insertEmployee(pool, workspace.companyId, 'employee-integration-from');
+    await addProjectMember(pool, workspace.projectId, fromEmployee);
+    const fromToken = await issueAuthToken(pool, workspace.companyId, fromEmployee);
+    const fromEvent = buildEventInput({
+      source: 'codex',
+      source_scope: SCOPE,
+      source_session_id: 'integration-from-session',
+      source_message_id: 'integration-from-message',
+      role: 'assistant',
+      text: 'INTEGRATION-FROM',
+    });
+    const fromResponse = await postEvents(app, {
+      token: fromToken,
+      body: buildEventBatch(workspace.projectId, [fromEvent]),
+    });
+    assert.equal(fromResponse.statusCode, 202, `fromイベント受付失敗: ${fromResponse.statusCode} ${fromResponse.body}`);
+
+    const toEvent = buildEventInput({
+      source: 'claude_code',
+      source_scope: SCOPE,
+      source_session_id: 'integration-to-session',
+      source_message_id: 'integration-to-message',
+      role: 'assistant',
+      text: 'INTEGRATION-TO',
+    });
+    const toResponse = await postEvents(app, {
+      token: workspace.token,
+      body: buildEventBatch(workspace.projectId, [toEvent]),
+    });
+    assert.equal(toResponse.statusCode, 202, `toイベント受付失敗: ${toResponse.statusCode} ${toResponse.body}`);
+    const toResult = toResponse.json<EventsResponse>().results[0];
+    assert.ok(toResult, 'toイベント結果がない');
+
+    const response = await postSessionLink({
+      token: workspace.token,
+      body: buildLinkBody({
+        from: { source: 'codex', source_scope: SCOPE, source_session_id: 'integration-from-session' },
+        to: { source: 'claude_code', source_scope: SCOPE, source_session_id: 'integration-to-session' },
+        evidence: {
+          source: 'claude_code',
+          source_scope: SCOPE,
+          source_session_id: 'integration-to-session',
+          source_message_id: 'integration-to-message',
+          revision: 1,
+        },
+      }),
+    });
+    assert.equal(response.statusCode, 201, `標準経路のidentityを201にしない: ${response.statusCode} ${response.body}`);
+    const json = response.json<LinkResponseBody>();
+    assertUuid(json.link_id, 'link_id');
+
+    const fromSession = await pool.query<{ id: string }>(
+      `SELECT id FROM sessions
+        WHERE source = 'codex' AND source_session_id = 'integration-from-session'
+          AND source_scope = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
+      [workspace.companyId, fromEmployee, SCOPE],
+    );
+    const toSession = await pool.query<{ id: string }>(
+      `SELECT id FROM sessions
+        WHERE source = 'claude_code' AND source_session_id = 'integration-to-session'
+          AND source_scope = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
+      [workspace.companyId, workspace.employeeId, SCOPE],
+    );
+    assert.ok(fromSession.rows[0], '標準経路のfrom sessionがない');
+    assert.ok(toSession.rows[0], '標準経路のto sessionがない');
+    assert.equal(json.from_session_id, fromSession.rows[0]?.id, 'from外部scopeが内部IDへ解決されていない');
+    assert.equal(json.to_session_id, toSession.rows[0]?.id, 'to外部scopeが内部IDへ解決されていない');
+    assert.equal(json.evidence_message_id, toResult.message_id, 'evidence外部identityが内部IDへ解決されていない');
+
+    const row = await readLinkRow(json.link_id as string);
+    assert.equal(row.from_session_id, fromSession.rows[0]?.id);
+    assert.equal(row.to_session_id, toSession.rows[0]?.id);
+    assert.equal(row.evidence_message_id, toResult.message_id);
   });
 
   it('根拠revision更新と競合した作成は、更新先行なら400にしてstale linkを残さない', async () => {
