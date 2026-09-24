@@ -169,4 +169,26 @@ describe('Jev評価キャッシュ', () => {
       await server.close();
     }
   });
+  it('質問定義versionが一致しないcacheは再利用せず再評価する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '質問定義版cache境界の対象発言' });
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })),
+    }));
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      const classifyJob = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
+      await processJob(pool, classifyJob, config);
+      assert.equal(server.requests.length, 1, 'classifyが外部評価していない');
+      // state_hashが同じでも、質問定義versionが一致しないcache行は再利用しない。
+      await pool.query(`UPDATE jev_evaluations SET questions_version = 'm3-1' WHERE company_id = $1`, [workspace.companyId]);
+
+      const routeJob = await claimJobForMessage(pool, 'route_search', seeded.messageId);
+      await processJob(pool, routeJob, config);
+      assert.equal(server.requests.length, 2, '質問定義versionが一致しないcacheを再利用している');
+      assert.equal((await readJob(pool, routeJob.id)).status, 'completed');
+    } finally {
+      await server.close();
+    }
+  });
 });
