@@ -388,6 +388,50 @@ describe('M7 明示session linkの探索', () => {
   });
 });
 
+describe('M7 evidence revision固定の明示link', () => {
+  it('link作成後に根拠messageが改訂されたactive linkは辿らない', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-stale-link-primary' });
+    const primaryText = 'PRIMARY-STALE-LINK-ANSWER';
+    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: primaryText });
+    // linkの根拠は代表根拠とは別messageにし、linkだけをstaleにする。
+    const linkEvidence = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 9, role: 'assistant', text: 'STALE-LINK-EVIDENCE' });
+    const linkedSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-stale-link-target' });
+    await seedMessage(pool, { sessionId: linkedSession, sequenceNo: 1, text: 'STALE-LINK-CONTEXT' });
+    await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: linkedSession, evidenceMessageId: linkEvidence.messageId });
+
+    const input = await seedExecuteSearch(pool, { workspace, sessionId: primarySession, sequenceNo: 3, text: 'QUERY-M7-STALE-LINK' });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: primarySession,
+      documentKey: 'm7-stale-link-primary-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+    // link作成後（保存後）に根拠messageだけを改訂する。
+    await advanceRevision(pool, linkEvidence.messageId, 'STALE-LINK-EVIDENCE-REVISED');
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    assert.ok(!relatedWithText(match, 'STALE-LINK-CONTEXT'), 'stale evidence linkの文脈を返している');
+    assert.ok(
+      !relatedEvidence(match).some((item) => item.source_kind === 'explicit_session_link'),
+      `stale evidence linkのrelatedが残っている: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`,
+    );
+  });
+});
+
 describe('M7 推定session候補', () => {
   it('同社員の前後各3sessionと共通Issue entityだけを候補にし、他社員の時間隣接を除外する', async () => {
     const { jev, config } = await startProviders();
@@ -764,6 +808,91 @@ describe('M7 保存直前の再検証', () => {
     assert.equal(request.status, 'completed');
     const match = primaryMatch(await readStoredResult(input.requestId));
     assert.ok(!relatedWithText(match, 'EXPLICIT-REVOKED'), '保存直前にrevokeされたlinkの原文を返している');
+  });
+});
+
+describe('M7 別session代表根拠の周辺・継続探索', () => {
+  it('primary evidenceが別sessionでもneighbor/correction/link/inferredを取得し、input境界は現在sessionだけに適用する', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const base = new Date('2026-09-21T00:00:00.000Z');
+
+    // 現在inputのsession。input以降の同session発言はrelatedへ含めない。
+    const inputSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-input' });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: 'QUERY-M7-CROSS' });
+    await seedMessage(pool, { sessionId: inputSession, sequenceNo: 2, text: 'CROSS-AFTER-INPUT' });
+
+    // 代表候補のsession（現在inputとは別session）。
+    const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-primary' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, base]);
+    await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, text: 'CROSS-NEIGHBOR-1' });
+    const primaryText = 'CROSS-PRIMARY-ANSWER';
+    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 2, role: 'assistant', text: primaryText });
+    await seedMessage(pool, { sessionId: primarySession, sequenceNo: 3, text: 'CROSS-NEIGHBOR-2' });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: primarySession,
+      documentKey: 'm7-cross-primary-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+
+    // 後続の訂正。
+    const correctionSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-correction' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [correctionSession, new Date(base.getTime() + 4 * 60_000)]);
+    const correction = await seedMessage(pool, { sessionId: correctionSession, sequenceNo: 1, text: 'CROSS-CORRECTION' });
+    await seedRelation(pool, {
+      sourceMessageId: correction.messageId,
+      sourceRevision: 1,
+      targetMessageId: primary.messageId,
+      targetRevision: 1,
+      relation: 'change',
+    });
+
+    // 明示link先。
+    const linkedSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-linked' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [linkedSession, new Date(base.getTime() + 5 * 60_000)]);
+    await seedMessage(pool, { sessionId: linkedSession, sequenceNo: 1, text: 'CROSS-EXPLICIT' });
+    await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: linkedSession, evidenceMessageId: primary.messageId });
+
+    // 同社員の隣接session（推定候補）。
+    const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-inferred' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [inferredSession, new Date(base.getTime() + 60_000)]);
+    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: 'CROSS-INFERRED' });
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    assert.ok(
+      (match.evidence ?? []).some((item) => item.message_id === primary.messageId),
+      '別session代表根拠がmatches.evidenceにない',
+    );
+
+    for (const marker of ['CROSS-NEIGHBOR-1', 'CROSS-NEIGHBOR-2']) {
+      const item = relatedWithText(match, marker);
+      assert.ok(item, `別session代表の周辺${marker}がない: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+      assert.equal(item.source_kind, 'neighbor', `${marker}のsource_kind`);
+    }
+    const correctionItem = relatedWithText(match, 'CROSS-CORRECTION');
+    assert.ok(correctionItem, '別session代表の訂正がない');
+    assert.equal(correctionItem.source_kind, 'correction');
+    assert.equal(correctionItem.related_to_message_id, primary.messageId);
+    const explicitItem = relatedWithText(match, 'CROSS-EXPLICIT');
+    assert.ok(explicitItem, '別session代表の明示link文脈がない');
+    assert.equal(explicitItem.source_kind, 'explicit_session_link');
+    const inferredItem = relatedWithText(match, 'CROSS-INFERRED');
+    assert.ok(inferredItem, '別session代表の推定候補がない');
+    assert.equal(inferredItem.source_kind, 'inferred_session_link');
+    assert.ok(!relatedWithText(match, 'CROSS-AFTER-INPUT'), '現在input以降の同session発言をrelatedへ含めている');
   });
 });
 
