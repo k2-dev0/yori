@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1〜M6)",
+  "description": "社内開発会話の共有検索基盤 (M1〜M7)",
   "engines": {
     "node": ">=24"
   },
@@ -16,6 +16,7 @@
     "build": "tsc -p tsconfig.build.json",
     "migrate": "tsx src/db/migrate-cli.ts",
     "collector:collect": "tsx src/collector/cli.ts collect",
+    "collector:notify": "tsx src/collector/cli.ts notify",
     "collector:flush": "tsx src/collector/cli.ts flush",
     "collector:diagnostics": "tsx src/collector/cli.ts diagnostics",
     "worker:start": "tsx src/worker/cli.ts start",
