@@ -552,6 +552,61 @@ describe('M7 collector補助通知', () => {
     );
   });
 
+  it('訂正をneighborより優先し、省略件数と打切り注意をadditionalContextへ明示する', async () => {
+    const targetOne = uuidv7();
+    const targetTwo = uuidv7();
+    const neighbors = Array.from({ length: 6 }, (_, index) => ({
+      message_id: uuidv7(),
+      revision: 1,
+      employee_id: uuidv7(),
+      role: 'assistant',
+      occurred_at: '2026-09-21T01:00:00.000Z',
+      text: `M7-NEIGHBOR-${index + 1}`,
+      source_kind: 'neighbor',
+    }));
+    const correction = {
+      message_id: uuidv7(),
+      revision: 1,
+      employee_id: uuidv7(),
+      role: 'assistant',
+      occurred_at: '2026-09-21T01:01:00.000Z',
+      text: 'M7-CORRECTION-MULTI 複数relationの訂正',
+      source_kind: 'correction',
+      relation: 'change',
+      related_to_message_id: targetOne,
+      related_to_revision: 1,
+      relations: [
+        { relation: 'change', related_to_message_id: targetOne, related_to_revision: 1 },
+        { relation: 'revoke', related_to_message_id: targetTwo, related_to_revision: 1 },
+      ],
+    };
+    const responseBody = searchView({}, [...neighbors, correction]);
+    (responseBody.matches as Array<Record<string, unknown>>)[0] = {
+      ...(responseBody.matches as Array<Record<string, unknown>>)[0],
+      truncated: true,
+    };
+    responseBody.warnings = [{ code: 'context_expansion_failed' }];
+
+    await withCentral(
+      () => ({ status: 200, body: responseBody }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          const context = hookContext(result.stdout);
+          assert.ok(context.includes('M7-CORRECTION-MULTI'), 'correction本文がadditionalContextにない');
+          assert.ok(context.includes('change') && context.includes('revoke'), '全relation種別がadditionalContextにない');
+          assert.ok(context.includes(targetOne) && context.includes(targetTwo), '全relation対象がadditionalContextにない');
+          assert.ok(context.includes('省略'), '省略表示がadditionalContextにない');
+          assert.ok(context.includes('打ち切') && context.includes('全探索済みではありません'), '打切り注意がない');
+          assert.ok(context.indexOf('M7-CORRECTION-MULTI') < context.indexOf('M7-NEIGHBOR-1'), 'correctionがneighborより後ろにある');
+          assert.ok(!context.includes('M7-NEIGHBOR-6'), '上限を超えたneighborを省略していない');
+          assert.ok(!result.stdout.includes('token-a'), 'tokenを出力している');
+        });
+      },
+    );
+  });
+
   it('by-inputのtimeoutは最大5秒×2・累計10秒で打ち切り、無出力で終了する', async () => {
     await withCentral(
       () => ({ hang: true }),
