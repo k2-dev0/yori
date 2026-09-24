@@ -5,7 +5,9 @@ import { z } from 'zod';
 import { createPool } from '../db/pool.js';
 import { JEV_PROVIDER, VOYAGE_PROVIDER } from './contract.js';
 import { isVoyageEndpoint, isWorkerEndpoint, loadWorkerConfig } from './config.js';
+import { loadProjectMetrics } from './metrics.js';
 import { retryJob } from './process.js';
+import { deleteGeneration, reindexProject } from './reindex.js';
 import { runWorker } from './runner.js';
 
 // 承認JSON。terms_checked_atは管理者が確認した日時を必須で受け、credentialは含めない。
@@ -165,6 +167,73 @@ async function runRevoke(env: NodeJS.ProcessEnv, approvalId: string | undefined)
   }
 }
 
+async function runReindex(env: NodeJS.ProcessEnv, projectId: string | undefined): Promise<number> {
+  if (projectId === undefined || !z.uuid().safeParse(projectId).success) {
+    return fail('invalid_project_id');
+  }
+  let loaded;
+  try {
+    loaded = loadWorkerConfig(env);
+  } catch {
+    return fail('invalid_worker_config');
+  }
+  const pool = createPool(loaded.databaseUrl);
+  try {
+    const result = await reindexProject(pool, projectId, loaded.config);
+    if (!result.ok) {
+      return fail(result.code);
+    }
+    process.stdout.write('worker: reindexed\n');
+    return 0;
+  } finally {
+    await pool.end();
+  }
+}
+
+// 世代削除はDBだけを必要とし、provider credentialは要求しない。
+async function runGenerationDelete(env: NodeJS.ProcessEnv, generationId: string | undefined): Promise<number> {
+  if (generationId === undefined || !z.uuid().safeParse(generationId).success) {
+    return fail('invalid_generation_id');
+  }
+  const databaseUrl = requireDatabaseUrl(env);
+  if (databaseUrl === null) {
+    return fail('invalid_worker_config');
+  }
+  const pool = createPool(databaseUrl);
+  try {
+    const result = await deleteGeneration(pool, generationId);
+    if (result !== 'deleted') {
+      return fail(result);
+    }
+    process.stdout.write('worker: deleted\n');
+    return 0;
+  } finally {
+    await pool.end();
+  }
+}
+
+// 運用metricsはDBだけを必要とし、stdoutへJSON以外を出さない。
+async function runMetrics(env: NodeJS.ProcessEnv, projectId: string | undefined): Promise<number> {
+  if (projectId === undefined || !z.uuid().safeParse(projectId).success) {
+    return fail('invalid_project_id');
+  }
+  const databaseUrl = requireDatabaseUrl(env);
+  if (databaseUrl === null) {
+    return fail('invalid_worker_config');
+  }
+  const pool = createPool(databaseUrl);
+  try {
+    const metrics = await loadProjectMetrics(pool, projectId);
+    if (metrics === null) {
+      return fail('project_not_found');
+    }
+    process.stdout.write(`${JSON.stringify(metrics)}\n`);
+    return 0;
+  } finally {
+    await pool.end();
+  }
+}
+
 // CLIは資格情報・本文を引数やログへ出さない。終了コードは固定。
 export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const [command, ...rest] = argv;
@@ -179,6 +248,15 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
   }
   if (command === 'revoke') {
     return runRevoke(env, rest[0]);
+  }
+  if (command === 'reindex') {
+    return runReindex(env, rest[0]);
+  }
+  if (command === 'generation:delete') {
+    return runGenerationDelete(env, rest[0]);
+  }
+  if (command === 'metrics') {
+    return runMetrics(env, rest[0]);
   }
   return fail('unknown_command');
 }
