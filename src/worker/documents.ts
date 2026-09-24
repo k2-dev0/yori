@@ -63,23 +63,74 @@ interface Part {
 
 const TARGET_LOCAL = CHUNK_TARGET_TOKENS - VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE;
 const MAX_LOCAL = CHUNK_MAX_TOKENS - VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE;
+// 次chunkは直前chunk末尾のCHUNK_OVERLAP_TOKENS分と区切り1トークンを引き継ぐ。
+// atom単体をこの上限に抑え、overlap windowを破棄せずMAX_LOCAL内へ収める。
+const MAX_ATOM_LOCAL = MAX_LOCAL - CHUNK_OVERLAP_TOKENS - 1;
+
+// 文書計画の入力。snapshotは計画時点のsession全messageと現行policyのanalysis状態のfingerprint。
+export interface SessionPlanInput {
+  messages: SessionMessage[];
+  snapshot: Buffer;
+}
+
+interface SessionStateRow {
+  message_id: string;
+  current_revision: number;
+  text: string | null;
+  analysis_revision: number | null;
+  policy_version: string | null;
+  state_hash: Buffer | null;
+  is_searchable: boolean | null;
+  retention: string | null;
+}
+
+// session全messageと、その現行revisionに対する現行policyのanalysisをsequence順に読む。
+// searchableな発言の抽出とsnapshot作成を同じ結果から行う。
+const SESSION_STATE_SQL = `
+  SELECT m.id AS message_id, m.current_revision, r.text,
+         a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention
+    FROM messages m
+    LEFT JOIN message_revisions r ON r.message_id = m.id AND r.revision = m.current_revision
+    LEFT JOIN message_analysis a ON a.message_id = m.id AND a.revision = m.current_revision AND a.policy_version = $2
+   WHERE m.session_id = $1
+   ORDER BY m.sequence_no, m.id
+`;
+
+async function loadSessionState(client: PoolClient, sessionId: string): Promise<SessionStateRow[]> {
+  const result = await client.query<SessionStateRow>(SESSION_STATE_SQL, [sessionId, WORKER_POLICY_VERSION]);
+  return result.rows;
+}
+
+// 新規message追加・原文revision・analysisの再分類のどれでも変化する決定的fingerprint。
+// textは含めず、同じ計画前提ならbuildと適用直前の再確認で同じ値になる。
+function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
+  const state = rows.map((row) => ({
+    message_id: row.message_id,
+    current_revision: row.current_revision,
+    analysis_revision: row.analysis_revision,
+    policy_version: row.policy_version,
+    state_hash: row.state_hash === null ? null : row.state_hash.toString('hex'),
+    is_searchable: row.is_searchable,
+    retention: row.retention,
+  }));
+  return createHash('sha256').update(JSON.stringify(state), 'utf8').digest();
+}
 
 // 現行revisionのsearchableな発言だけをsequence順に読む。progress_only/is_searchable=falseは除外する。
-export async function loadSessionMessages(pool: Pool, sessionId: string): Promise<SessionMessage[]> {
-  const result = await pool.query<{ message_id: string; current_revision: number; text: string }>(
-    `SELECT m.id AS message_id, m.current_revision, r.text
-       FROM messages m
-       JOIN message_revisions r ON r.message_id = m.id AND r.revision = m.current_revision
-       JOIN message_analysis a ON a.message_id = m.id AND a.revision = m.current_revision AND a.policy_version = $2
-      WHERE m.session_id = $1
-        AND a.is_searchable
-        AND a.retention <> 'progress_only'
-      ORDER BY m.sequence_no, m.id`,
-    [sessionId, WORKER_POLICY_VERSION],
-  );
-  return result.rows
-    .filter((row) => row.text.length > 0)
-    .map((row) => ({ messageId: row.message_id, revision: row.current_revision, text: row.text }));
+export async function loadSessionMessages(pool: Pool, sessionId: string): Promise<SessionPlanInput> {
+  const client = await pool.connect();
+  try {
+    const rows = await loadSessionState(client, sessionId);
+    const messages: SessionMessage[] = [];
+    for (const row of rows) {
+      if (row.text !== null && row.text.length > 0 && row.is_searchable === true && row.retention !== 'progress_only') {
+        messages.push({ messageId: row.message_id, revision: row.current_revision, text: row.text });
+      }
+    }
+    return { messages, snapshot: snapshotSessionState(rows) };
+  } finally {
+    client.release();
+  }
 }
 
 function isHighSurrogate(code: number): boolean {
@@ -179,7 +230,7 @@ function splitSegmentLines(
 ): Segment[] {
   const pieces: Segment[] = [];
   for (const line of lineSpans(text, segment.start, segment.end)) {
-    if (segmentTokens(tokenizer, text, line) <= MAX_LOCAL) {
+    if (segmentTokens(tokenizer, text, line) <= MAX_ATOM_LOCAL) {
       pieces.push(line);
       continue;
     }
@@ -196,7 +247,7 @@ function splitSegmentLines(
           low = middle + 1;
           continue;
         }
-        if (segmentTokens(tokenizer, text, { start: cursor, end: boundary }) <= MAX_LOCAL) {
+        if (segmentTokens(tokenizer, text, { start: cursor, end: boundary }) <= MAX_ATOM_LOCAL) {
           best = boundary;
           low = middle + 1;
         } else {
@@ -283,6 +334,8 @@ function trailingTokenSlice(
 }
 
 // 直前chunkの末尾から重複window（100トークン以内）を作る。partが大きい場合はtoken境界で部分区間を取る。
+// partsBudgetはpart間separatorを1トークンとして数えるため、構築予算にも同じseparatorを含め、
+// 戻り値のpartsBudget(overlap) <= CHUNK_OVERLAP_TOKENSを保証する。
 function overlapParts(
   tokenizer: { encode: (text: string) => { ids: number[] } },
   parts: readonly Part[],
@@ -291,12 +344,14 @@ function overlapParts(
   let tokens = 0;
   for (let index = parts.length - 1; index >= 0; index -= 1) {
     const part = parts[index];
-    if (tokens + part.tokens <= CHUNK_OVERLAP_TOKENS) {
+    // 現在のoverlapの先頭へ追加すると、既存part数と同じ数のseparatorが新たに増える。
+    const separatorTokens = overlap.length;
+    if (tokens + part.tokens + separatorTokens <= CHUNK_OVERLAP_TOKENS) {
       overlap.unshift({ ...part, sourceKind: 'overlap' });
       tokens += part.tokens;
       continue;
     }
-    const remaining = CHUNK_OVERLAP_TOKENS - tokens;
+    const remaining = CHUNK_OVERLAP_TOKENS - tokens - separatorTokens;
     const slice = remaining > 0 ? trailingTokenSlice(tokenizer, part.text, remaining) : null;
     if (slice !== null) {
       overlap.unshift({
@@ -349,12 +404,8 @@ export async function planDocumentChunks(sessionId: string, messages: readonly S
       continue;
     }
     if (overlapSeeded && current.every((part) => part.sourceKind === 'overlap')) {
-      // 重複windowだけのchunkは確定しない。まず現在atomを入れ、上限を超える場合はwindowを捨てる。
-      if (partsBudget(current) + atom.tokens + 1 > MAX_LOCAL) {
-        current = [];
-        overlapSeeded = false;
-        continue;
-      }
+      // 重複windowだけのchunkは確定しない。overlapPartsはpartsBudget(overlap) <= CHUNK_OVERLAP_TOKENSを保証し、
+      // atomはMAX_ATOM_LOCAL以下なので、window + separator + atomは必ずMAX_LOCAL内に入る。
       current.push(toPart(atom, 'original'));
       atoms.shift();
       overlapSeeded = false;
@@ -458,13 +509,50 @@ async function loadSources(client: PoolClient, documentId: string, revision: num
   return result.rows;
 }
 
-// 新しいdesired revisionが未公開の間、既存の公開revisionはstale=trueで警告付き利用にする。
-async function markPublicationStale(client: PoolClient, documentId: string, pendingRevision: number): Promise<void> {
+// 新しいdesired revisionが未公開の間、末尾追加で内容が保持される既存公開revisionをstale=trueで警告付き利用にする。
+async function markPublicationStale(client: PoolClient, documentId: string): Promise<void> {
   await client.query(
     `UPDATE document_publications SET stale = true, updated_at = now()
-      WHERE document_id = $1 AND revision <> $2 AND stale = false`,
-    [documentId, pendingRevision],
+      WHERE document_id = $1 AND stale = false`,
+    [documentId],
   );
+}
+
+function sourceMatches(row: SourceRow, source: PlannedSource): boolean {
+  return (
+    row.message_id === source.messageId &&
+    row.message_revision === source.messageRevision &&
+    row.start_offset === source.startOffset &&
+    row.end_offset === source.endOffset &&
+    row.source_kind === source.sourceKind
+  );
+}
+
+// 旧公開revisionの全source identityが新計画の先頭にそのまま残る末尾追加だけ、旧公開をstaleで残す。
+// source消失・message revision変更・UTF-16 range変更を含む制限的変更では公開行を削除して即時検索不能にする。
+// 埋め込み成功時はapplyDocumentEmbeddingsが新しい公開行を作り直す。
+async function reconcilePublications(
+  client: PoolClient,
+  documentId: string,
+  sources: readonly PlannedSource[],
+): Promise<void> {
+  const publications = await client.query<{ revision: number }>(
+    'SELECT revision FROM document_publications WHERE document_id = $1 FOR UPDATE',
+    [documentId],
+  );
+  let appendOnly = publications.rows.length > 0;
+  for (const publication of publications.rows) {
+    const published = await loadSources(client, documentId, publication.revision);
+    if (published.length > sources.length || !published.every((row, index) => sourceMatches(row, sources[index]))) {
+      appendOnly = false;
+      break;
+    }
+  }
+  if (!appendOnly) {
+    await client.query('DELETE FROM document_publications WHERE document_id = $1', [documentId]);
+    return;
+  }
+  await markPublicationStale(client, documentId);
 }
 
 async function replaceSources(client: PoolClient, documentId: string, revision: number, sources: readonly PlannedSource[]): Promise<void> {
@@ -494,9 +582,12 @@ async function replaceSources(client: PoolClient, documentId: string, revision: 
 const SESSION_BUILD_LOCK_NAMESPACE = 20260926;
 
 // chunk計画をDBへ反映し、埋め込み待ちのrevisionを返す。外部HTTPの前にTXを完了する。
+// 停止・回収済みの旧workerが後から計画を書き込まないよう、書込前にjob所有とsession前提をDBで再確認する。
 export async function applyDocumentPlan(
   pool: Pool,
+  job: ClaimedJob,
   input: { companyId: string; projectId: string; sessionId: string },
+  snapshot: Buffer,
   chunks: readonly PlannedChunk[],
 ): Promise<PendingRevision[]> {
   const client = await pool.connect();
@@ -506,6 +597,19 @@ export async function applyDocumentPlan(
       SESSION_BUILD_LOCK_NAMESPACE,
       input.sessionId,
     ]);
+    const leased = await client.query(
+      `SELECT 1 FROM jobs
+        WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()
+          AND target_revision IS NOT DISTINCT FROM $3
+        FOR UPDATE`,
+      [job.id, job.leaseToken, job.targetRevision],
+    );
+    if (leased.rows.length === 0) {
+      throw new LeaseLostError('jobのlease所有を確認できません');
+    }
+    if (!snapshot.equals(snapshotSessionState(await loadSessionState(client, input.sessionId)))) {
+      throw new StaleApplyError('sessionの状態が変化しました');
+    }
 
     const existing = await client.query<ExistingDocumentRow>(
       `SELECT id, document_key, desired_revision, is_searchable
@@ -569,7 +673,7 @@ export async function applyDocumentPlan(
           `UPDATE search_document_revisions SET status = 'pending', updated_at = now() WHERE document_id = $1 AND revision = $2`,
           [document.id, latest.revision],
         );
-        await markPublicationStale(client, document.id, latest.revision);
+        await reconcilePublications(client, document.id, chunk.sources);
         continue;
       }
       if (unchanged && document.is_searchable) {
@@ -588,7 +692,7 @@ export async function applyDocumentPlan(
           document.id,
           nextRevision,
         ]);
-        await markPublicationStale(client, document.id, nextRevision);
+        await reconcilePublications(client, document.id, chunk.sources);
         continue;
       }
 
@@ -606,7 +710,7 @@ export async function applyDocumentPlan(
           document.id,
           latest.revision,
         ]);
-        await markPublicationStale(client, document.id, latest.revision);
+        await reconcilePublications(client, document.id, chunk.sources);
         continue;
       }
 
@@ -621,7 +725,7 @@ export async function applyDocumentPlan(
         document.id,
         nextRevision,
       ]);
-      await markPublicationStale(client, document.id, nextRevision);
+      await reconcilePublications(client, document.id, chunk.sources);
     }
 
     for (const document of existing.rows) {
@@ -629,7 +733,8 @@ export async function applyDocumentPlan(
         continue;
       }
       await client.query('UPDATE search_documents SET is_searchable = false, updated_at = now() WHERE id = $1', [document.id]);
-      await client.query('UPDATE document_publications SET stale = true, updated_at = now() WHERE document_id = $1', [document.id]);
+      // 計画から消えた文書は旧sourceが新計画に残らない制限的変更なので、公開行を削除して即時検索不能にする。
+      await client.query('DELETE FROM document_publications WHERE document_id = $1', [document.id]);
       await client.query(
         `UPDATE search_document_revisions
             SET status = 'excluded', updated_at = now()
