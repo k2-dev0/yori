@@ -126,6 +126,14 @@ workerはroute laneとclassify laneを各1、合計2並列で走らせ、各lane
 
 `build_documents`と`execute_search`がpendingのまま残っているのはM4/M5未実装のためで、分類失敗や検索のno_matchではない。原文は`message_revisions`に保持され、`message_analysis`と`message_relations`は再実行で増殖しない。
 
+## 既知の保留事項
+
+- 成功ヘッダー受信後の本文受信timeout・通信切断は恒久失敗となる。原文は保持され、明示retryで再開する。
+- 長文の複数partが同じ承認・撤回関係を示す場合、関係の根拠範囲は最初のpartだけが保存される。
+- 正常な外部応答の所要時間はヘッダー受信までを計測し、本文受信の時間を含まない。
+
+上記はユーザー指定により今回の修正対象から除外している。再利用は外部評価後に比較対象の受付を読み直し、入力revisionが有効で、直接の元検索がnew_searchと確定している場合だけ採用する。
+
 ## テスト
 
 `npm test`は隔離Compose DBと合成loopback HTTP fixtureだけを使う。実Jev/Voyage・実会話は送信しない。workerのテストは`src/worker/tests/`にあり、runner/CLI/cacheも同じfixtureで検証する。
