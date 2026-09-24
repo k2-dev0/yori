@@ -60,6 +60,24 @@ const getEvidenceSchema = z.strictObject({
   revision: z.int().min(1).max(2_147_483_647),
 });
 
+// HTTP APIと同じstrict入力を公開する。identityと根拠revisionの組み合わせはSDKのschema検証に従う。
+const linkSessionIdentitySchema = z.strictObject({
+  source: z.enum(EVENT_SOURCES),
+  source_scope: z.string().min(1).max(1024),
+  source_session_id: z.string().min(1).max(1024),
+});
+
+const linkSessionSchema = z.strictObject({
+  project_id: z.uuid(),
+  idempotency_key: z.string().min(1).max(512),
+  from: linkSessionIdentitySchema,
+  to: linkSessionIdentitySchema,
+  evidence: linkSessionIdentitySchema.extend({
+    source_message_id: z.string().min(1).max(1024),
+    revision: z.int().min(1).max(2_147_483_647),
+  }),
+});
+
 const recordCaseSchema = z.strictObject({
   project_id: z.uuid(),
   idempotency_key: z.string().min(1).max(512),
@@ -118,6 +136,14 @@ function createServer(config: McpConfig): McpServer {
     'get_evidence',
     { description: '保存済みの原文revisionを出典IDから取得する', inputSchema: getEvidenceSchema },
     async (args) => runTool(() => client.getEvidence(args)),
+  );
+  server.registerTool(
+    'link_session',
+    {
+      description: '認証社員本人のsessionへの明示的な引き継ぎリンクを根拠発言付きで登録する',
+      inputSchema: linkSessionSchema,
+    },
+    async (args) => runTool(() => client.linkSession(args)),
   );
   server.registerTool(
     'record_case',
