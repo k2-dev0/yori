@@ -40,3 +40,61 @@ export const eventsRequestSchema = z.strictObject({
 
 export type ParsedEvent = z.infer<typeof eventSchema>;
 export type EventsRequest = z.infer<typeof eventsRequestSchema>;
+
+// M6の明示検索受付。質問・入力revision・冪等キー・force_refreshを必須にし、unknown fieldを拒否する。
+const searchQueryText = storableString.refine((text) => [...text].length <= MAX_TEXT_LENGTH, {
+  message: `queryは${MAX_TEXT_LENGTH}コードポイント以内にしてください`,
+});
+
+export const searchRequestSchema = z.strictObject({
+  project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
+  input_id: z.uuid().transform((inputId) => inputId.toLowerCase()),
+  input_revision: z.int().min(1).max(2_147_483_647),
+  query: searchQueryText,
+  idempotency_key: storableString.max(512),
+  force_refresh: z.boolean(),
+});
+
+export type ParsedSearchRequest = z.infer<typeof searchRequestSchema>;
+
+// wait_msはquery文字列として渡る。0〜5000の10進整数だけを受理する。
+const waitMsParam = z
+  .string()
+  .regex(/^(0|[1-9][0-9]*)$/)
+  .transform((value) => Number(value))
+  .refine((value) => value <= 5000, { message: 'wait_msは0〜5000の整数です' });
+
+export const searchDetailQuerySchema = z.strictObject({
+  wait_ms: waitMsParam.optional(),
+});
+
+// input revision等のquery paramは文字列から整数へ変換し、1以上だけを受理する。
+const revisionParam = z.coerce.number().int().min(1).max(2_147_483_647);
+
+// by-inputは内部input_idか、イベント受付と同じ取り込み元identityのどちらか一方だけを受理する。
+const byInputInternalQuerySchema = z.strictObject({
+  project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
+  input_id: z.uuid().transform((inputId) => inputId.toLowerCase()),
+  input_revision: revisionParam,
+  wait_ms: waitMsParam.optional(),
+});
+
+const byInputExternalQuerySchema = z.strictObject({
+  project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
+  source: z.enum(EVENT_SOURCES),
+  source_scope: sourceIdentifier,
+  source_session_id: sourceIdentifier,
+  source_message_id: sourceIdentifier,
+  revision: revisionParam,
+  wait_ms: waitMsParam.optional(),
+});
+
+export const searchByInputQuerySchema = z.union([byInputInternalQuerySchema, byInputExternalQuerySchema]);
+
+export type ParsedSearchByInputQuery = z.infer<typeof searchByInputQuerySchema>;
+
+// 原文取得は案件とrevisionを必須にし、unknown fieldを拒否する。
+export const evidenceQuerySchema = z.strictObject({
+  project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
+  revision: revisionParam,
+});
