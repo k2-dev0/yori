@@ -44,6 +44,14 @@ export interface SearchWarning {
 
 export type RelatedSourceKind = 'neighbor' | 'correction' | 'explicit_session_link' | 'inferred_session_link';
 
+// 同じ訂正・撤回message/revisionが複数targetを持つ場合のrelation 1件。
+export interface RelatedRelation {
+  relation: string;
+  relatedToMessageId: string;
+  relatedToRevision: number;
+  relationSourceRevision: number;
+}
+
 export interface RelatedEvidenceDraft {
   messageId: string;
   revision: number;
@@ -53,12 +61,10 @@ export interface RelatedEvidenceDraft {
   occurredAt: Date;
   text: string;
   sourceKind: RelatedSourceKind;
-  relation?: string;
-  relatedToMessageId?: string;
-  relatedToRevision?: number;
+  // correctionはrelation全件を保持する。related evidence自体はmessage単位で1件に固定する。
+  relations?: RelatedRelation[];
   // 起点primary sessionからこのitemのsessionまでの明示link ID経路（1辺以上）。
   linkIds?: string[];
-  relationSourceRevision?: number;
 }
 
 export interface ExplorationResult {
@@ -184,6 +190,8 @@ async function loadNeighbors(input: ExplorationInput): Promise<RelatedEvidenceDr
 // message_relationsは source=後続の訂正・撤回、target=元根拠。target->source方向へ最大3 hop辿る。
 async function loadCorrections(input: ExplorationInput): Promise<RelatedEvidenceDraft[]> {
   const drafts: RelatedEvidenceDraft[] = [];
+  const bySource = new Map<string, RelatedEvidenceDraft>();
+  // 訪問済みmessage ID+revisionで循環を検出し、同じ原文を再探索しない。
   const visited = new Set(input.primaryEvidence.map((source) => `${source.message_id}:${source.message_revision}`));
   let frontier = input.primaryEvidence.map((source) => ({ messageId: source.message_id, revision: source.message_revision }));
   for (let hop = 1; hop <= HOP_LIMIT && frontier.length > 0; hop += 1) {
@@ -215,19 +223,35 @@ async function loadCorrections(input: ExplorationInput): Promise<RelatedEvidence
       );
       for (const row of rows.rows) {
         const key = `${row.source_message_id}:${row.source_revision}`;
-        if (visited.has(key)) {
-          continue;
+        const relation: RelatedRelation = {
+          relation: row.relation,
+          relatedToMessageId: parent.messageId,
+          relatedToRevision: parent.revision,
+          relationSourceRevision: row.source_revision,
+        };
+        let draft = bySource.get(key);
+        if (draft === undefined) {
+          if (visited.has(key)) {
+            // 元根拠自身への循環relationはrelatedへ追加しない。
+            continue;
+          }
+          visited.add(key);
+          draft = draftOf(row, 'correction', { relations: [] });
+          bySource.set(key, draft);
+          drafts.push(draft);
+          next.push({ messageId: row.source_message_id, revision: row.source_revision });
         }
-        visited.add(key);
-        drafts.push(
-          draftOf(row, 'correction', {
-            relation: row.relation,
-            relatedToMessageId: parent.messageId,
-            relatedToRevision: parent.revision,
-            relationSourceRevision: row.source_revision,
-          }),
-        );
-        next.push({ messageId: row.source_message_id, revision: row.source_revision });
+        const relations = draft.relations as RelatedRelation[];
+        if (
+          !relations.some(
+            (existing) =>
+              existing.relation === relation.relation &&
+              existing.relatedToMessageId === relation.relatedToMessageId &&
+              existing.relatedToRevision === relation.relatedToRevision,
+          )
+        ) {
+          relations.push(relation);
+        }
       }
     }
     frontier = next;
@@ -793,25 +817,38 @@ export async function revalidateRelatedEvidence(
         continue;
       }
     }
-    if (
-      draft.relation !== undefined &&
-      draft.relatedToMessageId !== undefined &&
-      draft.relatedToRevision !== undefined &&
-      draft.relationSourceRevision !== undefined
-    ) {
-      const relation = await client.query(
-        `SELECT 1 FROM message_relations
-          WHERE source_message_id = $1 AND source_revision = $2
-            AND target_message_id = $3 AND target_revision = $4 AND relation = $5
-          FOR SHARE`,
-        [draft.messageId, draft.relationSourceRevision, draft.relatedToMessageId, draft.relatedToRevision, draft.relation],
-      );
-      if (relation.rows.length === 0) {
+    let current = draft;
+    if (draft.sourceKind === 'correction') {
+      if (draft.relations === undefined || draft.relations.length === 0) {
         continue;
       }
+      // 無効relationだけを落とす。1件でもcurrentなrelationが残ればitemは保持する。
+      const validRelations: RelatedRelation[] = [];
+      for (const relation of draft.relations) {
+        const found = await client.query(
+          `SELECT 1 FROM message_relations
+            WHERE source_message_id = $1 AND source_revision = $2
+              AND target_message_id = $3 AND target_revision = $4 AND relation = $5
+            FOR SHARE`,
+          [
+            draft.messageId,
+            relation.relationSourceRevision,
+            relation.relatedToMessageId,
+            relation.relatedToRevision,
+            relation.relation,
+          ],
+        );
+        if (found.rows.length > 0) {
+          validRelations.push(relation);
+        }
+      }
+      if (validRelations.length === 0) {
+        continue;
+      }
+      current = { ...draft, relations: validRelations };
     }
     valid.push({
-      ...draft,
+      ...current,
       employeeId: row.employee_id,
       role: row.role,
       occurredAt: row.occurred_at,
