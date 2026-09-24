@@ -135,7 +135,7 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 - 429/529/5xx/timeout/通信障害: jobはpendingへ戻し、Retry-Afterと指数バックオフ+jitterで再試行する。検索受付はfailedとcodeを持ち、自動再試行のclaim時にpendingへ戻す。
 - 401/422/応答契約不正: `failed`で保持する。自動では再送しない。
 - 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev）。
-- Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
+- Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）と、HTTP statusを得られないDNS・接続・TLS・本文受信切断等のtransport failure: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
 - 外部待ち中に原文revision・desired_revision・generation・leaseが変化した応答は保存・公開せず、lease期限後の回収へ委ねる。
 - 停止・回収後に再開した旧workerのapplyDocumentPlanは、jobのlease所有・期限・target_revisionとsession fingerprintを書込前に再確認し、不一致なら何も変更せず拒否する（lease期限後の回収へ委ねる）。回収後の別workerが公開した文書状態を上書きしない。
 - 検索受付の`failed`は`no_match`ではない。M5の検索完了を偽らない。
@@ -148,9 +148,9 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 
 - 公開を拒否したstale応答のvectorは、同じ旧本文のexact hashに対するembedding_cache行として残り得る。stale応答自体は公開せず、cacheはcompany_id+generation_id+operation+完全なinput hashで隔離されるため別本文へ適用されない。
 - HTTP待ち中に同じmessage revisionのanalysisだけが変わると、次buildまで旧計画が一時公開され得る（原文・analysisは保持され、次のbuildで新しいanalysisから再計画する）。
-- 成功ヘッダー受信後の本文受信timeout・通信切断は恒久失敗となる。原文は保持され、明示retryで再開する。
+- Jevの成功ヘッダー受信後の本文受信timeout・通信切断は恒久失敗となる。原文は保持され、明示retryで再開する。Voyageは上記のretryable transport failureとして扱う。
 - 長文の複数partが同じ承認・撤回関係を示す場合、関係の根拠範囲は最初のpartだけが保存される。
-- 正常な外部応答の所要時間はヘッダー受信までを計測し、本文受信の時間を含まない。
+- Jevの正常応答所要時間はヘッダー受信までを計測し、本文受信の時間を含まない。Voyageは本文受信・parse完了まで含める。
 
 上記はユーザー指定により今回の修正対象から除外している。再利用は外部評価後、保存トランザクション内で比較対象の受付を読み直し、入力revisionが有効で、直接の元検索がnew_searchと確定している場合だけ採用する。各参照先の受付と元入力を保存完了までロックするため、判定後の改訂は保存完了まで待つ。先に改訂された場合は新規検索へ戻す。保存後の改訂はM5/M6の取得時に再検証する。
 
