@@ -102,6 +102,7 @@ describe('分類と原文保持', () => {
     const sessionId = await seedSession(pool, workspace);
     const proposal = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: 'キャッシュを無効化する案です' });
     const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 2, text: 'その案で実装してください' });
+    const relationExplicitQuestions = new Set<string>();
     const select = mergeChoices(
       (question) =>
         questionField(question.id) === 'relation_target'
@@ -109,6 +110,14 @@ describe('分類と原文保持', () => {
             ? 'none'
             : proposal.messageId
           : undefined,
+      // 候補が1件でも、selectorでrelation_explicit質問を識別して明示回答を返す。
+      (question) => {
+        if (question.id.includes('relation_explicit') && question.instructions.includes('relation_explicit')) {
+          relationExplicitQuestions.add(question.id);
+          return 'explicit';
+        }
+        return undefined;
+      },
       jevChoices({ retention: 'decision_signal', decision_action: 'accept', continuity: 'same_topic', statement_status: 'approval' }),
     );
     const server = await startApprovedJev(pool, workspace.companyId, (request) => ({ body: jevReply(request, select) }));
@@ -119,6 +128,8 @@ describe('分類と原文保持', () => {
       assert.equal(relations[0].target_message_id, proposal.messageId, '候補revisionへリンクしていない');
       assert.equal(relations[0].target_revision, 1);
       assert.equal(relations[0].relation, 'accept');
+      assert.equal(relations[0].is_explicit, true, '明示された承認関係をinferredとして保存している');
+      assert.equal(relationExplicitQuestions.size, 1, '候補1件で候補専用relation_explicit質問が1件でない');
       assert.equal(relations[0].policy_version, 'initial-v1');
 
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
@@ -150,6 +161,97 @@ describe('分類と原文保持', () => {
       assert.equal(relations.length, 1, '撤回関係が1件でない');
       assert.equal(relations[0].target_message_id, proposal.messageId);
       assert.equal(relations[0].relation, 'revoke');
+      assert.equal(relations[0].is_explicit, true, '明示された撤回関係をinferredとして保存している');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('複数候補では2件目を選んでも候補ごとのrelation_explicitを対応付ける', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const selectedProposal = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '先に出す案です' });
+    const unselectedProposal = await seedMessage(pool, { sessionId, sequenceNo: 2, role: 'assistant', text: 'あとから出す案です' });
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 3, text: '2件目の案で進めてください' });
+    const answeredRelationExplicitIds = new Set<string>();
+    const select = mergeChoices(
+      (question) =>
+        questionField(question.id) === 'relation_target'
+          ? question.criteria[selectedProposal.messageId] === undefined
+            ? 'none'
+            : selectedProposal.messageId
+          : undefined,
+      (question) => {
+        if (question.id.includes('relation_explicit') && question.instructions.includes(selectedProposal.messageId)) {
+          answeredRelationExplicitIds.add(selectedProposal.messageId);
+          return { choice: 'inferred', confidence: 0.95 };
+        }
+        return undefined;
+      },
+      (question) => {
+        if (question.id.includes('relation_explicit') && question.instructions.includes(unselectedProposal.messageId)) {
+          answeredRelationExplicitIds.add(unselectedProposal.messageId);
+          return 'explicit';
+        }
+        return undefined;
+      },
+      jevChoices({ retention: 'decision_signal', decision_action: 'accept', continuity: 'same_topic', statement_status: 'approval' }),
+    );
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({ body: jevReply(request, select) }));
+    try {
+      await processClassify(seeded.messageId, server);
+      const firstRequest = server.requests[0];
+      assert.ok(firstRequest, 'Jev呼出しがない');
+      assert.equal(firstRequest.body.state.prior_messages.length, 2, 'prior_messagesが2件でない');
+      // prior_messagesは新しい順なので、relation_targetが選ぶ2件目はsequence 1の候補になる。
+      assert.equal(
+        firstRequest.body.state.prior_messages[1]?.message_id,
+        selectedProposal.messageId,
+        '選択候補がrelation_targetの2件目でない',
+      );
+
+      const relations = await readRelations(pool, seeded.messageId, 1);
+      assert.equal(relations.length, 1, '選択候補への関係が1件でない');
+      assert.equal(relations[0]?.target_message_id, selectedProposal.messageId, '選択候補へリンクしていない');
+      assert.equal(relations[0]?.is_explicit, false, '非選択候補のexplicit回答を選択候補のinferredへ適用している');
+      assert.deepEqual(
+        [...answeredRelationExplicitIds].sort(),
+        [selectedProposal.messageId, unselectedProposal.messageId].sort(),
+        '候補ごとのrelation_explicit質問をinstructionsで識別できない',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('選択候補のrelation_explicitが低信頼なら関係を保存しない', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const selectedProposal = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '先に出す案です' });
+    const unselectedProposal = await seedMessage(pool, { sessionId, sequenceNo: 2, role: 'assistant', text: 'あとから出す案です' });
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 3, text: '2件目の案で進めてください' });
+    const select = mergeChoices(
+      (question) =>
+        questionField(question.id) === 'relation_target'
+          ? question.criteria[selectedProposal.messageId] === undefined
+            ? 'none'
+            : selectedProposal.messageId
+          : undefined,
+      (question) =>
+        question.id.includes('relation_explicit') && question.instructions.includes(selectedProposal.messageId)
+          ? { choice: 'inferred', confidence: 0.5 }
+          : undefined,
+      (question) =>
+        question.id.includes('relation_explicit') && question.instructions.includes(unselectedProposal.messageId)
+          ? 'explicit'
+          : undefined,
+      jevChoices({ retention: 'decision_signal', decision_action: 'accept' }),
+    );
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({ body: jevReply(request, select) }));
+    try {
+      const jobId = await processClassify(seeded.messageId, server);
+      const relations = await readRelations(pool, seeded.messageId, 1);
+      assert.equal(relations.length, 0, '選択候補の低信頼relation_explicitで関係を保存している');
+      assert.equal((await readJob(pool, jobId)).status, 'completed', '低信頼relation_explicitでjobが失敗している');
+      assert.ok(await readAnalysis(pool, seeded.messageId, 1), '低信頼relation_explicitで分析が保存されていない');
     } finally {
       await server.close();
     }
