@@ -985,6 +985,10 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   if (target === null) {
     throw new TargetMissingError('検索対象のinput revisionがありません');
   }
+  // job sessionがmessage所属sessionと一致しないjobは、外部送信もrequest running更新もせず終端する。
+  if (job.sessionId === null || job.sessionId !== target.sessionId) {
+    throw new TargetMissingError('execute_searchのjob sessionがmessage所属と一致しません');
+  }
   const requestId = searchRequestIdFromPayload(job.payload);
   if (requestId === null) {
     throw new TargetMissingError('search_request_idがありません');
@@ -1020,6 +1024,10 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   const candidates = await loadCandidates(pool, { target, generation, queryVector });
   const { selected, warnings } = await selectCandidates(candidates, questionTokens);
   if (selected.length === 0) {
+    if (candidates.length > 0) {
+      // 候補は存在するが全件が質問込みtoken予算に収まらない。no_matchに偽装せず恒久failedにする。
+      throw new InputBudgetError();
+    }
     await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [] });
     return;
   }
