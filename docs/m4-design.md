@@ -24,11 +24,14 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 - sessionの現行message revisionと`WORKER_POLICY_VERSION`の現行analysisだけをsequence順に使う。is_searchable=false/progress_onlyは除外する。原文は常に`message_revisions`へ残す。
 - tokenizerはVoyage公式docsが案内する`voyageai/voyage-4-lite`の公開tokenizerを固定revisionのローカル資産（`assets/voyage-4-lite/`）として使う。実行時に会話本文を配信元へ送らない。`tokenizer_version`へasset revisionと実行library版（`voyageai/voyage-4-lite@0335ddf7698395712e3220733b4079006951cfef+@huggingface/tokenizers@0.2.0`）を記録する。依存はexact 0.2.0に固定する。
 - 目標800・上限1200・重複100トークンにprovider document prefixの予約32トークンを含める。message→paragraph→code block境界を優先し、上限を超える単一blockだけをrange付きで分割する。UTF-16サロゲートペアは割らない。
+- 単一block分割時のatom上限は、次chunkが重複window（100トークン）と区切り1トークンを保持しても上限内に収まる値にする。改行のない長文でも隣接chunkのoverlapを破棄せず、chunk全体を複製しない。
 - `document_key`はsession ID+chunk先頭のmessage ID+そのrevision内start+chunker_versionの決定的hash。先頭messageのrevision番号は含めず、先頭messageを編集して再buildしても同じdocumentの新revisionにする。確定済みchunkは維持し、変化した末尾・編集影響chunkだけ新revisionにする。未公開の最新revisionは同じ番号のまま作り直す。
-- 消えた/除外された文書はis_searchable=false、publication stale、最新revision excludedへ揃える（原文rangeは保持）。再び検索対象になった文書は新revisionで再公開する。
-- 新revisionがpending/embeddingの間は既存公開revisionをstale=true（旧版利用可・警告付き）にし、新revisionの公開時にstale=falseへ戻して以前のready revisionをsupersededにする。
+- 消えた/除外された文書はis_searchable=false、publication削除、最新revision excludedへ揃える（原文rangeは保持）。再び検索対象になった文書は新revisionで再公開する。
+- 新revisionがpending/embeddingの間で、旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭にそのまま残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）にする。source消失・message revision変更・range変更を含む制限的変更では、外部HTTP前の文書構築TXでdocument_publications行を削除して即時検索不能にする。search_documents.is_searchableは新desired revisionの埋め込み用にtrueを維持し、成功時にapplyDocumentEmbeddingsがpublicationを作り直す。
+- 新revisionの公開時にstale=falseへ戻して以前のready revisionをsupersededにする。
 - provider_rejected/provider_contract_invalidの恒久エラー時は、そのjobが保持するpending/embedding revisionだけをfailedにする（job lease・desired_revisionで限定）。policy blocked・retryable・stale・lease喪失ではfailedにしない。明示retry後は同じ内容のfailed revisionをpendingへ戻して実際に再埋め込みし、空完了にしない。
-- 外部HTTPの前に文書構築TXを完了する。
+- 外部HTTPの前に文書構築TXを完了する。processBuild開始時にtarget.currentRevisionとtarget.targetRevisionが不一致なら、文書計画を変更せずlease条件付きcompletedにする。
+- loadSessionMessages時点で、session全messageのcurrent_revisionと現行policyのanalysis状態（revision/policy/state_hash/is_searchable/retention）の決定的fingerprintを取得する。applyDocumentPlanはsession advisory lock取得後・書込前に、jobのrunning/lease_token/期限/target_revisionとsession fingerprintをDBで再確認し、不一致はLeaseLostError/StaleApplyErrorでrollbackする。新規message追加・原文revision・分析再分類のいずれでも適用を拒否し、desired_revision/publication/revisionを変更しない。HTTP後の既存再検証も維持する。
 
 ## VoyageEmbeddingProvider
 
@@ -49,6 +52,10 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 
 `VOYAGE_API_KEY` / `VOYAGE_ACCOUNT_REF`を必須、`VOYAGE_API_URL`（既定`https://api.voyageai.com/v1/embeddings`）と`VOYAGE_REQUEST_TIMEOUT_MS`（既定20000）を設定する。endpointはHTTPS、または開発用loopback HTTPのみ。
 
+## 保留（ユーザー指定）
+
+- 公開を拒否したstale応答のvectorは、同じ旧本文のexact hashに対するembedding_cache行として残り得る（stale応答自体は公開しない）。cacheはcompany_id+generation_id+operation+完全なinput hashで隔離されるため、別の本文の公開へは適用されない。
+
 ## 検証
 
-`src/worker/tests/m4-documents.test.ts`がbuild_documents、Voyage送信契約、承認ゲート、cache、障害、外部待ち中の状態変更、runner/retryを実PostgreSQLとloopback HTTP fixtureで検証する。`src/db/tests/schema.test.ts`が0004_m4.sqlのschema契約を検証する。実Voyage・実会話は送信しない。
+`src/worker/tests/m4-documents.test.ts`がbuild_documents、Voyage送信契約、承認ゲート、cache、障害、外部待ち中の状態変更、runner/retryを実PostgreSQLとloopback HTTP fixtureで検証する。非先頭sourceのprogress_only再分類でのpublication削除、snapshot後のlease回収・snapshot不一致での計画適用拒否、改行なし長文のoverlapも同fileで検証する。`src/db/tests/schema.test.ts`が0004_m4.sqlのschema契約を検証する。実Voyage・実会話は送信しない。
