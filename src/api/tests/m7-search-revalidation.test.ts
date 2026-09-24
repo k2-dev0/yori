@@ -50,6 +50,7 @@ interface RelatedFixture {
   relation?: string;
   relatedToMessageId?: string;
   relatedToRevision?: number;
+  relations?: Array<{ relation: string; relatedToMessageId: string; relatedToRevision: number }>;
   linkIds?: string[];
 }
 
@@ -68,6 +69,15 @@ function relatedJson(input: RelatedFixture): Record<string, unknown> {
           relation: input.relation,
           related_to_message_id: input.relatedToMessageId,
           related_to_revision: input.relatedToRevision,
+        }),
+    ...(input.relations === undefined
+      ? {}
+      : {
+          relations: input.relations.map((relation) => ({
+            relation: relation.relation,
+            related_to_message_id: relation.relatedToMessageId,
+            related_to_revision: relation.relatedToRevision,
+          })),
         }),
     ...(input.linkIds === undefined ? {} : { _link_ids: input.linkIds }),
   };
@@ -303,6 +313,97 @@ async function seedRevalidationFixture(): Promise<RevalidationFixture> {
     explicit,
     explicitLinkId: linkId,
     relationId,
+  };
+}
+
+interface MultiRelationFixture {
+  requestId: string;
+  sourceMessageId: string;
+  targetOneId: string;
+  targetTwoId: string;
+  relationOneId: string;
+  relationTwoId: string;
+}
+
+// 1つのcorrection message/revisionが2つのprimary evidenceをtargetにする保存result。
+async function seedMultiRelationFixture(): Promise<MultiRelationFixture> {
+  const input = await seedSessionWithMessage('m7-multi-rel-input', 1, 'MULTI-INPUT-QUERY', 'user');
+  const primary = await seedSessionWithMessage('m7-multi-rel-primary', 2, 'MULTI-PRIMARY-TWO');
+  const targetOne = await insertMessage(pool, {
+    sessionId: primary.sessionId,
+    sourceMessageId: 'msg-m7-multi-one',
+    sequenceNo: 1,
+    role: 'assistant',
+    text: 'MULTI-PRIMARY-ONE',
+  });
+  const correction = await insertMessage(pool, {
+    sessionId: primary.sessionId,
+    sourceMessageId: 'msg-m7-multi-correction',
+    sequenceNo: 3,
+    role: 'assistant',
+    text: 'MULTI-CORRECTION',
+  });
+  const relationOneId = await insertRelation(correction.messageId, targetOne.messageId, 'change');
+  const relationTwoId = await insertRelation(correction.messageId, primary.messageId, 'revoke');
+  const requestId = uuidv7();
+  await insertSearchRequest({
+    requestId,
+    sessionId: input.sessionId,
+    inputMessageId: input.messageId,
+    inputRevision: 1,
+    inputSequenceNo: 1,
+    result: directResult({
+      requestId,
+      inputId: input.messageId,
+      inputRevision: 1,
+      projectId: workspace.projectId,
+      evidence: [
+        {
+          messageId: targetOne.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:00:00.000Z',
+          text: 'MULTI-PRIMARY-ONE',
+          sourceKind: 'neighbor',
+        },
+        {
+          messageId: primary.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:01:00.000Z',
+          text: 'MULTI-PRIMARY-TWO',
+          sourceKind: 'neighbor',
+        },
+      ],
+      related: [
+        {
+          messageId: correction.messageId,
+          revision: 1,
+          employeeId: workspace.employeeId,
+          role: 'assistant',
+          occurredAt: '2026-09-21T01:02:00.000Z',
+          text: 'MULTI-CORRECTION',
+          sourceKind: 'correction',
+          relation: 'change',
+          relatedToMessageId: targetOne.messageId,
+          relatedToRevision: 1,
+          relations: [
+            { relation: 'change', relatedToMessageId: targetOne.messageId, relatedToRevision: 1 },
+            { relation: 'revoke', relatedToMessageId: primary.messageId, relatedToRevision: 1 },
+          ],
+        },
+      ],
+    }),
+  });
+  return {
+    requestId,
+    sourceMessageId: correction.messageId,
+    targetOneId: targetOne.messageId,
+    targetTwoId: primary.messageId,
+    relationOneId,
+    relationTwoId,
   };
 }
 
@@ -605,6 +706,47 @@ describe('M7 結果取得時の再検証', () => {
     const secondBody = second.json<DirectMatchBody & { lookup_status?: string }>();
     assert.equal(secondBody.outcome, 'matched');
     assert.ok(!relatedTexts(secondBody).includes('REVAL-NEIGHBOR'), 'by-inputで改訂済みrelatedを返している');
+  });
+
+  it('複数targetのcorrectionはrelated原文1件・relations 2件でGET matchedを返す', async () => {
+    const fixture = await seedMultiRelationFixture();
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'matched');
+    const evidenceIds = (body.matches?.[0]?.evidence ?? []).map((item) => item.message_id);
+    assert.ok(evidenceIds.includes(fixture.targetOneId) && evidenceIds.includes(fixture.targetTwoId), '2つのprimary evidenceがない');
+    const related = body.matches?.[0]?.related_evidence ?? [];
+    assert.equal(related.length, 1, `related原文がmessage単位で1件ではない: ${JSON.stringify(related)}`);
+    const relations = (related[0]?.relations ?? []) as Array<Record<string, unknown>>;
+    assert.equal(relations.length, 2, '複数targetのrelation metadataが失われている');
+    assert.deepEqual(
+      new Set(relations.map((relation) => relation.related_to_message_id)),
+      new Set([fixture.targetOneId, fixture.targetTwoId]),
+    );
+    assert.deepEqual(new Set(relations.map((relation) => relation.relation)), new Set(['change', 'revoke']));
+  });
+
+  it('複数relationの1件が削除されても残りrelationでitemを保持する', async () => {
+    const fixture = await seedMultiRelationFixture();
+    await pool.query('DELETE FROM message_relations WHERE id = $1', [fixture.relationTwoId]);
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'matched', '残りrelationがあるのにmatchを落としている');
+    const related = body.matches?.[0]?.related_evidence ?? [];
+    assert.equal(related.length, 1, '有効relationが残るcorrection itemを落としている');
+    assert.equal(related[0]?.related_to_message_id, fixture.targetOneId, '残ったrelationのtargetを保持していない');
+    const relations = related[0]?.relations;
+    assert.ok(relations === undefined || (Array.isArray(relations) && relations.length === 1), '無効relationだけが落ちていない');
+  });
+
+  it('複数target correctionへの未収録relationが追加されたらno_matchにする', async () => {
+    const fixture = await seedMultiRelationFixture();
+    const extra = await seedSessionWithMessage('m7-multi-extra', 1, 'MULTI-EXTRA', 'user');
+    await insertRelation(extra.messageId, fixture.targetTwoId, 'change');
+    const response = await getSearchById(app, { token: workspace.token, id: fixture.requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'no_match', '未収録relationがあるのにmatchedを返している');
+    assert.equal(body.matches?.length ?? 0, 0);
   });
 
   it('multi-hop explicitの起点linkがrevokeされたら終端Cも直接Bも落とす', async () => {
