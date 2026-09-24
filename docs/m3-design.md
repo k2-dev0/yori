@@ -67,3 +67,13 @@ CLIはworker起動、指定jobのfailed/blocked_policyからの明示retry、承
 
 既存方式node:test、Fastify inject、実PostgreSQL。外部AIだけローカルHTTP fixtureとし本番コードに偽応答を入れない。Redではtestと必要最小限の型・未実装stubを用意し、import/type/syntax失敗でなく未実装挙動によるassert失敗を確認して一度返却する。Green前に親が1fileずつcommitしbaselineを記録する。
 検証は`npm test`（隔離Compose DB＋既存回帰）、`npm run typecheck`、変更pathのeslint、`npm run build`。既存migration数固定assertとCompose service allowlistは追加分を含める。HTTPを行う実行はsandbox外。実社員会話は送信しない。
+
+## レビュー後の修正範囲（2026-09-24）
+
+ユーザー指定により指摘1・3・4・5を修正し、2は保留する。
+
+- 再利用chainは途中の受付だけでなく、直接の元検索を含む各参照先の状態・policy・先行入力revision・期限・根拠を検証する。不適格ならnew_searchへ戻す。
+- lease更新等のDB待機後、HTTP送信直前にも有効な送信承認を確認する。外部待機中にDB lockは保持しない。
+- ワーカー待機はタイマー満了・停止通知の両経路でtimer/listenerを解放する。
+- 設定modelはcache照合に保持し、応答modelは別途cache・usage・各partへ記録する。analysisのmodel_versionは応答modelが全part同一ならその値、混在なら重複除去した応答modelのJSON配列文字列とする。過去cacheで応答modelが不明なものは再利用せず再評価する。追加migrationで既存データを保持する。
+- 保留事項2：成功ヘッダー受信後の本文受信中のtimeout/通信切断は、現在provider_contract_invalidとして恒久失敗になる。原文は残り、明示retryで回復できる。今回この挙動は変更しない。
