@@ -97,7 +97,10 @@ function toResponse(row: {
   };
 }
 
-// 認証社員がmemberの案件に属するsessionだけを、取り込み元identityの完全一致で解決する。
+// 認証社員がmemberの案件に属するsessionを、POST /v1/eventsと同じ保存namespaceで解決する。
+// 保存済みscopeは `v1|company_id|employee_id|外部source_scope` であり、外部scopeをそのまま
+// 比較すると標準収集経路のsessionを見つけられない。LIKEやsuffix一致は使わず完全一致だけを許す。
+// fromは同案件の他社員sessionも解決でき、toの所有者確認は呼出側で認証社員本人に限定する。
 async function resolveSession(
   client: PoolClient,
   auth: AuthContext,
@@ -111,8 +114,8 @@ async function resolveSession(
       WHERE p.company_id = $1
         AND s.project_id = $2
         AND s.source = $3
-        AND s.source_scope = $4
-        AND s.source_session_id = $5`,
+        AND s.source_session_id = $5
+        AND s.source_scope = 'v1|' || p.company_id::text || '|' || s.employee_id::text || '|' || $4::text`,
     [auth.companyId, projectId, identity.source, identity.source_scope, identity.source_session_id],
   );
   return result.rows[0] ?? null;
