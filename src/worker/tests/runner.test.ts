@@ -1,5 +1,6 @@
 import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import { resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
@@ -111,5 +112,26 @@ describe('worker runner', () => {
       controller.abort();
       await server.close();
     }
+  });
+  it('poll待機を繰り返してもabort listenerを増やさず、停止後に解放する', async () => {
+    const controller = new AbortController();
+    const running = runWorker({
+      pool,
+      config: buildWorkerConfig('http://127.0.0.1:1'),
+      pollIntervalMs: 5,
+      signal: controller.signal,
+    });
+    try {
+      await waitFor(async () => getEventListeners(controller.signal, 'abort').length > 0);
+      // 複数poll分待っても、laneごとの現在の待機1件を超えてlistenerが累積しない。
+      await sleep(60);
+      const during = getEventListeners(controller.signal, 'abort').length;
+      assert.ok(during >= 1, `待機中のabort listenerがない: ${during}`);
+      assert.ok(during <= 3, `poll待機でabort listenerが累積している: ${during}`);
+    } finally {
+      controller.abort();
+      await running;
+    }
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0, '停止後もabort listenerが残っている');
   });
 });
