@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import type { WorkerConfig } from './config.js';
 import { PolicyBlockedError } from './errors.js';
@@ -104,6 +104,12 @@ async function runProjectReindex(pool: Pool, projectId: string, config: WorkerCo
     return { ok: false, code: 'project_not_found', runId: null, targetGenerationId: null };
   }
 
+  // 直前のcompleted runのtargetが現在のactiveで、completenessも成立する場合は何も作らずno-opにする。
+  const noop = await findCompletedNoop(pool, project, config);
+  if (noop !== null) {
+    return { ok: true, code: 'noop', runId: noop.runId, targetGenerationId: noop.target.id };
+  }
+
   let run = await findResumableRun(pool, project, config);
   if (run === null) {
     const created = await createRun(pool, project, config);
@@ -162,6 +168,34 @@ async function runProjectReindex(pool: Pool, projectId: string, config: WorkerCo
   }
   await markRunPending(pool, runId, 'reindex_incomplete');
   return { ok: false, code: 'reindex_incomplete', runId, targetGenerationId: target.id };
+}
+
+// 最新completed runのtargetが現在のactiveで、current spec一致かつ現在の全searchable desired revisionの
+// target completeness（embedding/publication/hash/stale/source現行性）が成立する場合だけno-op対象を返す。
+async function findCompletedNoop(pool: Pool, project: ProjectRow, config: WorkerConfig): Promise<ResumableRun | null> {
+  if (project.active_generation_id === null) {
+    return null;
+  }
+  const result = await pool.query<{ id: string; target_generation_id: string }>(
+    `SELECT id, target_generation_id
+       FROM reindex_runs
+      WHERE project_id = $1 AND status = 'completed'
+      ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC
+      LIMIT 1`,
+    [project.id],
+  );
+  const run = result.rows[0];
+  if (run === undefined || run.target_generation_id !== project.active_generation_id) {
+    return null;
+  }
+  const target = await loadGenerationById(pool, { companyId: project.company_id, generationId: run.target_generation_id });
+  if (target === null || target.status === 'failed' || !generationSpecMatches(target, config)) {
+    return null;
+  }
+  if ((await countIncompleteDocuments(pool, project.id, run.target_generation_id)) > 0) {
+    return null;
+  }
+  return { runId: run.id, target };
 }
 
 // 同project・同source・current specの未完了runだけをresumeする。それ以外の未完了runは
@@ -427,13 +461,8 @@ async function applyEmbeddings(
          DO UPDATE SET revision = EXCLUDED.revision, stale = false, updated_at = now()`,
         [item.id, input.target.id, item.desired_revision],
       );
-      await client.query(
-        `UPDATE search_document_revisions SET status = 'ready', updated_at = now()
-          WHERE document_id = $1 AND revision = $2 AND content_hash = $3 AND status <> 'excluded'`,
-        [item.id, item.desired_revision, item.content_hash],
-      );
-      // 旧世代はcutoverまでold publicationを使い続けるため、targetへの公開では
-      // 他revisionのready状態をsupersededへ変えない（8.3の「切替まで旧ready版を使える」）。
+      // revision statusは世代共通のためcandidate公開では変えない。旧activeのbuild_documentsが
+      // 引き続きpending/embeddingとして処理できる。ready化はcutover検証成功TXでだけ行う。
       applied += 1;
     }
     await client.query('COMMIT');
@@ -444,6 +473,38 @@ async function applyEmbeddings(
   } finally {
     client.release();
   }
+}
+
+// 現在searchableなdesired revisionについて、targetのembedding/publication/input_hash/staleと
+// source message現行性がすべて揃っていないdocument数を数える。tryCutover・no-op・metricsで同じ契約を使う。
+export async function countIncompleteDocuments(
+  client: Pool | PoolClient,
+  projectId: string,
+  targetGenerationId: string,
+): Promise<number> {
+  const result = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+       FROM search_documents d
+       JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
+       LEFT JOIN document_embeddings e
+         ON e.document_id = d.id AND e.revision = d.desired_revision AND e.generation_id = $2
+       LEFT JOIN document_publications p
+         ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
+      WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
+        AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale
+             OR NOT EXISTS (
+               SELECT 1 FROM search_document_sources s
+                WHERE s.document_id = d.id AND s.revision = d.desired_revision
+             )
+             OR EXISTS (
+               SELECT 1 FROM search_document_sources s
+                JOIN messages m ON m.id = s.message_id
+                WHERE s.document_id = d.id AND s.revision = d.desired_revision
+                  AND m.current_revision <> s.message_revision
+             ))`,
+    [projectId, targetGenerationId],
+  );
+  return Number(result.rows[0]?.count ?? '0');
 }
 
 // cutover TX。company generation lock → project FOR UPDATEの順に取得し、current searchable desired revisionの
@@ -494,32 +555,34 @@ async function tryCutover(
               OR r.document_id IS NULL OR r.status = 'excluded')`,
       [input.project.id, input.targetGenerationId],
     );
-    const missing = await client.query<{ count: string }>(
-      `SELECT count(*)::text AS count
-         FROM search_documents d
-         JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
-         LEFT JOIN document_embeddings e
-           ON e.document_id = d.id AND e.revision = d.desired_revision AND e.generation_id = $2
-         LEFT JOIN document_publications p
-           ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
-        WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
-          AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale
-               OR NOT EXISTS (
-                 SELECT 1 FROM search_document_sources s
-                  WHERE s.document_id = d.id AND s.revision = d.desired_revision
-               )
-               OR EXISTS (
-                 SELECT 1 FROM search_document_sources s
-                  JOIN messages m ON m.id = s.message_id
-                  WHERE s.document_id = d.id AND s.revision = d.desired_revision
-                    AND m.current_revision <> s.message_revision
-               ))`,
-      [input.project.id, input.targetGenerationId],
-    );
-    if (Number(missing.rows[0]?.count ?? '0') > 0) {
+    if ((await countIncompleteDocuments(client, input.project.id, input.targetGenerationId)) > 0) {
       await client.query('COMMIT');
       return 'incomplete';
     }
+    // 完全性が確定した時だけ、このTXでrevision statusを世代共通の最新へ揃える。
+    // candidate公開だけではreadyにしないため、旧activeのbuild_documents追従を止めない。
+    await client.query(
+      `UPDATE search_document_revisions r
+          SET status = 'ready', updated_at = now()
+         FROM search_documents d
+        WHERE d.id = r.document_id
+          AND d.project_id = $1
+          AND d.is_searchable
+          AND r.revision = d.desired_revision
+          AND r.status <> 'excluded'`,
+      [input.project.id],
+    );
+    await client.query(
+      `UPDATE search_document_revisions r
+          SET status = 'superseded', updated_at = now()
+         FROM search_documents d
+        WHERE d.id = r.document_id
+          AND d.project_id = $1
+          AND d.is_searchable
+          AND r.revision <> d.desired_revision
+          AND r.status = 'ready'`,
+      [input.project.id],
+    );
     await client.query(`UPDATE embedding_generations SET status = 'active', updated_at = now() WHERE id = $1 AND status = 'candidate'`, [
       input.targetGenerationId,
     ]);
@@ -552,7 +615,8 @@ async function tryCutover(
 export type GenerationDeleteResult = 'deleted' | 'not_found' | 'generation_referenced';
 
 // 参照がない世代だけを削除する。active project・未完了reindex run・実行中search requestが
-// 参照する世代は削除しない。参照の判定とDELETEを同一TXで行う。
+// 参照する世代は削除しない。削除できる場合も、固定世代を失うfailed requestは同一TXでexpiredへ
+// 終端し、後続retryが現在active世代へ再pinしないようにする。参照の判定とDELETEは同一TXで行う。
 export async function deleteGeneration(pool: Pool, generationId: string): Promise<GenerationDeleteResult> {
   const client = await pool.connect();
   try {
@@ -580,6 +644,15 @@ export async function deleteGeneration(pool: Pool, generationId: string): Promis
       await client.query('ROLLBACK');
       return 'generation_referenced';
     }
+    // failed requestは検索の再開対象から外し、削除済み世代を別世代へpinし直させない。
+    // completed/expiredはstatus/resultを壊さず、残る世代参照はFK ON DELETE SET NULLへ任せる。
+    await client.query(
+      `UPDATE search_requests
+          SET status = 'expired', outcome = NULL, error_code = 'embedding_generation_deleted',
+              stage = NULL, embedding_generation_id = NULL, updated_at = now()
+        WHERE embedding_generation_id = $1 AND status = 'failed'`,
+      [generationId],
+    );
     await client.query('DELETE FROM embedding_generations WHERE id = $1', [generationId]);
     await client.query('COMMIT');
     return 'deleted';
