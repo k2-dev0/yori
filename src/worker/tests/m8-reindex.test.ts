@@ -1285,6 +1285,49 @@ describe('M8 再索引と世代切替', () => {
     assert.ok(run, 'reindex runが残っていない');
     assert.notEqual(run.status, 'completed', '旧sourceのrunをcompletedにした');
   });
+  it('ミリ秒未満のcreated_atでもkeyset cursorが進み、再索引が有限時間で完了する', { timeout: 15_000 }, async () => {
+    const { config, env, voyage } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-micro-a',
+      text: 'M8-MICRO-A',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    const second = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 2,
+      key: 'm8-micro-b',
+      text: 'M8-MICRO-B',
+      generationId: source.id,
+      embedding: basisVector(1, 1),
+    });
+    // DBのtimestamptz精度（マイクロ秒）を持つ同値created_atを作り、cursorがidで一度ずつ進むことも確認する。
+    await pool.query(
+      `UPDATE search_documents
+          SET created_at = '2026-01-01 00:00:00.123456+00'::timestamptz,
+              updated_at = '2026-01-01 00:00:00.123456+00'::timestamptz
+        WHERE id = ANY($1::uuid[])`,
+      [[first.documentId, second.documentId]],
+    );
+
+    assert.equal(await runCli(['reindex', workspace.projectId], env), 0, 'reindexが成功終了しなかった');
+    const targetId = await readActiveGeneration(pool, workspace.projectId);
+    assert.ok(targetId !== null && targetId !== source.id, 'active generationが切り替わっていない');
+    const published = await readTargetPublications(pool, workspace.projectId, targetId);
+    assert.equal(published.length, 2, 'searchable文書がすべてtargetへ公開されていない');
+    const sent = voyage.requests.flatMap((request) => request.body.input ?? []);
+    assert.deepEqual([...sent].sort(), [first.text, second.text].sort(), '同じ文書を重複送信した');
+  });
 });
 
 describe('M8 運用metrics', () => {
