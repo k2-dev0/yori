@@ -42,8 +42,8 @@ interface RouteDecision {
   originRequestId?: string;
 }
 
-interface StoredEvaluation {
-  model: string;
+interface CachedEvaluation {
+  responseModel: string;
   answers: Record<string, JevAnswer>;
 }
 
@@ -62,17 +62,19 @@ async function hasActiveApproval(pool: Pool, companyId: string, config: WorkerCo
   return result.rows.length > 0;
 }
 
+// 応答modelが不明な旧cache行は再利用せず、実評価で更新するまでcache-hitにしない。
 async function loadCachedEvaluation(
   pool: Pool,
   companyId: string,
   config: WorkerConfig,
   stateHash: Buffer,
-): Promise<StoredEvaluation | undefined> {
-  const result = await pool.query<StoredEvaluation>(
-    `SELECT model, answers
+): Promise<CachedEvaluation | undefined> {
+  const result = await pool.query<CachedEvaluation>(
+    `SELECT response_model AS "responseModel", answers
        FROM jev_evaluations
       WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND model = $5 AND confidence_threshold = $6 AND policy_version = $7 AND questions_version = $8 AND state_hash = $9`,
+        AND model = $5 AND confidence_threshold = $6 AND policy_version = $7 AND questions_version = $8 AND state_hash = $9
+        AND response_model IS NOT NULL`,
     [
       companyId,
       JEV_PROVIDER,
@@ -89,18 +91,22 @@ async function loadCachedEvaluation(
 }
 
 // 完了済み評価だけを保存する。同時missでの二重外部評価は許容する。
+// 旧行の応答modelがNULLの時は実評価の応答modelと回答で更新し、不明なまま再利用させない。
 async function saveCachedEvaluation(
   pool: Pool,
   companyId: string,
   config: WorkerConfig,
   stateHash: Buffer,
+  responseModel: string,
   answers: Record<string, JevAnswer>,
 ): Promise<void> {
   await pool.query(
     `INSERT INTO jev_evaluations
-       (id, company_id, provider, account_ref, endpoint, model, confidence_threshold, policy_version, questions_version, state_hash, answers)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-     ON CONFLICT DO NOTHING`,
+       (id, company_id, provider, account_ref, endpoint, model, confidence_threshold, policy_version, questions_version, state_hash, answers, response_model)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+     ON CONFLICT (company_id, provider, account_ref, endpoint, model, confidence_threshold, policy_version, questions_version, state_hash)
+     DO UPDATE SET answers = EXCLUDED.answers, response_model = EXCLUDED.response_model
+     WHERE jev_evaluations.response_model IS NULL`,
     [
       uuidv7(),
       companyId,
@@ -113,8 +119,18 @@ async function saveCachedEvaluation(
       JEV_QUESTIONS_VERSION,
       stateHash,
       JSON.stringify(answers),
+      responseModel,
     ],
   );
+}
+
+// 応答本文を取得できた場合だけ、検証結果とは独立に応答modelを取り出す。推測補完はしない。
+function extractResponseModel(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null) {
+    return null;
+  }
+  const model = (raw as { model?: unknown }).model;
+  return typeof model === 'string' && model.length > 0 ? model : null;
 }
 
 function extractUsage(raw: unknown): JevUsage {
@@ -143,11 +159,12 @@ async function recordUsage(
   durationMs: number,
   errorCode: string | null,
   usage: JevUsage,
+  responseModel: string | null,
 ): Promise<void> {
   await pool.query(
     `INSERT INTO usage_events
-       (id, company_id, provider, account_ref, endpoint, operation, model, input_tokens, output_tokens, duration_ms, success, error_code)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       (id, company_id, provider, account_ref, endpoint, operation, model, response_model, input_tokens, output_tokens, duration_ms, success, error_code)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
     [
       uuidv7(),
       target.companyId,
@@ -156,6 +173,7 @@ async function recordUsage(
       config.apiUrl,
       jobKind,
       config.model,
+      responseModel,
       usage.input_tokens,
       usage.output_tokens,
       Math.max(0, Math.round(durationMs)),
@@ -193,16 +211,25 @@ async function evaluatePlan(
     if (cached !== undefined) {
       try {
         const validated = validateJevResponse(
-          { model: cached.model, answers: cached.answers, usage: { input_tokens: null, output_tokens: null } },
+          { model: cached.responseModel, answers: cached.answers, usage: { input_tokens: null, output_tokens: null } },
           planned.request.questions,
         );
-        evaluations.push({ part: planned.part, answers: validated.answers, candidates: planned.candidates });
+        evaluations.push({
+          part: planned.part,
+          answers: validated.answers,
+          candidates: planned.candidates,
+          responseModel: validated.model,
+        });
         continue;
       } catch {
         // 検証できないcacheは使わず外部評価へ進む。
       }
     }
     await renewLeaseOrThrow(pool, job, config);
+    // lease更新のDB待機中に承認が失効していたら、HTTP送信の直前にもう一度確認して送信しない。
+    if (!(await hasActiveApproval(pool, target.companyId, config))) {
+      throw new PolicyBlockedError('承認がありません');
+    }
     const started = Date.now();
     let json: unknown;
     let durationMs: number;
@@ -212,20 +239,33 @@ async function evaluatePlan(
       durationMs = called.durationMs;
     } catch (error) {
       const jevError = error instanceof JevCallError ? error : new JevCallError('provider_unavailable', true);
-      await recordUsage(pool, target, job.kind, config, false, Date.now() - started, jevError.code, {
-        input_tokens: null,
-        output_tokens: null,
-      });
+      await recordUsage(
+        pool,
+        target,
+        job.kind,
+        config,
+        false,
+        Date.now() - started,
+        jevError.code,
+        { input_tokens: null, output_tokens: null },
+        null,
+      );
       throw jevError;
     }
     try {
       const validated = validateJevResponse(json, planned.request.questions);
-      await recordUsage(pool, target, job.kind, config, true, durationMs, null, validated.usage);
-      await saveCachedEvaluation(pool, target.companyId, config, planned.stateHash, validated.answers);
-      evaluations.push({ part: planned.part, answers: validated.answers, candidates: planned.candidates });
+      await recordUsage(pool, target, job.kind, config, true, durationMs, null, validated.usage, validated.model);
+      await saveCachedEvaluation(pool, target.companyId, config, planned.stateHash, validated.model, validated.answers);
+      evaluations.push({
+        part: planned.part,
+        answers: validated.answers,
+        candidates: planned.candidates,
+        responseModel: validated.model,
+      });
     } catch (error) {
       const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
-      await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractUsage(json));
+      // 応答本文からmodelを取得できた場合は、検証失敗でも取得できた値だけを記録する。
+      await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractUsage(json), extractResponseModel(json));
       throw error instanceof JevCallError ? error : new JevCallError('provider_contract_invalid', false);
     }
   }
@@ -239,7 +279,6 @@ async function applyAnalysis(
   target: JobTarget,
   stateHash: Buffer,
   aggregate: AggregatedEvaluation,
-  config: WorkerConfig,
 ): Promise<void> {
   const client = await pool.connect();
   const started = Date.now();
@@ -288,7 +327,7 @@ async function applyAnalysis(
         aggregate.continuity,
         aggregate.statementStatus,
         aggregate.isSearchable,
-        config.model,
+        aggregate.modelVersion,
         stateHash,
         JSON.stringify(aggregate.parts),
       ],
@@ -472,7 +511,7 @@ async function processClassify(pool: Pool, job: ClaimedJob, config: WorkerConfig
   const plan = planEvaluations(target, priorMessages, priorSearch, config);
   const evaluations = await evaluatePlan(pool, target, job, plan, config);
   const aggregate = aggregateEvaluations(evaluations, config.confidenceThreshold);
-  await applyAnalysis(pool, job, target, plan.stateHash, aggregate, config);
+  await applyAnalysis(pool, job, target, plan.stateHash, aggregate);
 }
 
 async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): Promise<void> {
