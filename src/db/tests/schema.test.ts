@@ -45,6 +45,8 @@ const REQUIRED_TABLES = [
   'embedding_cache',
   // M5: 明示識別子の完全一致検索。
   'document_entities',
+  // M7: 明示session引き継ぎリンク。
+  'session_links',
 ];
 
 before(async () => {
@@ -114,6 +116,7 @@ describe('migration管理', () => {
       '0004_m4.sql',
       '0005_m5.sql',
       '0006_m6.sql',
+      '0007_m7.sql',
     ]);
   });
 
@@ -122,7 +125,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '6');
+    assert.equal(versions.rows[0].count, '7');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -133,6 +136,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0004_m4.sql'), '0004_m4.sql がない');
     assert.ok(files.includes('0005_m5.sql'), '0005_m5.sql がない');
     assert.ok(files.includes('0006_m6.sql'), '0006_m6.sql がない');
+    assert.ok(files.includes('0007_m7.sql'), '0007_m7.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
