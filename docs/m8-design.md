@@ -21,7 +21,9 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 - targetのembedding、publication、input hashが揃ったrevisionは再送しない。
 - VoyageEmbeddingProviderの承認ゲート、cache、件数・順序・次元・有限値検証を再利用する。
 - batch適用時に会社・案件・検索可否・desired revision・content hash・全source messageの現行revisionを再検証する。不一致ならtargetへ公開しない。
+- candidateへの公開だけでは世代共通のrevision statusを`ready`へ変えない。旧activeの通常`build_documents`がpending revisionを処理できる状態を維持し、完全なcutover TXでだけdesired revisionを`ready`、旧ready revisionを`superseded`へ揃える。
 - 承認未確認は`blocked_policy`、retry可能な外部障害は`pending`として同じtargetを再開可能にする。恒久provider拒否・契約違反はrunとtarget世代を`failed`にする。いずれも旧activeを変更しない。
+- 最新completed runのtargetが現在activeで、current specと全documentの完全性が一致する同一操作の再実行は成功no-opとする。新しいrun・generation・provider送信を増やさない。
 
 ## 原子的切替
 
@@ -46,7 +48,7 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 
 ## 世代削除とmetrics
 
-`worker:generation-delete -- <generation-uuid>`は、active案件、未完了reindex run、pending/running検索要求が参照する世代を拒否する。参照の確認と削除は同一TXで行い、参照がない世代だけを明示削除する。
+`worker:generation-delete -- <generation-uuid>`は、active案件、未完了reindex run、pending/running検索要求が参照する世代を拒否する。検索retryはgeneration行、request行の順でロックし、削除と直列化する。削除可能な世代を固定していたfailed検索要求は、同じTXで`expired / embedding_generation_deleted`へ終端してから世代参照を外し、後から別active世代へ再固定しない。参照の確認と削除は同一TXで行う。
 
 `worker:metrics -- <project-uuid>`は案件単位のJSONだけをstdoutへ返す。
 
@@ -66,6 +68,6 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 ## 検証
 
 - `src/db/tests/m8-schema.test.ts`: migration、run、検索世代固定、検索時間sample。
-- `src/worker/tests/m8-reindex.test.ts`: 正常切替、追加・改訂・除外追従、provider障害、承認待ち、恒久失敗、再開、会社・案件隔離、検索世代固定、明示削除、metrics、初回世代設定・source改訂・pointer変更との競合。
+- `src/worker/tests/m8-reindex.test.ts`: 正常切替、追加・改訂・除外追従、provider障害、承認待ち、恒久失敗、再開・完了後no-op、会社・案件隔離、検索世代固定、明示削除とretry競合、metrics、初回世代設定・source改訂・pointer変更・マイクロ秒cursorとの競合。
 - `deployment/tests/m8.test.ts`: production profile、Caddy、公開port、永続volume、log rotation、運用手順。
 - 合成fixtureとloopback providerだけを使用し、実Jev/Voyage・実会話・実クラウドへ送信しない。
