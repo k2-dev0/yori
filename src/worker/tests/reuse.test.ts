@@ -208,6 +208,50 @@ describe('再利用の制限', () => {
     }
   });
 
+  it('Jev応答待ち中に先行入力が改訂されたらnew_searchにする', async () => {
+    const pair = await seedPair();
+    const server = await startFakeJev(async (request) => {
+      // stateを送信済みの時点で改訂し、評価開始時のsnapshotでは判定できない失効を再現する。
+      const priorInput = await pool.query<{ input_id: string }>(
+        'SELECT input_id FROM search_requests WHERE id = $1',
+        [pair.priorRequestId],
+      );
+      await advanceRevision(pool, priorInput.rows[0].input_id, '条件を変更した質問');
+      return reuseReply()(request);
+    });
+    try {
+      await expectRouteAction(pair, server, 'new_search', '外部評価待ち中の先行入力改訂');
+      assert.equal(server.requests.length, 1, '外部評価を経由していない');
+      assert.equal(server.requests[0].body.state.prior_search?.input_revision, 1, '改訂前の入力を評価していない');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('検索要否が未判定のpending受付は直接でもchain経由でも再利用しない', async () => {
+    for (const viaChain of [false, true]) {
+      const chain = viaChain ? await seedReuseChain({ originStatus: 'pending' }) : undefined;
+      const pair = chain
+        ? {
+            priorSessionId: chain.current.sessionId,
+            evidenceMessageId: chain.evidenceMessageId,
+            priorRequestId: chain.originRequestId,
+            current: chain.current,
+          }
+        : await seedPair({ priorStatus: 'pending', priorOutcome: null, priorExpiresAt: null, result: null });
+      await pool.query('UPDATE search_requests SET search_action = NULL WHERE id = $1', [pair.priorRequestId]);
+      const server = await startFakeJev(reuseReply());
+      try {
+        await expectRouteAction(pair, server, 'new_search', viaChain ? 'chainの未判定終端' : '直近の未判定受付');
+        const prior = await readSearchRequest(pool, pair.priorRequestId);
+        assert.equal(prior.status, 'pending', '先行受付の処理を変更している');
+        assert.equal(prior.search_action, null, '先行受付を検索済みに書き換えている');
+      } finally {
+        await server.close();
+      }
+    }
+  });
+
   it('直近の先行検索が不適格でも、古い有効候補へ飛ばない', async () => {
     const sessionId = await seedSession(pool, workspace);
     await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '以前の修正報告' });
