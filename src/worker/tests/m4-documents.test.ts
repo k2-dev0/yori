@@ -2324,7 +2324,7 @@ describe('M4 Green追加契約', () => {
     );
   });
 
-  it('短いchunk全体をoverlapしても次chunkは別document_keyで保存できる', async () => {
+  it('短い先行chunk全体をoverlapせず、上限内なら次atomと1文書へ結合する', async () => {
     const { config } = await startApprovedVoyage(pool, workspace.companyId);
     const tokenizer = await loadVoyageTokenizer();
     const shortParagraph = exactTokenText(tokenizer, 50);
@@ -2335,16 +2335,18 @@ describe('M4 Green追加契約', () => {
       { messageId, revision: 1, text },
     ]);
 
-    assert.equal(chunks.length, 2, `短いchunk＋長いatomが2 chunkでない: ${chunks.length}`);
-    assert.equal(new Set(chunks.map((chunk) => chunk.documentKey)).size, chunks.length, 'overlap元と次chunkのdocument_keyが衝突した');
-    assert.ok(chunks[1].sources.some((source) => source.sourceKind === 'overlap'), '次chunkにoverlap sourceがない');
-    assert.ok(chunks[1].sources.some((source) => source.sourceKind === 'original'), '次chunkに固有のoriginal sourceがない');
+    assert.equal(chunks.length, 1, `短い先行chunkが次atomと結合されていない: ${chunks.length}`);
+    assert.ok(chunks[0].sources.every((source) => source.sourceKind === 'original'), '1文書内に不要なoverlap sourceがある');
+    assert.ok(
+      tokenizer.encode(chunks[0].content).ids.length + VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE <= CHUNK_MAX_TOKENS,
+      '結合後の文書がprovider prefix込み上限を超える',
+    );
 
     const sessionId = await seedSession(pool, workspace);
     const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
     const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
-    assert.equal(run.status, 'completed', `document_key衝突でbuild_documentsが完了しない: ${run.status}/${run.errorCode ?? ''}`);
-    assert.equal((await readDocuments(pool, workspace.projectId)).length, 2, '2つの検索文書として保存されていない');
+    assert.equal(run.status, 'completed', `短い先行chunkの結合後にbuild_documentsが完了しない: ${run.status}/${run.errorCode ?? ''}`);
+    assert.equal((await readDocuments(pool, workspace.projectId)).length, 1, '結合後も複数の検索文書として保存されている');
   });
 
   it('active generationがconfigとspec不一致なら自動切替せず恒久エラーにする', async () => {
