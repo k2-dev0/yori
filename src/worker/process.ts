@@ -808,8 +808,43 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
   try {
     await client.query('BEGIN');
     if (job.kind === 'execute_search' && executeSearchRequestId !== null) {
-      // payloadのrequestがjobのmessage/revisionとDB正本のscopeに一致する場合だけ再開する。
-      // 不一致ならjobもrequestも変更せずrollbackする。
+      // 1) lockなしでscopeを事前照合し、requestが固定したgeneration IDを読む。
+      const pinned = await client.query<{ embedding_generation_id: string | null; company_id: string }>(
+        `SELECT sr.embedding_generation_id, p.company_id
+           FROM search_requests sr
+           JOIN messages m ON m.id = sr.input_id
+           JOIN sessions s ON s.id = m.session_id
+           JOIN projects p ON p.id = s.project_id
+          WHERE sr.id = $1
+            AND sr.input_id = $2
+            AND sr.input_revision = $3
+            AND sr.input_sequence_no = m.sequence_no
+            AND sr.session_id = m.session_id
+            AND sr.employee_id = s.employee_id
+            AND sr.project_id = s.project_id
+            AND sr.company_id = p.company_id
+            AND sr.session_id = $4`,
+        [executeSearchRequestId, job.message_id, job.target_revision, job.session_id],
+      );
+      const pinnedRow = pinned.rows[0];
+      if (pinnedRow === undefined) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+      const pinnedGenerationId = pinnedRow.embedding_generation_id;
+      if (pinnedGenerationId !== null) {
+        // 2) generation削除とlock順序を揃えるため、requestより先にgeneration行をKEY SHAREでlockする。
+        //    既に削除済みならretryしない。
+        const generation = await client.query(
+          'SELECT 1 FROM embedding_generations WHERE id = $1 AND company_id = $2 FOR KEY SHARE',
+          [pinnedGenerationId, pinnedRow.company_id],
+        );
+        if (generation.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return false;
+        }
+      }
+      // 3) requestをlockし直し、identity・scope・固定generation IDが不変な場合だけ再開する。
       const scoped = await client.query(
         `SELECT 1
            FROM search_requests sr
@@ -825,8 +860,9 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
             AND sr.project_id = s.project_id
             AND sr.company_id = p.company_id
             AND sr.session_id = $4
+            AND sr.embedding_generation_id IS NOT DISTINCT FROM $5
           FOR SHARE OF sr`,
-        [executeSearchRequestId, job.message_id, job.target_revision, job.session_id],
+        [executeSearchRequestId, job.message_id, job.target_revision, job.session_id, pinnedGenerationId],
       );
       if (scoped.rows.length === 0) {
         await client.query('ROLLBACK');
