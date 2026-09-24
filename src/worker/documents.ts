@@ -14,6 +14,7 @@ import {
 import type { JobTarget } from './context.js';
 import { LeaseLostError, StaleApplyError } from './errors.js';
 import type { EmbeddingGeneration } from './embedding.js';
+import { extractEntityReferences } from './identifiers.js';
 import { loadVoyageTokenizer } from './tokenizer.js';
 
 // 文書生成はsessionの現行message revisionと現在policyのanalysisだけをsequence順に使う。
@@ -612,6 +613,23 @@ async function replaceSources(client: PoolClient, documentId: string, revision: 
   }
 }
 
+// 文書revisionのcontentから明示識別子だけを決定的に抽出し、当該revisionの既存entityを置換する。
+// 同じrevisionの再計画では削除→挿入をやり直すため、再実行しても増殖しない。
+async function replaceEntities(
+  client: PoolClient,
+  input: { documentId: string; revision: number; companyId: string; projectId: string; content: string },
+): Promise<void> {
+  await client.query('DELETE FROM document_entities WHERE document_id = $1 AND revision = $2', [input.documentId, input.revision]);
+  for (const reference of extractEntityReferences(input.content)) {
+    await client.query(
+      `INSERT INTO document_entities (id, document_id, revision, company_id, project_id, entity_type, entity_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (document_id, revision, entity_type, entity_key) DO NOTHING`,
+      [uuidv7(), input.documentId, input.revision, input.companyId, input.projectId, reference.entityType, reference.entityKey],
+    );
+  }
+}
+
 const SESSION_BUILD_LOCK_NAMESPACE = 20260926;
 
 // chunk計画をDBへ反映し、埋め込み待ちのrevisionを返す。外部HTTPの前にTXを完了する。
@@ -681,6 +699,13 @@ export async function applyDocumentPlan(
           [documentId, chunk.content, chunk.contentHash, chunk.chunkerVersion],
         );
         await replaceSources(client, documentId, 1, chunk.sources);
+        await replaceEntities(client, {
+          documentId,
+          revision: 1,
+          companyId: input.companyId,
+          projectId: input.projectId,
+          content: chunk.content,
+        });
         continue;
       }
 
@@ -721,6 +746,13 @@ export async function applyDocumentPlan(
           [document.id, nextRevision, chunk.content, chunk.contentHash, chunk.chunkerVersion],
         );
         await replaceSources(client, document.id, nextRevision, chunk.sources);
+        await replaceEntities(client, {
+          documentId: document.id,
+          revision: nextRevision,
+          companyId: input.companyId,
+          projectId: input.projectId,
+          content: chunk.content,
+        });
         await client.query('UPDATE search_documents SET desired_revision = $2, is_searchable = true, updated_at = now() WHERE id = $1', [
           document.id,
           nextRevision,
@@ -739,6 +771,13 @@ export async function applyDocumentPlan(
           [document.id, latest.revision, chunk.content, chunk.contentHash, chunk.chunkerVersion],
         );
         await replaceSources(client, document.id, latest.revision, chunk.sources);
+        await replaceEntities(client, {
+          documentId: document.id,
+          revision: latest.revision,
+          companyId: input.companyId,
+          projectId: input.projectId,
+          content: chunk.content,
+        });
         await client.query('UPDATE search_documents SET desired_revision = $2, is_searchable = true, updated_at = now() WHERE id = $1', [
           document.id,
           latest.revision,
@@ -754,6 +793,13 @@ export async function applyDocumentPlan(
         [document.id, nextRevision, chunk.content, chunk.contentHash, chunk.chunkerVersion],
       );
       await replaceSources(client, document.id, nextRevision, chunk.sources);
+      await replaceEntities(client, {
+        documentId: document.id,
+        revision: nextRevision,
+        companyId: input.companyId,
+        projectId: input.projectId,
+        content: chunk.content,
+      });
       await client.query('UPDATE search_documents SET desired_revision = $2, is_searchable = true, updated_at = now() WHERE id = $1', [
         document.id,
         nextRevision,
