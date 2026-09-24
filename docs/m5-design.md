@@ -7,7 +7,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 - `0005_m5.sql`は`document_entities`を追加する。文書ID・revision、会社・案件、種別、文字大小を保持したkeyを持ち、文書revisionへの複合FK、`(document_id, revision, entity_type, entity_key)`の一意制約、`(company_id, project_id, entity_type, entity_key)`の検索indexを持つ。
 - `build_documents`の文書計画適用TXで、文書revisionの本文から明示識別子を決定的に抽出し、当該revisionの行を置換する。再実行で増殖させない。
-- 初期の識別子は拡張子付きファイルpath/ファイル名、`name()`形式の関数、`Issue #123`、`PR #123`。文字大小を変えず、推定・部分一致・日本語全文検索は行わない。
+- 初期の識別子は拡張子付きファイルpath/ファイル名（`./`、`../`、絶対pathを含む）、`name()`形式の関数、`Issue #123`、`PR #123`。文字大小と先頭表記を変えず、推定・部分一致・日本語全文検索は行わない。
 
 ## 検索開始と世代
 
@@ -27,14 +27,15 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## Jev候補判定
 
-- TypeSafeの`POST /v1/systemone`へstructured objectのstateを送り、候補ごとの4段階relevance（unrelated/peripheral/useful/direct）と、similar symptom・reusable procedureを独立したChoice質問で判定する。
+- TypeSafeの`POST /v1/systemone`へstructured objectのstateを送り、候補ごとの4段階relevance（unrelated/peripheral/useful/direct）とは別に、対象一致、症状または修正依頼の類似、環境・制約の近さ、実装理由の根拠、手順の再利用性、proposal/reported_completed/reported_verified/unknownを独立したChoice質問で判定する。
 - `useful`または`direct`だけを採用し、relevance段階、RRF、文書IDの順で代表候補を1件選ぶ。confidenceを正答率へ変換しない。
+- 検証済みChoice回答だけを、全候補について`candidate_evaluations`へ保存する。document ID・revision、総合relevance、positiveな理由コード、statement status、各質問のchoice・全probabilities・confidence、代表採用の有無を残す。原文や外部error bodyはこの診断fieldへ複製しない。
 - HTTP送信直前にJevの会社・account・endpoint・学習利用条件の承認を確認する。試行ごとにusageを保存し、原文・credential・外部error bodyは運用ログへ出さない。
 - TypeSafe公式APIはstateにstring/object/arrayを受け付け、構造化fieldをinstructionsから参照できる。実Jevへの社内データ送信は未実施で、テストはloopback fixtureのみ。
 
 ## 保存と競合
 
-- 外部待ち後の保存TXでjob lease/token/期限、payloadの受付、input current revision、会社・案件、publication、文書検索可否、全sourceのcurrent revisionを再検証する。
+- 外部待ち後の保存TXでjob lease/token/期限、payloadの受付、input current revision、会社・案件、publication、文書検索可否、全sourceのcurrent revisionを再検証する。sourceの`messages`行は確認時からcommitまで共有lockし、改訂との確定順序をDBで固定する。
 - 有効な代表候補だけ、原文message ID・revision・社員・role・日時・本文をevidenceへ保存する。assistant/agent_report由来は`agent_reported`とし、ツール実証済みとは表現しない。
 - 候補sourceのrevision変更やpublication削除は候補を無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerがjob・受付を更新しない。
 - input自身が改訂された古い検索は、外部送信前または保存TXで当該受付だけを`expired/input_revision_stale`へし、jobをcompletedにする。新revisionの結果として流用しない。
@@ -48,4 +49,4 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## 検証
 
-`src/worker/tests/m5-search.test.ts`が実PostgreSQLとloopback Jev/Voyageで、識別子索引、社員横断検索、案件境界、自己根拠除外、RRF、候補上限・token予算、no_match、承認・provider障害、世代固定、実行状態、payload単位の障害更新、stale input、publication/revision/lease競合、冪等再実行、runnerを検証する。実Jev・実Voyage・実会話は使用しない。
+`src/worker/tests/m5-search.test.ts`が実PostgreSQLとloopback Jev/Voyageで、識別子索引、leading path、社員横断検索、案件境界、自己根拠除外、RRF、候補上限・token予算、6項目の独立判定と生回答保存、no_match、承認・provider障害、世代固定、実行状態、payload単位の障害更新、stale input、原文改訂の両競合順序、publication/revision/lease競合、冪等再実行、runnerを検証する。実Jev・実Voyage・実会話は使用しない。
