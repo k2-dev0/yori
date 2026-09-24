@@ -11,7 +11,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## 検索開始と世代
 
-- `execute_search`はjob payloadの`search_request_id`とjob対象message/revision、job session、会社・案件・社員・session、`new_search`をDB正本で照合する。他の受付を入力IDから推測せず、障害更新とretryも同じscope一致を必須にする。不一致payloadやmessage所属と異なるjob sessionでは外部送信・受付更新を行わない。
+- `execute_search`はjob payloadのUUID形式`search_request_id`とjob対象message/revision、必須のjob session、会社・案件・社員・session、`new_search`をDB正本で照合する。他の受付を入力IDから推測せず、障害更新とretryも同じscope一致を必須にする。不正UUID、不一致payload、NULLまたはmessage所属と異なるjob sessionでは外部送信・受付更新を行わない。
 - 完了済みresultの再実行はresultを変更せず、同じjobだけをlease条件付きで完了する。
 - 外部送信前にjob leaseとscopeを再確認し、対象受付だけを`running`にする。失敗・retry・明示再開もpayloadの受付1件だけを更新する。
 - 開始時にprojectの`active_generation_id`を固定する。NULLなら外部送信せず`completed/no_match`。会社、status、provider/model、次元、metric、tokenizer、document/query前処理が現在configと一致しなければ`embedding_generation_mismatch`でfailedにし、自動切替しない。
@@ -35,7 +35,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## 保存と競合
 
-- 外部待ち後の保存TXでjob lease/token/期限、payloadの受付、input current revision、会社・案件、publication、文書検索可否、全sourceのcurrent revisionを再検証する。sourceの`messages`行は確認時からcommitまで共有lockし、改訂との確定順序をDBで固定する。
+- 外部待ち後の保存TXでjob lease/token/期限に加えてjob message/session/payload、受付のinput identity・会社・案件・社員・session・search action、input current revision、publication、文書検索可否、全sourceのcurrent revisionをDB現在値から再検証する。sourceの`messages`行は確認時からcommitまで共有lockし、改訂との確定順序をDBで固定する。
 - 有効な代表候補だけ、原文message ID・revision・社員・role・日時・本文をevidenceへ保存する。assistant/agent_report由来は`agent_reported`とし、ツール実証済みとは表現しない。
 - 候補sourceのrevision変更やpublication削除は候補を無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerがjob・受付を更新しない。
 - input自身が改訂された古い検索は、外部送信前または保存TXで当該受付だけを`expired/input_revision_stale`へし、jobをcompletedにする。新revisionの結果として流用しない。
