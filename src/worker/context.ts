@@ -167,25 +167,14 @@ export async function loadPriorMessages(pool: Pool, target: JobTarget): Promise<
   }));
 }
 
-// 直近の先行検索を1件だけ読み、古い有効候補へ飛ばないようにする。policy/状態の適格性はreuse側で判定する。
-export async function loadPriorSearch(pool: Pool, target: JobTarget): Promise<PriorSearch | undefined> {
-  const result = await pool.query<PriorSearchRow>(
-    `SELECT sr.id, sr.input_id, sr.input_revision, sr.input_sequence_no, sr.status, sr.outcome, sr.search_action,
+const PRIOR_SEARCH_SELECT = `SELECT sr.id, sr.input_id, sr.input_revision, sr.input_sequence_no, sr.status, sr.outcome, sr.search_action,
             sr.policy_version, sr.reused_from_request_id, sr.original_request_id, sr.expires_at, sr.result,
             r.text AS input_text, m.current_revision AS input_current_revision
        FROM search_requests sr
        LEFT JOIN messages m ON m.id = sr.input_id
-       LEFT JOIN message_revisions r ON r.message_id = sr.input_id AND r.revision = sr.input_revision
-      WHERE sr.company_id = $1 AND sr.project_id = $2 AND sr.employee_id = $3 AND sr.session_id = $4
-        AND sr.input_sequence_no < $5
-      ORDER BY sr.input_sequence_no DESC, sr.created_at DESC, sr.id DESC
-      LIMIT 1`,
-    [target.companyId, target.projectId, target.employeeId, target.sessionId, target.sequenceNo],
-  );
-  const row = result.rows[0];
-  if (!row) {
-    return undefined;
-  }
+       LEFT JOIN message_revisions r ON r.message_id = sr.input_id AND r.revision = sr.input_revision`;
+
+function toPriorSearch(row: PriorSearchRow): PriorSearch {
   return {
     requestId: row.id,
     inputId: row.input_id,
@@ -202,6 +191,34 @@ export async function loadPriorSearch(pool: Pool, target: JobTarget): Promise<Pr
     inputText: row.input_text,
     inputCurrentRevision: row.input_current_revision,
   };
+}
+
+// 直近の先行検索を1件だけ読み、古い有効候補へ飛ばないようにする。policy/状態の適格性はreuse側で判定する。
+export async function loadPriorSearch(pool: Pool, target: JobTarget): Promise<PriorSearch | undefined> {
+  const result = await pool.query<PriorSearchRow>(
+    `${PRIOR_SEARCH_SELECT}
+      WHERE sr.company_id = $1 AND sr.project_id = $2 AND sr.employee_id = $3 AND sr.session_id = $4
+        AND sr.input_sequence_no < $5
+      ORDER BY sr.input_sequence_no DESC, sr.created_at DESC, sr.id DESC
+      LIMIT 1`,
+    [target.companyId, target.projectId, target.employeeId, target.sessionId, target.sequenceNo],
+  );
+  const row = result.rows[0];
+  return row === undefined ? undefined : toPriorSearch(row);
+}
+
+// reuse chainの参照先をscope内・対象sequenceより前の受付に限定してidで読む。
+// 原文revisionの存在/current一致・status適格性・期限・根拠はreuse側で判定する。
+export async function loadPriorSearchById(pool: Pool, target: JobTarget, requestId: string): Promise<PriorSearch | undefined> {
+  const result = await pool.query<PriorSearchRow>(
+    `${PRIOR_SEARCH_SELECT}
+      WHERE sr.id = $1 AND sr.company_id = $2 AND sr.project_id = $3 AND sr.employee_id = $4 AND sr.session_id = $5
+        AND sr.input_sequence_no < $6
+      LIMIT 1`,
+    [requestId, target.companyId, target.projectId, target.employeeId, target.sessionId, target.sequenceNo],
+  );
+  const row = result.rows[0];
+  return row === undefined ? undefined : toPriorSearch(row);
 }
 
 function sha256Json(value: unknown): Buffer {
