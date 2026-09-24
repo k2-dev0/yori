@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { validate as isUuid, v7 as uuidv7 } from 'uuid';
 import { buildApp } from '../app.js';
-import { MAX_TEXT_LENGTH, type EventInput, type EventsResponse } from '../contract.js';
+import { AUTO_SEARCH_POLICY_VERSION, MAX_TEXT_LENGTH, type EventInput, type EventsResponse } from '../contract.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
@@ -431,6 +431,174 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
     assert.ok(!body.matches || body.matches.length === 0, '別案件の根拠をmatchesへ含めている');
   });
 });
+
+  it('reuse元matchedでも現在入力revisionが変わったらexpired input_revision_staleにし、no_matchへ変換しない', async () => {
+    const origin = await ingestUserInput('revision失効するreuse元入力');
+    const evidence = await ingestEvent('assistant', 'revision失効の根拠原文');
+    await updateSearchRequest(pool, origin.requestId, {
+      status: 'completed',
+      outcome: 'matched',
+      searchAction: 'new_search',
+      stage: 'completed',
+      result: buildMatchedResult({
+        requestId: origin.requestId,
+        inputId: origin.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: evidence.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:04:00.000Z',
+            text: 'revision失効の根拠原文',
+          },
+        ],
+      }),
+    });
+
+    const current = await ingestUserInput('revision失効する現在入力');
+    await updateSearchRequest(pool, current.requestId, {
+      status: 'pending',
+      outcome: null,
+      searchAction: 'reuse',
+      stage: 'awaiting_reused_search',
+      reusedFromRequestId: origin.requestId,
+      originalRequestId: origin.requestId,
+    });
+    await advanceMessageRevision(pool, current.messageId, '改訂後の現在入力');
+
+    const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
+    assert.equal(response.statusCode, 200, `revision失効のreuse取得に失敗: ${response.body}`);
+    const body = response.json<SearchResponseBody>();
+    assert.equal(body.status, 'expired', '現在入力revision不一致をexpiredとして返していない');
+    assert.equal(body.outcome ?? null, null, 'expiredでoutcomeを返している');
+    assert.equal(body.error_code, 'input_revision_stale', 'expiredの機械可読理由を返していない');
+    assert.ok(!body.matches || body.matches.length === 0, '失効したmatchesを返している');
+    assert.equal(body.reused_from_request_id, origin.requestId, 'reuse元の追跡を失っている');
+
+    const currentRow = await readSearchRequestFull(pool, current.requestId);
+    assert.equal(currentRow.result, null, '元resultを現在受付へ複製している');
+  });
+
+  it('reuse元matchedは現在policyの分析がprogress_onlyまたは非searchableへ再分類されたらmatchedで返さない', async () => {
+    const origin = await ingestUserInput('再分類される根拠の元入力');
+    const evidence = await ingestEvent('assistant', '再分類の根拠原文');
+    await updateSearchRequest(pool, origin.requestId, {
+      status: 'completed',
+      outcome: 'matched',
+      searchAction: 'new_search',
+      stage: 'completed',
+      result: buildMatchedResult({
+        requestId: origin.requestId,
+        inputId: origin.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: evidence.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:05:00.000Z',
+            text: '再分類の根拠原文',
+          },
+        ],
+      }),
+    });
+
+    const current = await ingestUserInput('再分類の現在入力');
+    await updateSearchRequest(pool, current.requestId, {
+      status: 'pending',
+      outcome: null,
+      searchAction: 'reuse',
+      stage: 'awaiting_reused_search',
+      reusedFromRequestId: origin.requestId,
+      originalRequestId: origin.requestId,
+    });
+
+    const control = await getSearchById(app, { token: workspace.token, id: current.requestId });
+    assert.equal(control.statusCode, 200, `再分類前のreuse取得に失敗: ${control.body}`);
+    assert.equal(control.json<SearchResponseBody>().outcome, 'matched', '分類未保存の根拠をmatchedで返していない');
+
+    const cases = [
+      { label: 'progress_only', retention: 'progress_only', isSearchable: true },
+      { label: 'is_searchable=false', retention: 'substantive', isSearchable: false },
+    ];
+    for (const item of cases) {
+      await pool.query(
+        `INSERT INTO message_analysis
+           (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
+            continuity, statement_status, is_searchable, model_version, state_hash, parts)
+         VALUES ($1, $2, 1, $3, $4, 'implementation', '[]'::jsonb, 'new_search', 'same_topic', 'unknown', $5, 'test-model', $6, '[]'::jsonb)
+         ON CONFLICT (message_id, revision, policy_version) DO UPDATE
+           SET retention = EXCLUDED.retention, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
+        [uuidv7(), evidence.messageId, AUTO_SEARCH_POLICY_VERSION, item.retention, item.isSearchable, Buffer.alloc(32)],
+      );
+      const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
+      assert.equal(response.statusCode, 200, `${item.label}: ${response.body}`);
+      const body = response.json<SearchResponseBody>();
+      assert.notEqual(body.outcome, 'matched', `${item.label}へ再分類された根拠をmatchedとして返している`);
+      assert.ok(!body.matches || body.matches.length === 0, `${item.label}のmatchesを返している`);
+    }
+  });
+
+  it('reuse元matchedは明示revoke/changeで無効化された根拠をmatchedで返さない', async () => {
+    const origin = await ingestUserInput('撤回変更される根拠の元入力');
+    const evidence = await ingestEvent('assistant', '撤回変更の根拠原文');
+    await updateSearchRequest(pool, origin.requestId, {
+      status: 'completed',
+      outcome: 'matched',
+      searchAction: 'new_search',
+      stage: 'completed',
+      result: buildMatchedResult({
+        requestId: origin.requestId,
+        inputId: origin.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: evidence.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:06:00.000Z',
+            text: '撤回変更の根拠原文',
+          },
+        ],
+      }),
+    });
+
+    const current = await ingestUserInput('撤回変更の現在入力');
+    await updateSearchRequest(pool, current.requestId, {
+      status: 'pending',
+      outcome: null,
+      searchAction: 'reuse',
+      stage: 'awaiting_reused_search',
+      reusedFromRequestId: origin.requestId,
+      originalRequestId: origin.requestId,
+    });
+
+    const control = await getSearchById(app, { token: workspace.token, id: current.requestId });
+    assert.equal(control.statusCode, 200, `無効化前のreuse取得に失敗: ${control.body}`);
+    assert.equal(control.json<SearchResponseBody>().outcome, 'matched', '無効化前の根拠をmatchedで返していない');
+
+    for (const relation of ['change', 'revoke']) {
+      await pool.query(
+        `INSERT INTO message_relations
+           (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, evidence_ranges, policy_version)
+         VALUES ($1, $2, 1, $3, 1, $4, true, '[]'::jsonb, $5)`,
+        [uuidv7(), origin.messageId, evidence.messageId, relation, AUTO_SEARCH_POLICY_VERSION],
+      );
+      const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
+      assert.equal(response.statusCode, 200, `${relation}: ${response.body}`);
+      const body = response.json<SearchResponseBody>();
+      assert.notEqual(body.outcome, 'matched', `${relation}で無効化された根拠をmatchedとして返している`);
+      assert.ok(!body.matches || body.matches.length === 0, `${relation}で無効化されたmatchesを返している`);
+      await pool.query('DELETE FROM message_relations WHERE target_message_id = $1 AND target_revision = 1', [evidence.messageId]);
+    }
+  });
 
 describe('M6 GET /v1/searches/by-input 入力照合', () => {
   it('内部input_id・revisionと外部source/session/message IDで同じ自動受付を返す', async () => {
@@ -906,6 +1074,35 @@ describe('M6 POST /v1/searches 受付', () => {
     assert.equal(await countManualSearchRequests(pool), 1, 'conflictでmanual受付を増やしている');
     assert.equal(await countJobs(pool, 'execute_search'), 1, 'conflictでexecute_search jobを増やしている');
     assert.equal(await countRows(pool, 'search_requests'), 2, '自動受付以外が増減している');
+  });
+
+  it('manual冪等キーの既存照合はauto再利用より先で、同keyの同原文force_refresh=falseも409にする', async () => {
+    const input = await ingestUserInput('冪等優先の入力原文');
+    const idempotencyKey = `idem-${randomUUID()}`;
+    const first = await postSearch(app, {
+      token: workspace.token,
+      body: buildSearchBody({ messageId: input.messageId, query: 'キー付きの別質問', idempotencyKey, forceRefresh: true }),
+    });
+    assertAccepted(first, '初回のkey付きmanual受付に失敗');
+    const manualId = first.json<{ request_id: string }>().request_id;
+
+    const sameContent = await postSearch(app, {
+      token: workspace.token,
+      body: buildSearchBody({ messageId: input.messageId, query: 'キー付きの別質問', idempotencyKey, forceRefresh: true }),
+    });
+    assertAccepted(sameContent, '同key同内容の再送に失敗');
+    assert.equal(sameContent.json<{ request_id: string }>().request_id, manualId, '同key同内容で別manualを返している');
+
+    const autoLikeBypass = await postSearch(app, {
+      token: workspace.token,
+      body: buildSearchBody({ messageId: input.messageId, query: '冪等優先の入力原文', idempotencyKey }),
+    });
+    assert.equal(autoLikeBypass.statusCode, 409, `同keyの同原文force_refresh=falseをauto再利用で迂回した: ${autoLikeBypass.body}`);
+    assert.equal(errorCode(autoLikeBypass), 'conflict', 'auto再利用時の固定codeがconflictでない');
+    assert.notEqual(autoLikeBypass.json<{ request_id?: string }>().request_id, input.requestId, 'auto受付IDを返している');
+
+    assert.equal(await countManualSearchRequests(pool), 1, 'conflictでmanual受付を増やしている');
+    assert.equal(await countJobs(pool, 'execute_search'), 1, 'conflictでexecute_search jobを増やしている');
   });
 
   it('冪等キーは社員ごとに独立で、他社員・他会社の同じキーと衝突しない', async () => {
