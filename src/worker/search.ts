@@ -882,23 +882,39 @@ async function saveSearchResult(
     if (request.rows.length === 0) {
       throw new StaleApplyError('search_requestのidentityまたはscopeが変化しました');
     }
-    const inputMessage = await client.query<{ current_revision: number; session_project_id: string; project_company_id: string }>(
-      `SELECT m.current_revision, s.project_id AS session_project_id, p.company_id AS project_company_id
+    // input messageのscope正本（message/session/project）を共有lockし、commitまで所属変更を待たせる。
+    const inputMessage = await client.query<{
+      current_revision: number;
+      session_id: string;
+      sequence_no: number;
+      employee_id: string;
+      project_id: string;
+      company_id: string;
+    }>(
+      `SELECT m.current_revision, m.session_id, m.sequence_no, s.employee_id, s.project_id, p.company_id
          FROM messages m
          JOIN sessions s ON s.id = m.session_id
          JOIN projects p ON p.id = s.project_id
         WHERE m.id = $1
-        FOR UPDATE OF m`,
+        FOR SHARE OF m, s, p`,
       [input.request.input_id],
     );
     const inputRow = inputMessage.rows[0];
+    if (inputRow === undefined) {
+      throw new StaleApplyError('input messageがありません');
+    }
     if (
-      inputRow === undefined ||
-      inputRow.current_revision !== input.request.input_revision ||
-      inputRow.session_project_id !== input.target.projectId ||
-      inputRow.project_company_id !== input.target.companyId
+      inputRow.session_id !== input.target.sessionId ||
+      inputRow.sequence_no !== input.target.sequenceNo ||
+      inputRow.employee_id !== input.target.employeeId ||
+      inputRow.project_id !== input.target.projectId ||
+      inputRow.company_id !== input.target.companyId
     ) {
-      // 候補判定後・保存時に入力が改訂されたら、old inputの結果を保存せずexpiredで終端する。
+      // 入力の所属session/employee/projectが変化した場合は結果を保存せず、jobも完了しない。
+      throw new StaleApplyError('input messageのscopeが変化しました');
+    }
+    if (inputRow.current_revision !== input.request.input_revision) {
+      // 候補判定後・保存時に入力本文が改訂されたら、old inputの結果を保存せずexpiredで終端する。
       await expireStaleSearch(client, input.job, input.target, input.request);
       await client.query('COMMIT');
       return;
