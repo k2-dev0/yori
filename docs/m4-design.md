@@ -24,7 +24,7 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 - sessionの現行message revisionと`WORKER_POLICY_VERSION`の現行analysisだけをsequence順に使う。is_searchable=false/progress_onlyは除外する。現行policyで有効なrevoke/change relationのtarget message revision（relationのsourceとtargetがともに現行revisionで、同一案件・会社内のmessage間に限る）も索引対象から除外する。原文・relationは常に保持する。
 - tokenizerはVoyage公式docsが案内する`voyageai/voyage-4-lite`の公開tokenizerを固定revisionのローカル資産（`assets/voyage-4-lite/`）として使う。実行時に会話本文を配信元へ送らない。`tokenizer_version`へasset revisionと実行library版（`voyageai/voyage-4-lite@0335ddf7698395712e3220733b4079006951cfef+@huggingface/tokenizers@0.2.0`）を記録する。依存はexact 0.2.0に固定する。
 - 目標800・上限1200・重複100トークンにprovider document prefixの予約32トークンを含める。message→paragraph→code block境界を優先し、上限を超える単一blockだけをrange付きで分割する。UTF-16サロゲートペアは割らない。
-- 単一block分割時のatom上限は、次chunkが重複window（100トークン）と区切り1トークンを保持しても上限内に収まる値にする。改行のない長文でも隣接chunkのoverlapを破棄せず、chunk全体を複製しない。
+- 単一block分割時のatom上限は、次chunkが重複window（100トークン）と区切り1トークンを保持しても上限内に収まる値にする。改行のない長文でも隣接chunkのoverlapを破棄しない。確定前のchunk全体がoverlap予算以下で、次atomとの合計が上限内なら、目標値を超えても同じchunkへ結合して短いchunk全体の複製を避ける。
 - `document_key`はsession ID+chunk固有の先頭original sourceのmessage ID+そのrevision内start+chunker_versionの決定的hash。前chunkから複製したoverlap sourceはidentityへ使わない。anchor messageのrevision番号は含めず、同じ位置の原文編集は同じdocumentの新revisionにする。確定済みchunkは維持し、変化した末尾・編集影響chunkだけ新revisionにする。未公開の最新revisionは同じ番号のまま作り直す。
 - 消えた/除外された文書はis_searchable=false、publication削除、最新revision excludedへ揃える（原文rangeは保持）。再び検索対象になった文書は新revisionで再公開する。
 - 新revisionがpending/embeddingの間で、旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭にそのまま残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）にする。source消失・message revision変更・range変更を含む制限的変更では、外部HTTP前の文書構築TXでdocument_publications行を削除して即時検索不能にする。search_documents.is_searchableは新desired revisionの埋め込み用にtrueを維持し、成功時にapplyDocumentEmbeddingsがpublicationを作り直す。
@@ -37,7 +37,7 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 
 - production interfaceは`embedDocuments(texts, generation)` / `embedQuery(text, generation)`。テスト専用のclient injectionは作らず、loopback endpointをconfigで使う。
 - 送信は`voyage-4-lite`、input_type=document/query、output_dimension=1024、output_dtype=float、truncation=false。応答のdata indexは重複なし・0..n-1全件を要求し、入力順へ並べ直す。件数/model/1024次元/finite/非ゼロ/usageを検証し、不正は`provider_contract_invalid`とする。
-- 408/429/5xx/timeoutだけretryable。headers受信後のbody read timeout/Abortもprovider_timeoutとしてretryableにする。Retry-Afterはdelta-secondsとHTTP-dateを解釈して0..1hへclampする。他の4xxは`provider_rejected`の恒久失敗。試行ごとにusage_eventsを記録し、原文・key・外部error bodyは保存しない。duration_msはbody受信・parse完了まで含める。
+- 408/429/5xx/timeoutに加え、DNS・接続・TLS・本文受信切断等のHTTP statusを得られないtransport failureは`provider_unavailable`としてretryableにする。headers受信後のbody read timeout/Abortもprovider_timeoutとしてretryableにする。Retry-Afterはdelta-secondsとHTTP-dateを解釈して0..1hへclampする。他の4xxは`provider_rejected`の恒久失敗。試行ごとにusage_eventsを記録し、原文・key・外部error bodyは保存しない。duration_msはbody受信・parse完了まで含める。
 - 各HTTP送信の直前にcompany/provider/account/endpoint/active/learning_disabled/`terms_checked_at IS NOT NULL AND <= now()`/`confirmed_at <= now()`で承認を再確認する。NULLの規約確認日は未確認として扱い、外部送信0件・blocked_policyにする。cache hitでも未確認policyの結果を公開に使わない。
 - cacheは`company_id+generation_id+operation+完全なinput hash`。vector結果だけを再利用し、document/sourceのidentityは統合しない。
 - 応答適用TXでmessage current revision、desired_revision、active generation、input hash、job lease token/期限を全再検証する。一致時だけdocument_embeddings保存・publication更新・revision ready・job完了を同一TXで行う。不一致・所有喪失時は公開しない。
