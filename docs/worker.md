@@ -1,10 +1,10 @@
-# worker（Jev分類・検索振り分け）
+# worker（分類・文書構築・検索）
 
-`src/worker/`はM3の`classify_message`/`route_search`（Jev）とM4の`build_documents`（Voyage埋め込み）を処理する。外向きのHTTP先は承認済みJev/Voyage endpointだけで、実会話をテストへ使わない。M5の`execute_search`はpendingで登録するところまでで、まだclaimしない。
+`src/worker/`はM3の`classify_message`/`route_search`（Jev）、M4の`build_documents`（Voyage埋め込み）、M5の`execute_search`（案件内検索・Jev候補判定）を処理する。外向きのHTTP先は承認済みJev/Voyage endpointだけで、実会話をテストへ使わない。
 
 ## 前提
 
-- `0004_m4.sql`適用済みのPostgreSQL（M3の`0002_m3.sql`/`0003_m3_response_model.sql`を含む）。workerはmigrationを実行しない。
+- `0005_m5.sql`適用済みのPostgreSQL（M3/M4 migrationを含む）。workerはmigrationを実行しない。
 - `JEV_API_KEY`/`JEV_ACCOUNT_REF`と`VOYAGE_API_KEY`/`VOYAGE_ACCOUNT_REF`。未設定・不正なら偽の判定・送信へ進まず`invalid_worker_config`で起動に失敗する。
 - `JEV_API_URL`はHTTPS（開発用loopback HTTPのみ）で、pathは`/v1/systemone`固定。`VOYAGE_API_URL`は`/v1/embeddings`固定。userinfo・query・fragmentは拒否する。3xxは追従せず、承認外endpointへ資格情報や本文を送らない。
 - 実データを送る前に、管理者がTypeSafe/Voyage側のアカウント設定を確認する。この承認記録は設定を変更・証明しない。
@@ -79,8 +79,8 @@ npm run provider:revoke -- <approval-id>
 
 | command | 動作 |
 |---|---|
-| `npm run worker:start` | route lane 1 + classify/buildの外部処理lane 1（計2並列）でjobを処理する |
-| `npm run worker:retry -- <jobId>` | `failed`/`blocked_policy`のjobを、現在の承認を確認してpendingへ戻す。routeは検索受付も同一TXで戻す |
+| `npm run worker:start` | route lane 1 + classify/build/execute_searchの外部処理lane 1（計2並列）でjobを処理する |
+| `npm run worker:retry -- <jobId>` | `failed`/`blocked_policy`のjobを、現在の承認を確認してpendingへ戻す。route/execute_searchは対象の検索受付も同一TXで戻す |
 | `npm run provider:approve -- <approval.json>` | 承認を登録し、同じendpointの旧承認を失効させる |
 | `npm run provider:revoke -- <approval-id>` | 承認を失効させる |
 
@@ -88,7 +88,7 @@ npm run provider:revoke -- <approval-id>
 
 ## 処理内容
 
-workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、各laneは同時に1jobだけclaimする。`execute_search`はM5までclaimしない。
+workerはroute laneとclassify/build/execute_search laneを各1、合計2並列で走らせ、各laneは同時に1jobだけclaimする。
 
 ### classify_message
 
@@ -123,6 +123,15 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 - 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にstale=falseへ戻し、以前のready revisionはsupersededにする。
 - `embedding_cache`（company+generation+operation+input hash）はvector結果だけを再利用し、document/sourceのidentityを統合しない。cache hitでも承認を再確認し、未承認はblocked_policyにする。
 
+### execute_search
+
+- payloadの`search_request_id`、job対象message/revision、会社・案件・社員・session、`new_search`を照合し、対象受付だけを`running`へする。詳細は[m5-design.md](m5-design.md)。
+- 開始時のactive generationを固定し、Voyageへ`input_type=query`で質問を埋め込む。世代なしは外部送信なしの`no_match`、spec不一致は`embedding_generation_mismatch`。
+- 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
+- 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけで予算超過なら`input_budget_exceeded`。
+- Jevのuseful/direct候補から代表1件を選び、原文revision・社員・role・日時・本文をresultへ保存する。保存直前にlease、入力revision、publication、source revision、scopeを再検証する。
+- input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
+
 ### 評価キャッシュ
 
 同一会社・provider/account/endpoint・要求model・閾値・policy版・質問版・state hashが一致する完了済み評価だけを`jev_evaluations`から再利用する。実応答model（`response_model`）がNULLの旧行は応答model不明として再利用せず、再評価して同keyの行を実応答model付きで更新する。cache利用でも承認を再確認する。同時missでの二重外部評価は許容する。
@@ -135,15 +144,11 @@ workerはroute laneとclassify/build laneを各1、合計2並列で走らせ、�
 
 - 429/529/5xx/timeout/通信障害: jobはpendingへ戻し、Retry-Afterと指数バックオフ+jitterで再試行する。検索受付はfailedとcodeを持ち、自動再試行のclaim時にpendingへ戻す。
 - 401/422/応答契約不正: `failed`で保持する。自動では再送しない。
-- 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev）。
+- 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev、execute_searchは両方）。
 - Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）と、HTTP statusを得られないDNS・接続・TLS・本文受信切断等のtransport failure: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
 - 外部待ち中に原文revision・desired_revision・generation・leaseが変化した応答は保存・公開せず、lease期限後の回収へ委ねる。
 - 停止・回収後に再開した旧workerのapplyDocumentPlanは、jobのlease所有・期限・target_revisionとsession fingerprintを書込前に再確認し、不一致なら何も変更せず拒否する（lease期限後の回収へ委ねる）。回収後の別workerが公開した文書状態を上書きしない。
-- 検索受付の`failed`は`no_match`ではない。M5の検索完了を偽らない。
-
-## M5待ちの見分け
-
-`execute_search`がpendingのまま残っているのはM5未実装のためで、検索のno_matchではない。`build_documents`の失敗・blocked_policyは分類失敗や検索結果なしとは区別し、原文は`message_revisions`に保持する。`message_analysis`と`message_relations`は再実行で増殖しない。
+- 検索受付の`failed`は`no_match`ではない。`execute_search`の`running`は処理中、`expired/input_revision_stale`は入力改訂による旧受付の終端である。
 
 ## 既知の保留事項
 
