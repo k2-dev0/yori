@@ -18,15 +18,25 @@ import {
 } from '../../db/tests/fixtures.js';
 import { BUILD_DOCUMENTS_PRIORITY, claimJobs, enqueueJob, type ClaimedJob } from '../../jobs/queue.js';
 import { loadWorkerConfig, type WorkerConfig } from '../config.js';
-import { WORKER_POLICY_VERSION } from '../contract.js';
-import { processJob } from '../process.js';
+import {
+  CHUNK_MAX_TOKENS,
+  CHUNK_TARGET_TOKENS,
+  JEV_PROVIDER,
+  VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE,
+  VOYAGE_TOKENIZER_VERSION,
+  WORKER_POLICY_VERSION,
+} from '../contract.js';
+import { applyDocumentPlan, loadSessionMessages, planDocumentChunks } from '../documents.js';
+import { ensureActiveGeneration, VoyageEmbeddingProvider } from '../embedding.js';
+import { processJob, retryJob } from '../process.js';
+import { loadVoyageTokenizer } from '../tokenizer.js';
 import { runWorker } from '../runner.js';
 import { advanceRevision, countJobsByKind, minutesFromNow, readJob, seedMessage, seedSession, sleep } from './support.js';
 
 // M4の結合test。production codeを変更せず、既存のprocessJob / runWorker / PostgreSQLだけを通して
 // 未実装のbuild_documents・Voyage送信・M4 schemaを検出する。
 //
-// ここで前提にするM4契約（予定schema）:
+// ここで前提にするM4契約（0004_m4.sqlで確定）:
 // - embedding_generations(id, provider, model, dimensions, status, tokenizer/前処理版, metric)
 // - search_documents(id, company_id, project_id, session_id, document_key, desired_revision, is_searchable)
 // - search_document_revisions(document_id, revision, 検索本文, content_hash, chunker_version, status)
@@ -35,8 +45,8 @@ import { advanceRevision, countJobsByKind, minutesFromNow, readJob, seedMessage,
 // - document_publications(document_id, generation_id, revision, stale)
 // - embedding_cache(company_id, generation_id, operation, input_hash)
 // - revision status: pending / embedding / ready / failed / superseded / excluded
-// - Voyage接続設定はJEVと同じ方式でenv（VOYAGE_API_KEY / VOYAGE_ACCOUNT_REF / VOYAGE_API_URL）から読む。
-//   実APIへは送らず、loopback HTTP fixtureだけを使う。
+// - Voyage接続設定はJEVと同じ方式でenv（VOYAGE_API_KEY / VOYAGE_ACCOUNT_REF / VOYAGE_API_URL /
+//   VOYAGE_REQUEST_TIMEOUT_MS）から読む。実APIへは送らず、loopback HTTP fixtureだけを使う。
 
 const VOYAGE_PROVIDER = 'voyage_direct';
 const VOYAGE_MODEL = 'voyage-4-lite';
@@ -73,9 +83,12 @@ after(async () => {
 
 interface FakeHttpReply {
   status?: number;
+  headers?: Record<string, string>;
   body?: unknown;
   rawBody?: string;
   delayMs?: number;
+  // headersを先にflushし、bodyだけを遅延させる。
+  bodyDelayMs?: number;
 }
 
 interface RecordedHttpRequest {
@@ -112,11 +125,20 @@ async function startFakeVoyage(responder: FakeHttpResponder): Promise<FakeHttpSe
       }
       requests.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers, rawBody, body });
       const reply = await responder(body);
+      res.statusCode = reply.status ?? 200;
+      res.setHeader('content-type', 'application/json');
+      for (const [name, value] of Object.entries(reply.headers ?? {})) {
+        res.setHeader(name, value);
+      }
+      if (reply.bodyDelayMs !== undefined) {
+        res.flushHeaders();
+        await sleep(reply.bodyDelayMs);
+        res.end(reply.rawBody ?? JSON.stringify(reply.body ?? {}));
+        return;
+      }
       if (reply.delayMs !== undefined) {
         await sleep(reply.delayMs);
       }
-      res.statusCode = reply.status ?? 200;
-      res.setHeader('content-type', 'application/json');
       res.end(reply.rawBody ?? JSON.stringify(reply.body ?? {}));
     })().catch(() => {
       res.destroy();
@@ -201,10 +223,11 @@ function loadM4WorkerConfig(voyageEndpoint: string, overrides: Record<string, st
 interface VoyageApprovalSeed {
   companyId: string;
   endpoint: string;
+  provider?: string;
   accountRef?: string;
   active?: boolean;
   learningDisabled?: boolean;
-  termsCheckedAt?: Date;
+  termsCheckedAt?: Date | null;
   confirmedAt?: Date;
 }
 
@@ -216,17 +239,75 @@ async function insertVoyageApproval(pool: Pool, input: VoyageApprovalSeed): Prom
     [
       uuidv7(),
       input.companyId,
-      VOYAGE_PROVIDER,
+      input.provider ?? VOYAGE_PROVIDER,
       input.accountRef ?? VOYAGE_ACCOUNT,
       input.endpoint,
       'https://www.voyageai.com/tos',
-      input.termsCheckedAt ?? new Date(),
+      input.termsCheckedAt === undefined ? new Date() : input.termsCheckedAt,
       input.learningDisabled ?? true,
       'retention-terms',
       input.confirmedAt ?? new Date(),
       input.active ?? true,
     ],
   );
+}
+
+interface GenerationSeed {
+  companyId: string;
+  overrides?: Partial<{
+    provider: string;
+    accountRef: string;
+    endpoint: string;
+    model: string;
+    dimensions: number;
+    metric: string;
+    tokenizerVersion: string;
+    documentInputType: string;
+    queryInputType: string;
+    normalization: string;
+    status: string;
+  }>;
+}
+
+// spec不一致test用に、configと一致しない世代を直接登録する。
+async function insertGeneration(pool: Pool, input: GenerationSeed): Promise<string> {
+  const id = uuidv7();
+  const values = {
+    provider: VOYAGE_PROVIDER,
+    accountRef: VOYAGE_ACCOUNT,
+    endpoint: `https://api.voyageai.com${VOYAGE_PATH}`,
+    model: VOYAGE_MODEL,
+    dimensions: EMBEDDING_DIMENSIONS,
+    metric: 'cosine',
+    tokenizerVersion: 'test-tokenizer',
+    documentInputType: 'document',
+    queryInputType: 'query',
+    normalization: 'provider_default',
+    status: 'active',
+    ...input.overrides,
+  };
+  await pool.query(
+    `INSERT INTO embedding_generations
+       (id, company_id, provider, account_ref, endpoint, model, model_revision, dimensions, metric,
+        tokenizer_version, document_input_type, query_input_type, normalization, status)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13)`,
+    [
+      id,
+      input.companyId,
+      values.provider,
+      values.accountRef,
+      values.endpoint,
+      values.model,
+      values.dimensions,
+      values.metric,
+      values.tokenizerVersion,
+      values.documentInputType,
+      values.queryInputType,
+      values.normalization,
+      values.status,
+    ],
+  );
+  return id;
 }
 
 async function startApprovedVoyage(
@@ -252,7 +333,7 @@ async function enqueueBuildJob(
   pool: Pool,
   input: { sessionId: string; messageId: string; revision: number; retention: string; isSearchable: boolean },
 ): Promise<string> {
-  return enqueueJob(pool, {
+  const jobId = await enqueueJob(pool, {
     kind: 'build_documents',
     idempotencyKey: `build_documents:${input.messageId}:${input.revision}:${WORKER_POLICY_VERSION}`,
     priority: BUILD_DOCUMENTS_PRIORITY,
@@ -261,6 +342,9 @@ async function enqueueBuildJob(
     targetRevision: input.revision,
     payload: { retention: input.retention, is_searchable: input.isSearchable },
   });
+  // host時計とDB時計のskewで直後のclaimが未到来扱いになるのを避け、DB時刻へ揃える。
+  await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+  return jobId;
 }
 
 async function upsertAnalysis(
@@ -320,7 +404,21 @@ async function seedSearchableMessage(
 
 async function claimBuildJob(pool: Pool, buildJobId: string): Promise<ClaimedJob> {
   const [job] = await claimJobs(pool, { kinds: ['build_documents'], limit: 1, leaseMs: 60_000 });
-  assert.ok(job, `build_documents jobをclaimできない: ${buildJobId}`);
+  if (job === undefined) {
+    // host時計とDB時計のskewで未到来扱いになった場合に原因が分かるよう、job行を診断へ含める。
+    const diagnostics = await pool.query(
+      'SELECT status, next_run_at, now() AS db_now, next_run_at > now() AS is_future FROM jobs WHERE id = $1',
+      [buildJobId],
+    );
+    const activity = await pool.query(
+      `SELECT pid, state, xact_start, wait_event_type, left(query, 80) AS query
+         FROM pg_stat_activity
+        WHERE datname = current_database() AND state <> 'idle'`,
+    );
+    assert.fail(
+      `build_documents jobをclaimできない: ${buildJobId} ${JSON.stringify(diagnostics.rows[0] ?? null)} activity=${JSON.stringify(activity.rows)}`,
+    );
+  }
   assert.equal(job.id, buildJobId, '別のbuild_documents jobをclaimした');
   return job;
 }
@@ -571,6 +669,7 @@ interface GenerationRow {
   model: string;
   dimensions: number;
   status: string | null;
+  tokenizerVersion: string;
 }
 
 async function readActiveGeneration(pool: Pool, projectId: string): Promise<GenerationRow> {
@@ -592,6 +691,7 @@ async function readActiveGeneration(pool: Pool, projectId: string): Promise<Gene
     model: pickString(record.row, ['model'], 'embedding_generations.model'),
     dimensions: pickNumber(record.row, ['dimensions'], 'embedding_generations.dimensions'),
     status: pickOptionalString(record.row, ['status']),
+    tokenizerVersion: pickString(record.row, ['tokenizer_version'], 'embedding_generations.tokenizer_version'),
   };
 }
 
@@ -604,12 +704,16 @@ async function readEmbeddingCacheRows(pool: Pool): Promise<{ companyId: string |
   }));
 }
 
-async function readVoyageUsageEvents(pool: Pool, companyId: string): Promise<{ provider: string | null; success: boolean | null }[]> {
+async function readVoyageUsageEvents(
+  pool: Pool,
+  companyId: string,
+): Promise<{ provider: string | null; operation: string | null; success: boolean | null }[]> {
   const result = await pool.query<{ row: DbRow }>('SELECT to_jsonb(u) AS row FROM usage_events u WHERE company_id = $1', [
     companyId,
   ]);
   return result.rows.map(({ row }) => ({
     provider: pickOptionalString(row, ['provider']),
+    operation: pickOptionalString(row, ['operation']),
     success: pickOptionalBoolean(row, ['success']),
   }));
 }
@@ -725,6 +829,10 @@ function revisionKey(documentId: string, revision: number): string {
   return `${documentId}:${revision}`;
 }
 
+function totalSpanLength(spans: readonly SourceSpan[]): number {
+  return spans.reduce((sum, span) => sum + (span.end - span.start), 0);
+}
+
 function revisionContainsRange(spans: readonly SourceSpan[], range: { start: number; end: number }): boolean {
   const ranges = spans.map((span) => [span.start, span.end]).sort((a, b) => a[0] - b[0]);
   let covered = range.start;
@@ -767,6 +875,12 @@ describe('M4 build_documents: 世代作成・原文対応・公開', () => {
     assert.equal(generation.provider, VOYAGE_PROVIDER, 'generationのproviderがvoyage_directでない');
     assert.equal(generation.model, VOYAGE_MODEL, 'generationのmodelがvoyage-4-liteでない');
     assert.equal(generation.dimensions, EMBEDDING_DIMENSIONS, 'generationのdimensionsが1024でない');
+    assert.equal(generation.tokenizerVersion, VOYAGE_TOKENIZER_VERSION, 'tokenizer_versionにasset revisionと実行library版が入っていない');
+    assert.ok(
+      generation.tokenizerVersion.includes('0335ddf7698395712e3220733b4079006951cfef') &&
+        generation.tokenizerVersion.includes('@huggingface/tokenizers@0.2.0'),
+      `tokenizer_versionの固定内容が不足: ${generation.tokenizerVersion}`,
+    );
 
     const documents = await readDocuments(pool, workspace.projectId);
     assert.ok(documents.length >= 1, '検索文書がない');
@@ -914,14 +1028,20 @@ describe('M4 build_documents: 世代作成・原文対応・公開', () => {
       for (let right = left + 1; right < codeSpans.length; right += 1) {
         const first = codeSpans[left];
         const second = codeSpans[right];
-        if (first.revision === second.revision) {
+        if (first.documentId === second.documentId && first.revision === second.revision) {
           continue;
         }
         const overlapLength = Math.min(first.end, second.end) - Math.max(first.start, second.start);
         if (overlapLength > 0) {
           hasOverlap = true;
-          const shorterLength = Math.min(first.end - first.start, second.end - second.start);
-          assert.ok(overlapLength < shorterLength, '分割時の重複windowが文書全体の複製になっている');
+          // 重複windowは前chunkの末尾rangeの複製なので、span単体では包含関係になる。
+          // revision全体を複製していないことを、revisionごとの原文range合計で確認する。
+          const firstTotal = totalSpanLength(spansByRevision.get(revisionKey(first.documentId, first.revision)) ?? []);
+          const secondTotal = totalSpanLength(spansByRevision.get(revisionKey(second.documentId, second.revision)) ?? []);
+          assert.ok(
+            overlapLength < Math.min(firstTotal, secondTotal),
+            '分割時の重複windowがrevision全体の複製になっている',
+          );
         }
       }
     }
@@ -1244,6 +1364,11 @@ describe('M4 VoyageEmbeddingProviderの送信契約と応答検証', () => {
       assert.equal(run.errorCode, 'provider_contract_invalid', `契約不正のerror_codeが違う: ${run.errorCode ?? ''}`);
       assert.equal((await readPublications(pool, workspace.projectId)).length, 0, '不正vectorの文書が公開された');
       assert.equal((await readEmbeddings(pool)).length, 0, '不正vectorが保存された');
+      const invalidRevisions = await readRevisions(pool);
+      assert.ok(
+        invalidRevisions.length >= 1 && invalidRevisions.every((revision) => revision.status === 'failed'),
+        `恒久契約不正でrevisionがfailedにならない: ${invalidRevisions.map((revision) => revision.status).join(',')}`,
+      );
       assert.equal(await messageRevisionText(pool, message.messageId, message.revision), message.text, '失敗時に原文が消えた');
     });
   }
@@ -1262,6 +1387,7 @@ describe('M4 学習利用条件の送信ゲート', () => {
     { name: '別accountの承認しかない', seed: { accountRef: 'other-acct' } },
     { name: '別endpointの承認しかない', seed: { endpoint: 'https://api.voyageai.com/v1/embeddings' } },
     { name: '規約確認日が未来', seed: { termsCheckedAt: minutesFromNow(10) } },
+    { name: '規約確認日が未設定', seed: { termsCheckedAt: null } },
     { name: '確認日が未来', seed: { confirmedAt: minutesFromNow(10) } },
   ];
 
@@ -1288,6 +1414,12 @@ describe('M4 学習利用条件の送信ゲート', () => {
         '承認停止時に原文が消えた',
       );
       assert.equal((await readPublications(pool, workspace.projectId)).length, 0, '承認停止時に文書が公開された');
+      const revisions = await readRevisions(pool);
+      assert.ok(revisions.length >= 1, '承認停止時に文書revisionがない');
+      assert.ok(
+        revisions.every((revision) => revision.status === 'pending' || revision.status === 'embedding'),
+        `policy停止でpending revisionがfailedになった: ${revisions.map((revision) => revision.status).join(',')}`,
+      );
     });
   }
 });
@@ -1299,21 +1431,47 @@ describe('M4 Voyage障害時の再試行と永続失敗', () => {
     delayMs?: number;
     expectedStatus: string;
     expectedCode: string;
+    expectedRevisionStatus: string;
     timeoutOverride?: string;
   }
 
   const failureCases: FailureCase[] = [
-    { name: '429', replyStatus: 429, expectedStatus: 'pending', expectedCode: 'provider_rate_limited' },
-    { name: '503', replyStatus: 503, expectedStatus: 'pending', expectedCode: 'provider_unavailable' },
+    {
+      name: '429',
+      replyStatus: 429,
+      expectedStatus: 'pending',
+      expectedCode: 'provider_rate_limited',
+      expectedRevisionStatus: 'pending',
+    },
+    {
+      name: '503',
+      replyStatus: 503,
+      expectedStatus: 'pending',
+      expectedCode: 'provider_unavailable',
+      expectedRevisionStatus: 'pending',
+    },
     {
       name: 'timeout',
       delayMs: 1_000,
       expectedStatus: 'pending',
       expectedCode: 'provider_timeout',
+      expectedRevisionStatus: 'pending',
       timeoutOverride: '200',
     },
-    { name: '400', replyStatus: 400, expectedStatus: 'failed', expectedCode: 'provider_rejected' },
-    { name: '422', replyStatus: 422, expectedStatus: 'failed', expectedCode: 'provider_rejected' },
+    {
+      name: '400',
+      replyStatus: 400,
+      expectedStatus: 'failed',
+      expectedCode: 'provider_rejected',
+      expectedRevisionStatus: 'failed',
+    },
+    {
+      name: '422',
+      replyStatus: 422,
+      expectedStatus: 'failed',
+      expectedCode: 'provider_rejected',
+      expectedRevisionStatus: 'failed',
+    },
   ];
 
   for (const testCase of failureCases) {
@@ -1325,6 +1483,7 @@ describe('M4 Voyage障害時の再試行と永続失敗', () => {
       }));
       openServers.push(server);
       const endpoint = `${server.baseUrl}${VOYAGE_PATH}`;
+      await insertVoyageApproval(pool, { companyId: workspace.companyId, endpoint });
       const config = loadM4WorkerConfig(
         endpoint,
         testCase.timeoutOverride === undefined ? {} : { VOYAGE_REQUEST_TIMEOUT_MS: testCase.timeoutOverride },
@@ -1342,6 +1501,12 @@ describe('M4 Voyage障害時の再試行と永続失敗', () => {
         await messageRevisionText(pool, message.messageId, message.revision),
         message.text,
         '障害時に原文が消えた',
+      );
+      const revisions = await readRevisions(pool);
+      assert.ok(revisions.length >= 1, '障害時に文書revisionがない');
+      assert.ok(
+        revisions.every((revision) => revision.status === testCase.expectedRevisionStatus),
+        `revision statusが${testCase.expectedRevisionStatus}でない: ${revisions.map((revision) => revision.status).join(',')}`,
       );
     });
   }
@@ -1367,11 +1532,12 @@ describe('M4 外部待ち中の状態変更', () => {
     );
     const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: '応答待ちの対象になる原文' });
     const beforePublications = await readPublications(pool, workspace.projectId);
+    const warmRequests = server.requests.length;
 
     gateArmed = true;
     const job = await claimBuildJob(pool, second.buildJobId);
     const processing = processJob(pool, job, config);
-    const sent = await waitUntil(() => server.requests.length >= 1, EXTERNAL_WAIT_TIMEOUT_MS);
+    const sent = await waitUntil(() => server.requests.length > warmRequests, EXTERNAL_WAIT_TIMEOUT_MS);
     if (sent) {
       await advanceRevision(pool, warm.messageId, '外部待ちの間に編集された原文');
       gate.resolve();
@@ -1393,6 +1559,10 @@ describe('M4 外部待ち中の状態変更', () => {
       );
     }
     assert.equal(await messageRevisionText(pool, warm.messageId, 2), '外部待ちの間に編集された原文', '外部待ち中の編集が消えた');
+    assert.ok(
+      (await readRevisions(pool)).every((revision) => revision.status !== 'failed'),
+      'stale応答でrevisionがfailedになった',
+    );
   });
 
   it('外部待ちの間にlease所有を失った応答は保存・公開しない', async () => {
@@ -1414,11 +1584,12 @@ describe('M4 外部待ち中の状態変更', () => {
     );
     const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: 'lease喪失中の応答対象' });
     const beforePublications = await readPublications(pool, workspace.projectId);
+    const warmRequests = server.requests.length;
 
     gateArmed = true;
     const job = await claimBuildJob(pool, second.buildJobId);
     const processing = processJob(pool, job, config);
-    const sent = await waitUntil(() => server.requests.length >= 1, EXTERNAL_WAIT_TIMEOUT_MS);
+    const sent = await waitUntil(() => server.requests.length > warmRequests, EXTERNAL_WAIT_TIMEOUT_MS);
     if (sent) {
       await pool.query('UPDATE jobs SET lease_token = $2, updated_at = now() WHERE id = $1', [job.id, uuidv7()]);
       gate.resolve();
@@ -1440,6 +1611,10 @@ describe('M4 外部待ち中の状態変更', () => {
       );
     }
     assert.notEqual((await readJob(pool, second.buildJobId)).status, 'completed', 'lease喪失後もjobがcompletedになった');
+    assert.ok(
+      (await readRevisions(pool)).every((revision) => revision.status !== 'failed'),
+      'lease喪失でrevisionがfailedになった',
+    );
   });
 
   it('外部待ちの間にdesired_revisionが変わった応答は公開revisionを更新しない', async () => {
@@ -1462,11 +1637,12 @@ describe('M4 外部待ち中の状態変更', () => {
     const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: 'desired変更中の応答対象' });
     const documentsBefore = await readDocuments(pool, workspace.projectId);
     const beforePublications = await readPublications(pool, workspace.projectId);
+    const warmRequests = server.requests.length;
 
     gateArmed = true;
     const job = await claimBuildJob(pool, second.buildJobId);
     const processing = processJob(pool, job, config);
-    const sent = await waitUntil(() => server.requests.length >= 1, EXTERNAL_WAIT_TIMEOUT_MS);
+    const sent = await waitUntil(() => server.requests.length > warmRequests, EXTERNAL_WAIT_TIMEOUT_MS);
     let reverted: { id: string; desiredRevision: number } | undefined;
     if (sent) {
       const documentsDuring = await readDocuments(pool, workspace.projectId);
@@ -1610,5 +1786,507 @@ describe('M4 worker runner', () => {
       controller.abort();
       await running;
     }
+  });
+});
+
+describe('M4 Green追加契約', () => {
+  it('embedQueryはinput_type=queryで固定値送信し、同じ入力はcacheから再利用する', async () => {
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId);
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const provider = new VoyageEmbeddingProvider(pool, config);
+    const vector = await provider.embedQuery('検索質問の本文', generation);
+
+    assert.equal(server.requests.length, 1, 'embedQueryが1回送信していない');
+    const body = readVoyageRequest(server.requests[0].body);
+    assert.equal(body.input_type, 'query', 'input_typeがqueryでない');
+    assert.equal(body.model, VOYAGE_MODEL, 'modelがvoyage-4-liteでない');
+    assert.equal(body.output_dimension, EMBEDDING_DIMENSIONS, 'output_dimensionが1024でない');
+    assert.equal(body.output_dtype, 'float', 'output_dtypeがfloatでない');
+    assert.equal(body.truncation, false, 'truncationがfalseでない');
+    assert.deepEqual(body.input, ['検索質問の本文'], 'inputが質問本文と一致しない');
+    assert.equal(server.requests[0].headers.authorization, `Bearer ${VOYAGE_KEY}`, 'Bearer credentialでない');
+    assert.equal(vector.length, EMBEDDING_DIMENSIONS, 'query vectorの次元が1024でない');
+    assert.ok(Math.abs(vector[0] - 0.1) < 1e-9, 'index順のvector対応が違う');
+
+    const cacheRows = await readEmbeddingCacheRows(pool);
+    assert.ok(cacheRows.some((row) => row.operation === 'query'), 'query操作のembedding_cache行がない');
+    const usage = await readVoyageUsageEvents(pool, workspace.companyId);
+    assert.ok(
+      usage.some((row) => row.provider === VOYAGE_PROVIDER && row.operation === 'query' && row.success === true),
+      'queryのusage_eventsがない',
+    );
+
+    const second = await provider.embedQuery('検索質問の本文', generation);
+    assert.equal(server.requests.length, 1, '同じ質問でHTTPを省略していない');
+    assert.deepEqual(second, vector, 'cache再利用のvectorが違う');
+  });
+
+  it('実tokenizerの計測で各revisionは上限内に収まり、隣接chunkが重複windowを持つ', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const tokenizer = await loadVoyageTokenizer();
+    const words = Array.from({ length: 3_000 }, (_, index) => `word${String(index).padStart(4, '0')}`);
+    const text = words
+      .map((word, index) => (index > 0 && index % 200 === 0 ? `\n\n${word}` : ` ${word}`))
+      .join('')
+      .trim();
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(run.status, 'completed', `boundary fixtureのbuild_documentsがcompletedでない: ${run.status}/${run.errorCode ?? ''}`);
+
+    const revisions = await readRevisions(pool);
+    assert.ok(revisions.length >= 2, `3000 tokenの文書が分割されていない: ${revisions.length}`);
+    const tokenCounts = revisions.map((revision) => tokenizer.encode(revision.text).ids.length);
+    for (const [index, count] of tokenCounts.entries()) {
+      assert.ok(count > 0, `revision ${index} が空`);
+      assert.ok(
+        count + VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE <= CHUNK_MAX_TOKENS,
+        `revision ${index} が上限1200+prefix予約を超える: ${count}`,
+      );
+    }
+    assert.ok(
+      Math.max(...tokenCounts) > CHUNK_TARGET_TOKENS - VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE - 50,
+      `目標800 token近傍まで使っていない: max=${Math.max(...tokenCounts)}`,
+    );
+
+    const spans = await readSources(pool);
+    const messageSpans = spans.filter((span) => span.messageId === message.messageId && span.messageRevision === message.revision);
+    assertCoverage(messageSpans, text.length, 'tokenizer境界fixture');
+
+    const groups = new Map<string, SourceSpan[]>();
+    for (const span of messageSpans) {
+      const key = revisionKey(span.documentId, span.revision);
+      groups.set(key, [...(groups.get(key) ?? []), span]);
+    }
+    const ordered = [...groups.values()]
+      .map((revisionSpans) => ({
+        start: Math.min(...revisionSpans.map((span) => span.start)),
+        end: Math.max(...revisionSpans.map((span) => span.end)),
+      }))
+      .sort((left, right) => left.start - right.start);
+    for (let index = 1; index < ordered.length; index += 1) {
+      assert.ok(ordered[index].start < ordered[index - 1].end, `隣接chunkに重複windowがない: ${ordered[index].start} >= ${ordered[index - 1].end}`);
+    }
+  });
+
+  it('active generationがconfigとspec不一致なら自動切替せず恒久エラーにする', async () => {
+    const server = await startFakeVoyage(defaultVoyageResponder);
+    openServers.push(server);
+    const endpoint = `${server.baseUrl}${VOYAGE_PATH}`;
+    const config = loadM4WorkerConfig(endpoint);
+    const generationId = await insertGeneration(pool, {
+      companyId: workspace.companyId,
+      overrides: { endpoint: `https://api.voyageai.com${VOYAGE_PATH}`, dimensions: 768 },
+    });
+    await pool.query('UPDATE projects SET active_generation_id = $2 WHERE id = $1', [workspace.projectId, generationId]);
+
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '世代不一致の対象になる設計メモ' });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+
+    assert.equal(run.status, 'failed', `spec不一致がfailedにならない: ${run.status}`);
+    assert.equal(run.errorCode, 'embedding_generation_mismatch', `spec不一致のerror_codeが違う: ${run.errorCode ?? ''}`);
+    assert.equal(server.requests.length, 0, 'spec不一致なのにVoyageへ送信している');
+    assert.equal((await readPublications(pool, workspace.projectId)).length, 0, 'spec不一致で文書が公開された');
+  });
+
+  it('承認失効後はcache hit可能でもHTTPを送らずblocked_policyにし、cacheから公開しない', async () => {
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'cacheとpolicy再確認の対象' });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: message.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    const cacheBefore = await readEmbeddingCacheRows(pool);
+    assert.ok(cacheBefore.length >= 1, '再利用可能なcache行がない');
+
+    await pool.query(
+      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      [workspace.companyId, VOYAGE_PROVIDER],
+    );
+    // 同じcontentのrevisionをpendingへ戻し、cache-hitになり得る再処理を作る。
+    await pool.query(
+      `UPDATE search_document_revisions
+          SET status = 'pending'
+        WHERE document_id IN (SELECT id FROM search_documents WHERE project_id = $1)`,
+      [workspace.projectId],
+    );
+    const requestsBefore = server.requests.length;
+    await reopenJob(pool, message.buildJobId);
+    const rerun = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+
+    assert.equal(rerun.status, 'blocked_policy', `承認失効後のjobがblocked_policyでない: ${rerun.status}/${rerun.errorCode ?? ''}`);
+    assert.equal(rerun.errorCode, 'provider_policy_unverified', `policy停止のerror_codeが違う: ${rerun.errorCode ?? ''}`);
+    assert.equal(server.requests.length, requestsBefore, '承認失効後にVoyageへ送信している');
+    assert.ok((await readEmbeddingCacheRows(pool)).length >= cacheBefore.length, 'cache行が消えた');
+  });
+
+  it('retryJobはbuild_documentsにVoyage承認だけを使い、Jev承認では再開しない', async () => {
+    const server = await startFakeVoyage(defaultVoyageResponder);
+    openServers.push(server);
+    const endpoint = `${server.baseUrl}${VOYAGE_PATH}`;
+    const config = loadM4WorkerConfig(endpoint);
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'retry対象のbuild_documents' });
+    const blocked = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(blocked.status, 'blocked_policy', `未承認のbuild_documentsがblocked_policyでない: ${blocked.status}`);
+
+    // Jev承認だけではVoyage jobを再開しない。
+    await insertVoyageApproval(pool, {
+      companyId: workspace.companyId,
+      endpoint: config.apiUrl,
+      provider: JEV_PROVIDER,
+      accountRef: config.accountRef,
+    });
+    assert.equal(await retryJob(pool, message.buildJobId, config), false, 'Jev承認でVoyage jobを再開した');
+
+    await insertVoyageApproval(pool, { companyId: workspace.companyId, endpoint });
+    assert.equal(await retryJob(pool, message.buildJobId, config), true, 'Voyage承認で再開できない');
+    assert.equal((await readJob(pool, message.buildJobId)).status, 'pending', 'retry後にpendingでない');
+
+    const retried = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(retried.status, 'completed', `retry後のbuild_documentsがcompletedでない: ${retried.status}/${retried.errorCode ?? ''}`);
+    assert.ok(server.requests.length >= 1, 'retry後にVoyageへ送信していない');
+    const publications = await readPublications(pool, workspace.projectId);
+    assert.ok(publications.some((publication) => !publication.stale), 'retry後に文書が公開されていない');
+  });
+});
+
+describe('M4 監査修正契約', () => {
+  it('先頭message編集後もdocument_keyは不変で、同じdocumentの新revisionになる', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '編集前の先頭になる短い設計メモ' });
+    const second = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: '後続の短い実装メモ',
+    });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: first.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: second.buildJobId, config })).status,
+      'completed',
+      '後続のbuild_documentsがcompletedでない',
+    );
+    const documentsBefore = await readDocuments(pool, workspace.projectId);
+    const revisionsBefore = await readRevisions(pool);
+    assert.equal(documentsBefore.length, 1, `短い2発言が同一文書へまとまっていない: ${documentsBefore.length}`);
+
+    const edited = '編集後の先頭になる短い設計メモ';
+    const revision2 = await advanceRevision(pool, first.messageId, edited);
+    await upsertAnalysis(pool, { messageId: first.messageId, revision: revision2 });
+    const editJobId = await enqueueBuildJob(pool, {
+      sessionId,
+      messageId: first.messageId,
+      revision: revision2,
+      retention: 'substantive',
+      isSearchable: true,
+    });
+    const run = await runBuildJob(pool, { buildJobId: editJobId, config });
+    assert.equal(run.status, 'completed', `編集後のbuild_documentsがcompletedでない: ${run.status}/${run.errorCode ?? ''}`);
+
+    const documentsAfter = await readDocuments(pool, workspace.projectId);
+    assert.equal(documentsAfter.length, documentsBefore.length, 'document_keyへrevision番号を含めたため別documentへ増殖した');
+    assert.deepEqual(
+      [...documentsAfter].map((document) => document.id).sort(),
+      [...documentsBefore].map((document) => document.id).sort(),
+      '同じsearch_documents.idが維持されていない',
+    );
+    assert.deepEqual(
+      [...documentsAfter].map((document) => document.documentKey).sort(),
+      [...documentsBefore].map((document) => document.documentKey).sort(),
+      'document_keyが編集で変化した',
+    );
+    const newRevisions = (await readRevisions(pool)).filter(
+      (revision) =>
+        !revisionsBefore.some((before) => before.documentId === revision.documentId && before.revision === revision.revision),
+    );
+    assert.equal(newRevisions.length, 1, `同じdocumentの新revisionが1件でない: ${newRevisions.length}`);
+    assert.equal(newRevisions[0].documentId, documentsBefore[0].id, '新revisionが別documentへ増殖した');
+    assert.ok(compact(newRevisions[0].text).includes(compact(edited)), '編集後の本文が新revisionにない');
+  });
+
+  for (const status of ['retired', 'failed'] as const) {
+    it(`active generationが${status}なら自動切替せずHTTP 0件で恒久失敗する`, async () => {
+      const server = await startFakeVoyage(defaultVoyageResponder);
+      openServers.push(server);
+      const endpoint = `${server.baseUrl}${VOYAGE_PATH}`;
+      const config = loadM4WorkerConfig(endpoint);
+      const generationId = await insertGeneration(pool, {
+        companyId: workspace.companyId,
+        overrides: { endpoint, status },
+      });
+      await pool.query('UPDATE projects SET active_generation_id = $2 WHERE id = $1', [workspace.projectId, generationId]);
+
+      const sessionId = await seedSession(pool, workspace);
+      const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: `${status}世代の対象` });
+      const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+
+      assert.equal(run.status, 'failed', `${status}世代がfailedにならない: ${run.status}`);
+      assert.equal(run.errorCode, 'embedding_generation_mismatch', `${status}世代のerror_codeが違う: ${run.errorCode ?? ''}`);
+      assert.equal(server.requests.length, 0, `${status}世代なのにVoyageへ送信している`);
+      assert.equal((await readPublications(pool, workspace.projectId)).length, 0, `${status}世代で文書が公開された`);
+    });
+  }
+
+  it('headers受信後のbody read timeoutはprovider_timeoutとしてretryableにする', async () => {
+    const server = await startFakeVoyage((body) => ({
+      status: 200,
+      body: validVoyageReply(readVoyageRequest(body).input ?? []),
+      bodyDelayMs: 1_000,
+    }));
+    openServers.push(server);
+    const endpoint = `${server.baseUrl}${VOYAGE_PATH}`;
+    await insertVoyageApproval(pool, { companyId: workspace.companyId, endpoint });
+    const config = loadM4WorkerConfig(endpoint, { VOYAGE_REQUEST_TIMEOUT_MS: '250' });
+
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'body遅延のtimeout対象' });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+
+    assert.ok(server.requests.length >= 1, 'Voyageへ送信していない');
+    assert.equal(run.status, 'pending', `body timeoutがretryableでない: ${run.status}/${run.errorCode ?? ''}`);
+    assert.equal(run.errorCode, 'provider_timeout', `body timeoutのerror_codeが違う: ${run.errorCode ?? ''}`);
+    const revisions = await readRevisions(pool);
+    assert.ok(revisions.length >= 1 && revisions.every((revision) => revision.status === 'pending'), 'body timeoutでrevisionがfailedになった');
+    assert.equal((await readPublications(pool, workspace.projectId)).length, 0, 'body timeoutで文書が公開された');
+  });
+
+  it('Retry-Afterはdelta-secondsとHTTP-dateの両方をbackoffへ反映する', async () => {
+    const deltaServer = await startFakeVoyage(() => ({
+      status: 429,
+      headers: { 'retry-after': '2' },
+      body: { detail: 'rate limited' },
+    }));
+    openServers.push(deltaServer);
+    const deltaEndpoint = `${deltaServer.baseUrl}${VOYAGE_PATH}`;
+    await insertVoyageApproval(pool, { companyId: workspace.companyId, endpoint: deltaEndpoint });
+    const deltaConfig = loadM4WorkerConfig(deltaEndpoint);
+    const deltaSessionId = await seedSession(pool, workspace);
+    const deltaMessage = await seedSearchableMessage(pool, {
+      sessionId: deltaSessionId,
+      sequenceNo: 1,
+      text: 'delta-secondsの再試行対象',
+    });
+    const deltaRun = await runBuildJob(pool, { buildJobId: deltaMessage.buildJobId, config: deltaConfig });
+    assert.equal(deltaRun.status, 'pending', `delta-secondsの429がpendingでない: ${deltaRun.status}`);
+    assert.equal(deltaRun.errorCode, 'provider_rate_limited');
+    const deltaDelayMs = (await readJob(pool, deltaMessage.buildJobId)).next_run_at.getTime() - Date.now();
+    assert.ok(deltaDelayMs >= 1_000 && deltaDelayMs <= 15_000, `Retry-After(秒)が反映されていない: ${deltaDelayMs}`);
+
+    const dateServer = await startFakeVoyage(() => ({
+      status: 429,
+      headers: { 'retry-after': new Date(Date.now() + 60_000).toUTCString() },
+      body: { detail: 'rate limited' },
+    }));
+    openServers.push(dateServer);
+    const dateEndpoint = `${dateServer.baseUrl}${VOYAGE_PATH}`;
+    // endpointごとにactive generationが固定されるため、HTTP-date側は別会社・別projectで検証する。
+    const dateWorkspace = await seedWorkspace(pool, { name: 'company-retry-date', repositoryIdentifier: 'repo-retry-date' });
+    await insertVoyageApproval(pool, { companyId: dateWorkspace.companyId, endpoint: dateEndpoint });
+    const dateConfig = loadM4WorkerConfig(dateEndpoint);
+    const dateSessionId = await seedSession(pool, dateWorkspace);
+    const dateMessage = await seedSearchableMessage(pool, {
+      sessionId: dateSessionId,
+      sequenceNo: 1,
+      text: 'HTTP-dateの再試行対象',
+    });
+    const dateRun = await runBuildJob(pool, { buildJobId: dateMessage.buildJobId, config: dateConfig });
+    assert.equal(dateRun.status, 'pending', `HTTP-dateの429がpendingでない: ${dateRun.status}`);
+    assert.equal(dateRun.errorCode, 'provider_rate_limited');
+    const dateDelayMs = (await readJob(pool, dateMessage.buildJobId)).next_run_at.getTime() - Date.now();
+    assert.ok(dateDelayMs >= 30_000 && dateDelayMs <= 90_000, `Retry-After(HTTP-date)が反映されていない: ${dateDelayMs}`);
+  });
+
+  it('新revisionのembedding待ち中は既存公開revisionをstaleにし、公開時にsupersededへする', async () => {
+    const gate = deferred();
+    let gateArmed = false;
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId, async (body) => {
+      const reply = validVoyageReply(readVoyageRequest(body).input ?? []);
+      if (gateArmed) {
+        await gate.promise;
+      }
+      return { body: reply };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const warm = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '先に公開されるstale対象' });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: warm.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    const warmRevisions = await readRevisions(pool);
+    const warmReady = warmRevisions.find((revision) => revision.status === 'ready');
+    assert.ok(warmReady, '最初のready revisionがない');
+
+    const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: 'stale中に追加される発言' });
+    const warmRequests = server.requests.length;
+    gateArmed = true;
+    const job = await claimBuildJob(pool, second.buildJobId);
+    const processing = processJob(pool, job, config);
+    const sent = await waitUntil(() => server.requests.length > warmRequests, EXTERNAL_WAIT_TIMEOUT_MS);
+    if (!sent) {
+      await processing;
+    }
+    assert.ok(sent, 'Voyage送信まで到達せず、embedding待ち中のstaleを確認できない');
+
+    const duringPublications = await readPublications(pool, workspace.projectId);
+    const duringWarm = duringPublications.find(
+      (publication) => publication.documentId === warmReady.documentId && publication.revision === warmReady.revision,
+    );
+    assert.ok(duringWarm, 'embedding待ち中に旧公開revisionがない');
+    assert.equal(duringWarm.stale, true, 'embedding待ち中に旧公開revisionがstale=trueでない');
+
+    gate.resolve();
+    await processing;
+    const afterRevisions = await readRevisions(pool);
+    const superseded = afterRevisions.find(
+      (revision) => revision.documentId === warmReady.documentId && revision.revision === warmReady.revision,
+    );
+    assert.equal(superseded?.status, 'superseded', '公開後に以前のready revisionがsupersededでない');
+    const afterPublications = await readPublications(pool, workspace.projectId);
+    const published = afterPublications.find((publication) => publication.documentId === warmReady.documentId && !publication.stale);
+    assert.ok(published, '新revisionが公開されていない');
+    assert.ok(published.revision > warmReady.revision, '公開revisionが進んでいない');
+  });
+
+  it('同じrevisionのcontent_hashが別jobで置換された後の恒久失敗は新hashをfailedにしない', async () => {
+    const gate = deferred();
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId, async (body) => {
+      const reply = validVoyageReply(readVoyageRequest(body).input ?? []);
+      await gate.promise;
+      return { body: { ...reply, model: 'voyage-3' } };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '置換前の本文' });
+    const job = await claimBuildJob(pool, message.buildJobId);
+    const processing = processJob(pool, job, config);
+    const sent = await waitUntil(() => server.requests.length >= 1, EXTERNAL_WAIT_TIMEOUT_MS);
+    if (!sent) {
+      gate.resolve();
+      await processing;
+    }
+    assert.ok(sent, 'Voyage送信まで到達せず、content_hash置換競合を再現できない');
+
+    const document = (await readDocuments(pool, workspace.projectId))[0];
+    assert.ok(document, '対象文書がない');
+    const revision = document.desiredRevision;
+
+    // 別jobが同じdocument_id/revision/desired_revisionのcontent/sourceを新hashへ置換する。
+    const edited = '別jobが置換した本文';
+    const editedRevision = await advanceRevision(pool, message.messageId, edited);
+    await upsertAnalysis(pool, { messageId: message.messageId, revision: editedRevision });
+    const messages = await loadSessionMessages(pool, sessionId);
+    const chunks = await planDocumentChunks(sessionId, messages);
+    await applyDocumentPlan(pool, { companyId: workspace.companyId, projectId: workspace.projectId, sessionId }, chunks);
+
+    gate.resolve();
+    await processing;
+
+    assert.equal((await readJob(pool, message.buildJobId)).status, 'failed', '恒久契約不正がfailedでない');
+    const revisions = await readRevisions(pool);
+    const replaced = revisions.find((item) => item.documentId === document.id && item.revision === revision);
+    assert.ok(replaced, '置換されたrevisionがない');
+    assert.equal(replaced.status, 'pending', '旧hashの恒久失敗が新hashのrevisionをfailedに巻き込んだ');
+    assert.ok(compact(replaced.text).includes(compact(edited)), '新hashのcontentが保持されていない');
+    assert.ok(
+      revisions.every((item) => item.status !== 'failed'),
+      `新hash revisionがfailedになった: ${revisions.map((item) => item.status).join(',')}`,
+    );
+  });
+
+  it('恒久エラーのfailed更新はjobのpending revisionに限定し、desiredが変わったrevisionを巻き込まない', async () => {
+    const gate = deferred();
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId, async (body) => {
+      const reply = validVoyageReply(readVoyageRequest(body).input ?? []);
+      await gate.promise;
+      return { body: { ...reply, model: 'voyage-3' } };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '限定更新の対象' });
+    const job = await claimBuildJob(pool, message.buildJobId);
+    const processing = processJob(pool, job, config);
+    const sent = await waitUntil(() => server.requests.length >= 1, EXTERNAL_WAIT_TIMEOUT_MS);
+    if (!sent) {
+      await processing;
+    }
+    assert.ok(sent, 'Voyage送信まで到達せず、限定更新を確認できない');
+
+    const document = (await readDocuments(pool, workspace.projectId))[0];
+    const latest = (await readRevisions(pool)).find((revision) => revision.documentId === document.id);
+    assert.ok(latest, '対象revisionがない');
+    // 応答待ち中に別の新しいrevisionがdesiredになり、旧revisionはこのjobの対象でなくなる。
+    await pool.query(
+      `INSERT INTO search_document_revisions (document_id, revision, content, content_hash, chunker_version, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')`,
+      [document.id, latest.revision + 1, '別jobが作る内容', sha256Bytes('別jobが作る内容'), latest.chunkerVersion],
+    );
+    await pool.query('UPDATE search_documents SET desired_revision = $2, updated_at = now() WHERE id = $1', [
+      document.id,
+      latest.revision + 1,
+    ]);
+    gate.resolve();
+    await processing;
+
+    assert.equal((await readJob(pool, message.buildJobId)).status, 'failed', '恒久契約不正がfailedでない');
+    const after = await readRevisions(pool);
+    assert.equal(
+      after.find((revision) => revision.documentId === document.id && revision.revision === latest.revision)?.status,
+      'pending',
+      'desiredが変わったrevisionをfailedに巻き込んだ',
+    );
+    assert.equal(
+      after.find((revision) => revision.documentId === document.id && revision.revision === latest.revision + 1)?.status,
+      'pending',
+      'このjobのpending listにないrevisionをfailedにした',
+    );
+  });
+
+  it('恒久契約不正のrevisionはfailedになり、明示retryで同じrevisionを再埋め込みしてjobを空完了しない', async () => {
+    let invalid = true;
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId, (body) => {
+      const reply = validVoyageReply(readVoyageRequest(body).input ?? []);
+      return invalid ? { body: { ...reply, model: 'voyage-3' } } : { body: reply };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '再埋め込みretryの対象' });
+
+    const first = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(first.status, 'failed', `契約不正がfailedにならない: ${first.status}`);
+    assert.equal(first.errorCode, 'provider_contract_invalid');
+    const failedRevisions = await readRevisions(pool);
+    const failedRevision = failedRevisions.find((revision) => revision.status === 'failed');
+    assert.ok(failedRevision, `恒久契約不正でrevisionがfailedにならない: ${failedRevisions.map((revision) => revision.status).join(',')}`);
+    assert.equal((await readPublications(pool, workspace.projectId)).length, 0, '契約不正で文書が公開された');
+    const requestsAfterFailure = server.requests.length;
+    assert.ok(requestsAfterFailure >= 1, '契約不正のHTTP送信がない');
+
+    invalid = false;
+    assert.equal(await retryJob(pool, message.buildJobId, config), true, 'failed jobをretryできない');
+    assert.equal((await readJob(pool, message.buildJobId)).status, 'pending', 'retry後にpendingでない');
+    const retried = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(retried.status, 'completed', `retry後のbuild_documentsがcompletedでない: ${retried.status}/${retried.errorCode ?? ''}`);
+    assert.ok(server.requests.length > requestsAfterFailure, 'retry後の再埋め込みHTTP送信がない');
+    const retriedRevision = (await readRevisions(pool)).find(
+      (revision) => revision.documentId === failedRevision.documentId && revision.revision === failedRevision.revision,
+    );
+    assert.equal(retriedRevision?.status, 'ready', '同じfailed revisionがreadyへ戻っていない');
+    assert.ok(
+      (await readPublications(pool, workspace.projectId)).some(
+        (publication) => publication.documentId === failedRevision.documentId && !publication.stale,
+      ),
+      'retry後に文書が公開されていない',
+    );
   });
 });
