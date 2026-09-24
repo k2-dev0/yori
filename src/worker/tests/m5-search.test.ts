@@ -297,6 +297,32 @@ async function waitForGateOrProcessing(gate: ExternalGate, processing: Promise<v
   return Promise.race([gate.waitForEntry(timeoutMs), processing.then(() => false, () => false)]);
 }
 
+// 検索の共有lock中にmessages更新が待たされるかをlock_timeoutで検出する。
+async function probeMessageRevisionUpdate(pool: Pool, messageId: string, timeoutMs: number): Promise<'blocked' | 'timeout'> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL lock_timeout = 150');
+      try {
+        await client.query('UPDATE messages SET updated_at = now() WHERE id = $1', [messageId]);
+        await client.query('ROLLBACK');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        if ((error as { code?: string }).code === '55P03') {
+          return 'blocked';
+        }
+        throw error;
+      }
+    } finally {
+      client.release();
+    }
+    await sleep(25);
+  }
+  return 'timeout';
+}
+
 function createExternalGate(): ExternalGate {
   let entered = false;
   let resolveEntered: (() => void) | undefined;
@@ -614,7 +640,9 @@ interface M5Evidence {
 
 interface M5Match {
   case_or_document_id?: string;
+  relevance?: string;
   relevance_kind?: string[];
+  statement_status?: string;
   claim_status?: string;
   evidence?: M5Evidence[];
   related_evidence_ids?: unknown[];
@@ -638,6 +666,7 @@ interface M5SearchResult {
     search_mode?: string;
   };
   matches?: M5Match[];
+  candidate_evaluations?: unknown[];
   warnings?: unknown[];
 }
 
@@ -750,7 +779,8 @@ describe('M5 schemaと識別子索引', () => {
     const { config } = await startProviders(pool, workspace.companyId, { approveJev: false });
     const sessionId = await seedSession(pool, workspace);
     const text =
-      'src/worker/process.ts の buildRequest() を直し、Issue #123 と PR #456、CaseSensitive.ts を確認した';
+      'src/worker/process.ts、./src/worker/process.ts、../src/worker/process.ts、/repo/src/worker/process.ts を確認し、' +
+      'buildRequest() を直し、Issue #123 と PR #456、CaseSensitive.ts、https://example.com/src/worker/process.ts を参照した';
     const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
     await runBuildJob(pool, message.buildJobId, config);
 
@@ -762,7 +792,16 @@ describe('M5 schemaと識別子索引', () => {
       [documentId],
     );
     const keys = entities.rows.map((row) => row.entity_key);
-    assert.ok(keys.some((key) => key.includes('src/worker/process.ts')), `ファイルpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('src/worker/process.ts'), `相対pathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('./src/worker/process.ts'), `./付きpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('../src/worker/process.ts'), `../付きpathのentityがない: ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes('/repo/src/worker/process.ts'), `絶対pathのentityがない: ${JSON.stringify(keys)}`);
+    assert.equal(
+      keys.filter((key) => key.endsWith('/src/worker/process.ts')).length,
+      3,
+      `URLや過剰な表記からpathを抽出した: ${JSON.stringify(keys)}`,
+    );
+    assert.ok(!keys.some((key) => key.includes('example.com') || key.startsWith('https')), `URL全体を抽出した: ${JSON.stringify(keys)}`);
     assert.ok(keys.some((key) => key.includes('buildRequest')), `関数のentityがない: ${JSON.stringify(keys)}`);
     assert.ok(keys.some((key) => key.includes('#123')), `Issueのentityがない: ${JSON.stringify(keys)}`);
     assert.ok(keys.some((key) => key.includes('#456')), `PRのentityがない: ${JSON.stringify(keys)}`);
@@ -780,6 +819,72 @@ describe('M5 schemaと識別子索引', () => {
       documentId,
     ]);
     assert.equal(Number(after.rows[0]?.count ?? '0'), before, '再実行でdocument_entitiesが増殖した');
+  });
+
+  it('leading path 4形態はvector上位20外でもentity完全一致routeで候補になる', async () => {
+    await requireM5Tables(pool);
+    const queryVector = basisVector(0, 1);
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const forms = [
+      { marker: 'LEAD-ONE', text: './src/worker/process.ts の修正' },
+      { marker: 'LEAD-TWO', text: '../src/worker/process.ts の修正' },
+      { marker: 'LEAD-THREE', text: '/repo/src/worker/process.ts の修正' },
+      { marker: 'LEAD-FOUR', text: 'src/worker/process.ts の修正' },
+    ];
+    const entityMessageIds: string[] = [];
+    for (const [index, form] of forms.entries()) {
+      const seededMessage = await seedSearchableMessage(pool, {
+        sessionId: sessionA,
+        sequenceNo: index + 1,
+        text: `${form.marker} ${form.text}`,
+      });
+      await runBuildJob(pool, seededMessage.buildJobId, config);
+      entityMessageIds.push(seededMessage.messageId);
+    }
+    // 近傍vector候補を21件積み、leading path文書をvector上位20から外す。
+    for (let index = 0; index < 21; index += 1) {
+      const text = `LEAD-VEC-${String(index + 1).padStart(2, '0')} 近傍候補`;
+      const message = await seedMessage(pool, {
+        sessionId: sessionA,
+        sequenceNo: forms.length + index + 1,
+        role: 'assistant',
+        text: `近傍発言-${index + 1}`,
+      });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `leading-vector-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const sessionB = await seedSession(pool, workspace);
+    const queryText =
+      './src/worker/process.ts ../src/worker/process.ts /repo/src/worker/process.ts src/worker/process.ts LEAD-QUERY';
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: queryText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const result = await readStoredResult(pool, seeded.requestId);
+    const topEvidence = result.matches?.[0]?.evidence ?? [];
+    assert.ok(
+      topEvidence.some((evidence) => entityMessageIds.includes(evidence.message_id)),
+      'leading pathのentity route候補が代表evidenceになっていない',
+    );
+    const jevBody = allJevRawBody(jev);
+    for (const form of forms) {
+      assert.ok(jevBody.includes(form.marker), `leading path ${form.text} がentity routeでJev候補に入っていない`);
+    }
   });
 });
 
@@ -1259,6 +1364,100 @@ describe('M5 順位統合とJev投入量', () => {
   });
 });
 
+describe('M5 独立候補判定', () => {
+  it('overall relevanceと6つの独立Choiceを候補ごとに評価し、positiveをreason code・statement_statusを別fieldで残す', async () => {
+    const queryVector = basisVector(0, 1);
+    const selectByQuestion: JevChoiceSelector = (question) => {
+      const field = question.id.split(':')[0] ?? question.id;
+      switch (field) {
+        case 'candidate_relevance':
+          return 'useful';
+        case 'candidate_target_match':
+          return 'yes';
+        case 'candidate_similar_symptom_or_request':
+          return 'no';
+        case 'candidate_similar_constraints':
+          return 'yes';
+        case 'candidate_implementation_rationale':
+          return 'no';
+        case 'candidate_reusable_procedure':
+          return 'yes';
+        case 'candidate_statement_status':
+          return 'reported_verified';
+        default:
+          return undefined;
+      }
+    };
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, selectByQuestion) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const text = 'INDEPENDENT-CANDIDATE 独立判定の候補';
+    const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'independent-candidate',
+      content: text,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'INDEPENDENT-QUERY' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{
+      document_id?: string;
+      revision?: number;
+      relevance?: string;
+      relevance_kind?: string[];
+      statement_status?: string;
+      adopted?: boolean;
+      answers?: Record<string, { choice?: string; probabilities?: Record<string, number>; confidence?: number }>;
+    }>;
+    assert.equal(evaluations.length, 1, 'candidate_evaluationがない');
+    const evaluation = evaluations[0];
+    assert.equal(evaluation.document_id !== undefined, true);
+    assert.equal(evaluation.relevance, 'useful');
+    assert.deepEqual(evaluation.relevance_kind, ['target_match', 'similar_constraints', 'reusable_procedure']);
+    assert.equal(evaluation.statement_status, 'reported_verified');
+    assert.equal(evaluation.adopted, true);
+    const answers = evaluation.answers ?? {};
+    assert.equal(answers.overall?.choice, 'useful');
+    assert.equal(answers.statement_status?.choice, 'reported_verified');
+    for (const kind of [
+      'overall',
+      'target_match',
+      'similar_symptom_or_request',
+      'similar_constraints',
+      'implementation_rationale',
+      'reusable_procedure',
+      'statement_status',
+    ]) {
+      const answer = answers[kind];
+      assert.ok(answer, `${kind}のraw answerがない`);
+      const probabilities = answer.probabilities ?? {};
+      assert.ok(Object.keys(probabilities).length >= 2, `${kind}のprobabilitiesがない`);
+      const total = Object.values(probabilities).reduce((sum, value) => sum + value, 0);
+      assert.ok(Math.abs(total - 1) < 0.01, `${kind}のprobabilities合計が1でない`);
+      assert.ok(typeof answer.confidence === 'number' && answer.confidence >= 0 && answer.confidence <= 1);
+    }
+    const match = result.matches?.[0];
+    assert.equal(match?.relevance, 'useful');
+    assert.deepEqual(match?.relevance_kind, ['target_match', 'similar_constraints', 'reusable_procedure']);
+    assert.equal(match?.statement_status, 'reported_verified');
+    assert.equal(match?.claim_status, 'agent_reported', 'reported_verifiedをエージェント報告のclaim_statusへ格上げした');
+  });
+});
+
 describe('M5 no_match', () => {
   it('検索可能な公開文書がなければcompleted/no_matchにする', async () => {
     const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
@@ -1327,6 +1526,20 @@ describe('M5 no_match', () => {
     const result = await readStoredResult(pool, seeded.requestId);
     assert.equal(result.outcome, 'no_match');
     assert.equal(result.matches?.length ?? 0, 0, 'unrelated判定なのにmatchesがある');
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{
+      relevance?: string;
+      statement_status?: string;
+      adopted?: boolean;
+      answers?: Record<string, { choice?: string; probabilities?: Record<string, number>; confidence?: number }>;
+    }>;
+    assert.equal(evaluations.length, 1, 'no_matchでも判定済み候補のraw evaluationを残していない');
+    assert.equal(evaluations[0]?.relevance, 'unrelated');
+    assert.equal(evaluations[0]?.statement_status, 'unknown');
+    assert.equal(evaluations[0]?.adopted, false, 'no_match候補をadoptedにした');
+    const overall = evaluations[0]?.answers?.overall;
+    assert.ok(overall, 'no_match候補のoverall raw answerがない');
+    assert.ok(Object.keys(overall.probabilities ?? {}).length >= 2, 'no_match候補のprobabilitiesがない');
+    assert.ok(typeof overall.confidence === 'number', 'no_match候補のconfidenceがない');
     assert.equal(voyage.requests.filter((item) => item.body.input_type === 'query').length, 1, '候補取得のquery埋め込みをしていない');
     assert.ok(jev.requests.length >= 1, '候補ありなのにJev判定していない');
   });
@@ -1771,6 +1984,125 @@ describe('M5 stale inputの終端', () => {
   });
 });
 
+describe('M5 原文revisionの保存TX競合', () => {
+  it('改訂が先にcommitした場合は旧evidenceを保存せずno_matchにする', async () => {
+    const queryVector = basisVector(0, 1);
+    const gate = createExternalGate();
+    gate.armed = true;
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      gate,
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const candidateText = 'TOCTOU-CANDIDATE 改訂競合の候補';
+    const candidate = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text: candidateText });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'toctou-update-first',
+      content: candidateText,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: candidate.messageId, messageRevision: 1, startOffset: 0, endOffset: candidateText.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'TOCTOU-UPDATE-QUERY' });
+    const job = await claimExecuteJob(pool, seeded.jobId);
+    const processing = processJob(pool, job, config);
+    const entered = await waitForGateOrProcessing(gate, processing, EXTERNAL_WAIT_TIMEOUT_MS);
+    const holder = await pool.connect();
+    try {
+      await holder.query('BEGIN');
+      // 検索のsave TXをrequest rowで止め、その間に原文revisionの改訂を先にcommitさせる。
+      await holder.query('SELECT id FROM search_requests WHERE id = $1 FOR UPDATE', [seeded.requestId]);
+      if (entered) {
+        await advanceRevision(pool, candidate.messageId, '改訂後 TOCTOU-CANDIDATE-NEW');
+        gate.release();
+      }
+      await sleep(100);
+      await holder.query('COMMIT');
+    } finally {
+      holder.release();
+    }
+    await processing;
+    assert.ok(entered, 'Jev候補判定まで到達しなかった（競合順序を検証できない）');
+
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'no_match', '改訂先行なのに旧evidenceをmatched保存した');
+    const result = await readStoredResult(pool, seeded.requestId);
+    assert.equal(result.matches?.length ?? 0, 0);
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{ adopted?: boolean; answers?: unknown }>;
+    assert.equal(evaluations.length, 1, '競合時に判定記録を失った');
+    assert.equal(evaluations[0]?.adopted, false, '改訂済み候補をadoptedにした');
+  });
+
+  it('検索が先に共有lockを取った場合は改訂が検索commitまで待つ', async () => {
+    const queryVector = basisVector(0, 1);
+    const gate = createExternalGate();
+    gate.armed = true;
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      gate,
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const candidateText = 'TOCTOU-CANDIDATE 共有lockの候補';
+    const candidate = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text: candidateText });
+    const documentId = await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'toctou-search-first',
+      content: candidateText,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: candidate.messageId, messageRevision: 1, startOffset: 0, endOffset: candidateText.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'TOCTOU-SEARCH-QUERY' });
+    const holder = await pool.connect();
+    try {
+      await holder.query('BEGIN');
+      // publication rowを止め、検索をsource messageの共有lock取得後・commit前に待たせる。
+      await holder.query('SELECT document_id FROM document_publications WHERE document_id = $1 AND generation_id = $2 FOR UPDATE', [
+        documentId,
+        generation.id,
+      ]);
+      const job = await claimExecuteJob(pool, seeded.jobId);
+      const processing = processJob(pool, job, config);
+      const entered = await waitForGateOrProcessing(gate, processing, EXTERNAL_WAIT_TIMEOUT_MS);
+      assert.ok(entered, 'Jev候補判定まで到達しなかった（競合順序を検証できない）');
+      gate.release();
+
+      const probe = await probeMessageRevisionUpdate(pool, candidate.messageId, 4_000);
+      assert.equal(probe, 'blocked', '検索の共有lock中に原文revision更新が待たなかった');
+      await holder.query('COMMIT');
+      await processing;
+
+      const request = await readSearchRequest(pool, seeded.requestId);
+      assert.equal(request.status, 'completed');
+      assert.equal(request.outcome, 'matched', '検索先行なのにmatched保存できていない');
+      const result = await readStoredResult(pool, seeded.requestId);
+      const evidence = (result.matches?.[0]?.evidence ?? []).find((item) => item.message_id === candidate.messageId);
+      assert.ok(evidence, '検索先行の旧revision evidenceがない');
+      assert.equal(evidence.revision, 1);
+
+      await advanceRevision(pool, candidate.messageId, '検索commit後の改訂');
+      const message = await pool.query<{ current_revision: number }>('SELECT current_revision FROM messages WHERE id = $1', [
+        candidate.messageId,
+      ]);
+      assert.equal(message.rows[0]?.current_revision, 2, '検索commit後に改訂できない');
+    } finally {
+      holder.release();
+    }
+  });
+});
+
 describe('M5 世代固定と再検証', () => {
   it('active generationがprovider specと不一致ならfailed/embedding_generation_mismatchにし、no_matchにしない', async () => {
     const { jev, voyage, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct' });
@@ -1908,6 +2240,14 @@ describe('M5 世代固定と再検証', () => {
     const result = await readStoredResult(pool, seeded.requestId);
     assert.equal(result.matches?.length ?? 0, 0, '改訂後に無効evidenceを保存した');
     assert.ok(!JSON.stringify(result).includes('STALE-REV'), '改訂前の原文textを保存した');
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{
+      relevance?: string;
+      adopted?: boolean;
+      answers?: Record<string, { choice?: string; probabilities?: Record<string, number>; confidence?: number }>;
+    }>;
+    assert.equal(evaluations.length, 1, 'invalid候補の判定記録がない');
+    assert.equal(evaluations[0]?.adopted, false, 'invalid候補をadoptedとして保存した');
+    assert.ok(evaluations[0]?.answers?.overall, 'invalid候補のraw answersがない');
   });
 
   it('候補判定後にpublicationが消えたevidenceは保存しない', async () => {
