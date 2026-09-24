@@ -682,6 +682,24 @@ async function handleProcessError(pool: Pool, job: ClaimedJob, error: unknown): 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (job.kind === 'execute_search') {
+      // 外部待機中にjob identity/payloadが変わっていたら、旧ownerはjobもrequestも更新しない。
+      // 開始直後のinvalid UUID/NULL session等はsnapshotが一致するため従来どおりfailedにできる。
+      const identity = await client.query(
+        `SELECT 1 FROM jobs
+          WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()
+            AND target_revision IS NOT DISTINCT FROM $3
+            AND message_id IS NOT DISTINCT FROM $4
+            AND session_id IS NOT DISTINCT FROM $5
+            AND payload = $6::jsonb
+          FOR UPDATE`,
+        [job.id, job.leaseToken, job.targetRevision, job.messageId, job.sessionId, JSON.stringify(job.payload ?? {})],
+      );
+      if (identity.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return;
+      }
+    }
     if (error instanceof PolicyBlockedError) {
       const blocked = await blockJob(client, {
         jobId: job.id,
