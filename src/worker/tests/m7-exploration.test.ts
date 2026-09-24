@@ -119,14 +119,15 @@ function warningCodes(result: M7SearchResult): string[] {
 }
 
 // M7 session_links fixture。Redではtable不在のDBエラーで失敗し、migration要求を示す。
-async function insertActiveSessionLink(input: { fromSessionId: string; toSessionId: string; evidenceMessageId: string }): Promise<void> {
+async function insertActiveSessionLink(input: { fromSessionId: string; toSessionId: string; evidenceMessageId: string }): Promise<string> {
+  const id = uuidv7();
   await pool.query(
     `INSERT INTO session_links
        (id, company_id, project_id, from_session_id, to_session_id, evidence_message_id, evidence_revision,
         is_explicit, status, created_by_employee_id, idempotency_key, condition_hash)
      VALUES ($1, $2, $3, $4, $5, $6, 1, true, 'active', $7, $8, $9)`,
     [
-      uuidv7(),
+      id,
       workspace.companyId,
       workspace.projectId,
       input.fromSessionId,
@@ -137,6 +138,7 @@ async function insertActiveSessionLink(input: { fromSessionId: string; toSession
       'm7-condition',
     ],
   );
+  return id;
 }
 
 async function insertIssueEntity(documentId: string, entityKey = '#777'): Promise<void> {
@@ -432,6 +434,73 @@ describe('M7 evidence revision固定の明示link', () => {
   });
 });
 
+describe('M7 multi-hop明示linkの保存前再検証', () => {
+  it('起点linkが保存前にrevokeされたら終端Cと直接Bを落とす', async () => {
+    const gate = createExternalGate();
+    gate.armed = true;
+    const { config } = await startProviders({
+      jevResponder: async (request, rawBody) => {
+        // M5候補判定の後に走るM7推定探索のJev呼出しで止め、探索後・保存前の競合を作る。
+        if (gate.armed && rawBody.includes('m7_context_')) {
+          gate.armed = false;
+          gate.enter();
+          await gate.waitRelease();
+        }
+        return { body: jevReply(request, m7ChoiceSelector('positive')) };
+      },
+    });
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const startedAt = new Date('2026-09-21T00:00:00.000Z');
+    const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-primary' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, startedAt]);
+    const primaryText = 'PATH-SAVE-PRIMARY-ANSWER';
+    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: primaryText });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId: primarySession, sequenceNo: 3, text: 'QUERY-M7-PATH-SAVE' });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: primarySession,
+      documentKey: 'm7-path-save-primary-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+
+    const sessionB = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-b' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [sessionB, new Date(startedAt.getTime() + 60_000)]);
+    const bMessage = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 1, text: 'PATH-SAVE-B' });
+    const sessionC = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-c' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [sessionC, new Date(startedAt.getTime() + 2 * 60_000)]);
+    const cMessage = await seedMessage(pool, { sessionId: sessionC, sequenceNo: 1, text: 'PATH-SAVE-C' });
+    const linkAB = await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: sessionB, evidenceMessageId: bMessage.messageId });
+    await insertActiveSessionLink({ fromSessionId: sessionB, toSessionId: sessionC, evidenceMessageId: cMessage.messageId });
+    // 推定探索のJev呼出しを作るための隣接session。
+    const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-inferred' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [inferredSession, new Date(startedAt.getTime() + 3 * 60_000)]);
+    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: 'PATH-SAVE-INFERRED' });
+
+    const processing = runExecuteSearch(pool, { jobId: input.jobId, config });
+    const entered = await gate.waitForEntry(5_000);
+    assert.ok(entered, 'M7推定探索のJev呼出しに到達しなかった');
+    await pool.query("UPDATE session_links SET status = 'revoked', updated_at = now() WHERE id = $1", [linkAB]);
+    gate.release();
+    await processing;
+
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    const texts = evidenceTexts(relatedEvidence(match));
+    assert.ok(!texts.includes('PATH-SAVE-B'), `起点link revoke後も直接Bを保存している: ${JSON.stringify(texts)}`);
+    assert.ok(!texts.includes('PATH-SAVE-C'), `起点link revoke後も終端Cを保存している: ${JSON.stringify(texts)}`);
+  });
+});
+
 describe('M7 推定session候補', () => {
   it('同社員の前後各3sessionと共通Issue entityだけを候補にし、他社員の時間隣接を除外する', async () => {
     const { jev, config } = await startProviders();
@@ -646,6 +715,54 @@ describe('M7 revoke・changeの後続探索', () => {
     const ids = related.map((item) => item.message_id);
     assert.equal(new Set(ids).size, ids.length, 'related_evidenceに重複messageがある');
     assert.deepEqual(match.related_evidence_ids, [...new Set(ids)], 'related_evidence_idsが初出順の重複除去になっていない');
+  });
+
+  it('代表根拠の前後2以内にあるchange/revokeもcorrection metadataで返す', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace, { sourceSessionId: 'm7-adjacent-correction' });
+    const correctionMessage = await seedMessage(pool, { sessionId, sequenceNo: 1, text: 'ADJACENT-CORRECTION' });
+    const primaryText = 'PRIMARY-ADJACENT-ANSWER';
+    const primary = await seedMessage(pool, { sessionId, sequenceNo: 2, role: 'assistant', text: primaryText });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 4, text: 'QUERY-M7-ADJACENT' });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId,
+      documentKey: 'm7-adjacent-primary-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+    await seedRelation(pool, {
+      sourceMessageId: correctionMessage.messageId,
+      sourceRevision: 1,
+      targetMessageId: primary.messageId,
+      targetRevision: 1,
+      relation: 'change',
+    });
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    const items = relatedEvidence(match).filter((item) => item.text.includes('ADJACENT-CORRECTION'));
+    assert.equal(items.length, 1, `前後2以内のcorrectionが重複している: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+    const item = items[0] as M7Evidence;
+    assert.equal(item.source_kind, 'correction', 'correctionをneighborで上書きしている');
+    assert.equal(item.relation, 'change');
+    assert.equal(item.related_to_message_id, primary.messageId);
+    assert.equal(item.related_to_revision, 1);
+    assert.ok(
+      !relatedEvidence(match).some((entry) => entry.source_kind === 'neighbor' && entry.text.includes('ADJACENT-CORRECTION')),
+      'correction発言がneighborとして残っている',
+    );
   });
 });
 
