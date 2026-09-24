@@ -54,6 +54,20 @@ export interface FlushCollectorInput {
   token: string;
 }
 
+// このcollect呼出しのSQLite commitで新規追加またはrevision更新として確定したuser発言identity。
+// 本文・promptは含めず、通知のby-input照合に必要なidentityだけを返す。
+export interface ConfirmedUserInput {
+  sourceMessageId: string;
+  revision: number;
+  sequenceNo: number;
+  sourceScope: string;
+  projectId: string;
+}
+
+export interface CollectFromHookResult {
+  confirmedUserInputs: ConfirmedUserInput[];
+}
+
 function sha256Hex(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -225,6 +239,8 @@ interface IngestContext {
   nextSequence: number;
   sessionExists: boolean;
   held: boolean;
+  // このTXでcommit対象になったuser発言のidentity。rollback時はcollectFromHookが返さない。
+  confirmedUserInputs: Array<{ sourceMessageId: string; revision: number; sequenceNo: number }>;
   // 保留scanはTXごとrollbackするため、原因の固定code/offsetを別途保存できるよう保持する。
   heldDiagnostic: { code: string; byteOffset: number } | null;
 }
@@ -267,6 +283,9 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
       occurred_at: occurredAt,
       content_hash: contentHash,
     });
+    if (record.role === 'user') {
+      ctx.confirmedUserInputs.push({ sourceMessageId: record.source_message_id, revision, sequenceNo });
+    }
   } else {
     if (stored.role !== record.role || stored.occurred_at !== occurredAt) {
       recordDiagnostic(ctx.state, ctx.namespace, 'message_identity_conflict', byteOffset);
@@ -278,6 +297,9 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     sequenceNo = stored.sequence_no;
     revision = stored.revision + 1;
     updateStoredMessageRevision(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id, revision, contentHash);
+    if (record.role === 'user') {
+      ctx.confirmedUserInputs.push({ sourceMessageId: record.source_message_id, revision, sequenceNo });
+    }
   }
 
   // 区切り文字が識別子に含まれても組の境界が崩れないよう、配列をJSONとして直列化してhashする。
@@ -350,6 +372,8 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
 export interface IngestResult {
   held: boolean;
   projectId?: string;
+  // commitで確定したuser発言identity。rollback/保留時は未設定。
+  confirmedUserInputs?: Array<{ sourceMessageId: string; revision: number; sequenceNo: number }>;
 }
 
 // 指定transcriptの差分を1トランザクションでcursor・message・outbox・診断へ反映する。
@@ -423,6 +447,7 @@ export function ingestTranscript(
         nextSequence: session?.next_sequence ?? 1,
         sessionExists: session !== undefined,
         held: false,
+        confirmedUserInputs: [],
         heldDiagnostic: null,
       };
       const scan = scanLines({
@@ -473,7 +498,7 @@ export function ingestTranscript(
         skip_offset: scan.skipOffset,
       });
       state.db.exec('COMMIT');
-      return { held: false };
+      return { held: false, confirmedUserInputs: ctx.confirmedUserInputs };
     } finally {
       closeSync(fd);
     }
@@ -484,14 +509,14 @@ export function ingestTranscript(
 }
 
 // hookを契機にtranscriptの差分を読み、SQLiteへ保存して未送信分の送信を試みる。
-export async function collectFromHook(input: CollectFromHookInput): Promise<void> {
+export async function collectFromHook(input: CollectFromHookInput): Promise<CollectFromHookResult> {
   const namespace = collectorNamespace(input.config.api_url, input.token);
   const state = openCollectorState(input.config.state_dir);
   try {
     // 不正session_idは収集境界で拒否し、source/sessionを保存せず他のsessionの送信を妨げない。
     if (!isStorableIdentifier(input.hook.session_id)) {
       recordDiagnostic(state, namespace, 'session_invalid_identifier', NO_OFFSET);
-      return;
+      return { confirmedUserInputs: [] };
     }
     const repository = resolveRepositoryFromCwd(input.hook.cwd);
     const project = repository === null ? undefined : input.config.projects.find((candidate) => candidate.repository === repository);
@@ -505,7 +530,7 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<void
         )
         .run(namespace, input.source, input.hook.session_id, input.hook.transcript_path, input.hook.cwd);
       await deliverPending({ state, namespace, config: input.config, token: input.token, automatic: true, blockedProjects: new Set() });
-      return;
+      return { confirmedUserInputs: [] };
     }
     const result = ingestTranscript(state, {
       namespace,
@@ -515,9 +540,18 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<void
       projectId: project.project_id,
     });
     if (result.held) {
-      return;
+      return { confirmedUserInputs: [] };
     }
+    // commitで確定したidentityをここで固定し、deliverPendingのHTTP待機中の後続collectと混ぜない。
+    const confirmedUserInputs = (result.confirmedUserInputs ?? []).map((item) => ({
+      sourceMessageId: item.sourceMessageId,
+      revision: item.revision,
+      sequenceNo: item.sequenceNo,
+      sourceScope: repository,
+      projectId: project.project_id,
+    }));
     await deliverPending({ state, namespace, config: input.config, token: input.token, automatic: true, blockedProjects: new Set() });
+    return { confirmedUserInputs };
   } finally {
     closeCollectorState(state);
   }
