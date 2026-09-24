@@ -14,9 +14,11 @@ import {
   readJob,
   readRevision,
   readSearchRequest,
+  readUsageEvents,
   seedApproval,
   seedSession,
   seedUserMessage,
+  sleep,
   startFakeJev,
   usageEventRows,
   type FakeJevServer,
@@ -42,6 +44,24 @@ async function processLane(messageId: string, kind: 'classify_message' | 'route_
   const job = await claimJobForMessage(pool, kind, messageId);
   await processJob(pool, job, buildWorkerConfig(server.baseUrl));
   return job.id;
+}
+
+// job rowのlock待ちでrenewalのUPDATEが滞留していることをpg_stat_activityで観測する。
+async function waitForLeaseRenewalLockWait(timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'
+          AND query ILIKE '%UPDATE jobs%' AND query ILIKE '%lease_expires_at%' AND query NOT ILIKE '%pg_stat_activity%'`,
+    );
+    if (Number(result.rows[0]?.count ?? '0') > 0) {
+      return true;
+    }
+    await sleep(20);
+  }
+  return false;
 }
 
 describe('外部送信・障害', () => {
@@ -216,6 +236,72 @@ describe('外部送信・障害', () => {
       assert.equal(await retryJob(pool, jobId, buildWorkerConfig(server.baseUrl)), false, '未承認なのにretryが成功した');
       assert.equal((await readJob(pool, jobId)).status, 'blocked_policy');
       assert.equal(server.requests.length, 0);
+    } finally {
+      await server.close();
+    }
+  });
+  it('lease更新のDB待機中に承認が失効したら、送信せずblocked_policyにする', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '承認失効の競合確認' });
+    const server = await startFakeJev((request) => ({
+      body: jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })),
+    }));
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl, active: true });
+      const job = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
+      const blocker = await pool.connect();
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query('SELECT id FROM jobs WHERE id = $1 FOR UPDATE', [job.id]);
+        const processing = processJob(pool, job, config);
+        // 固定sleepで順序を偽証せず、renewalがlock待ちになったことを観測してから承認を失効させる。
+        assert.ok(await waitForLeaseRenewalLockWait(), 'lease更新がjob rowのlock待ちにならない');
+        await pool.query('UPDATE provider_policy_approvals SET active = false WHERE company_id = $1 AND endpoint = $2', [
+          workspace.companyId,
+          config.apiUrl,
+        ]);
+        await blocker.query('COMMIT');
+        await processing;
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => undefined);
+        blocker.release();
+      }
+      assert.equal((await readJob(pool, job.id)).status, 'blocked_policy', '承認失効後もlease更新を抜けて送信している');
+      assert.equal(server.requests.length, 0, 'lease待機中の承認失効後も外部送信している');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('応答契約不正では取得できた応答modelをusageへ記録し、応答なし失敗はNULLにする', async () => {
+    const broken = await seedUserMessage(pool, { workspace, sessionId: await seedSession(pool, workspace), sequenceNo: 1, text: '契約modelの確認' });
+    const unavailable = await seedUserMessage(pool, { workspace, sessionId: await seedSession(pool, workspace), sequenceNo: 1, text: '応答なし失敗の確認' });
+    const server = await startFakeJev((request, rawBody) => {
+      if (rawBody.includes('契約modelの確認')) {
+        return { body: { model: 'jev-broken-2', answers: {}, usage: { input_tokens: 3, output_tokens: 4 } } };
+      }
+      return { status: 503, body: { error: 'unavailable' } };
+    });
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl, active: true });
+      const brokenJob = await claimJobForMessage(pool, 'classify_message', broken.messageId);
+      await processJob(pool, brokenJob, config);
+      const unavailableJob = await claimJobForMessage(pool, 'classify_message', unavailable.messageId);
+      await processJob(pool, unavailableJob, config);
+      assert.equal((await readJob(pool, brokenJob.id)).status, 'failed');
+      assert.equal((await readJob(pool, unavailableJob.id)).status, 'pending');
+
+      const usage = await readUsageEvents(pool, workspace.companyId);
+      const brokenRow = usage.find((row) => row.error_code === 'provider_contract_invalid');
+      assert.ok(brokenRow, '契約不正のusageが記録されていない');
+      assert.equal(brokenRow.model, 'jev-latest', '要求modelを保持していない');
+      assert.equal(brokenRow.response_model, 'jev-broken-2', '検証失敗時に取得できた応答modelを記録していない');
+      const unavailableRow = usage.find((row) => row.error_code === 'provider_unavailable');
+      assert.ok(unavailableRow, '応答なし失敗のusageが記録されていない');
+      assert.equal(unavailableRow.model, 'jev-latest');
+      assert.equal(unavailableRow.response_model, null, '応答なし失敗で応答modelを埋めている');
     } finally {
       await server.close();
     }
