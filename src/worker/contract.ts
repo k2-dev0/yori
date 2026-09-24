@@ -75,7 +75,7 @@ export const RELATION_ACTIONS = ['accept', 'reject', 'revoke', 'change'] as cons
 export type RelationAction = (typeof RELATION_ACTIONS)[number];
 
 // 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
-export const JEV_QUESTIONS_VERSION = 'm3-1';
+export const JEV_QUESTIONS_VERSION = 'm3-2';
 
 // partごとに独立して質問するfield。検索振り分けもpart単位で確認して集約する。
 export const JEV_PART_FIELDS = [
@@ -96,6 +96,11 @@ export function jevQuestionId(field: JevPartField, partIndex?: number): string {
 
 export function jevTechnicalLabelQuestionId(label: TechnicalLabel, partIndex: number): string {
   return `technical_label:${label}${JEV_PART_SEPARATOR}${partIndex}`;
+}
+
+// 候補専用のrelation_explicit質問ID。候補message IDとpart indexで呼出し内に一意にし、意味はinstructionsで示す。
+export function jevRelationExplicitQuestionId(candidateId: string, partIndex: number): string {
+  return `${JEV_RELATION_EXPLICIT_QUESTION_ID}:${candidateId}${JEV_PART_SEPARATOR}${partIndex}`;
 }
 
 // 公式契約のQuestion本体はIDを持たず、request.questionsのmap keyが質問IDになる。
