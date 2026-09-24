@@ -122,7 +122,7 @@ token予算はprimary evidenceを除く追加候補の採用判定に使う。pr
 
 ## 補助通知
 
-collector CLIへ通知用commandを追加し、既存のcollect処理を実行してから、その呼出しで確定できた最新のuser message identityに対する検索結果を取得する。
+collector CLIへ`notify --source codex|claude_code --config <path>`を追加し、既存のcollect処理を実行してから、その呼出しで確定できた最新のuser message identityに対する検索結果を取得する。
 
 - `GET /v1/searches/by-input`を外部identityで呼び、1回最大5秒・累計最大10秒だけ待つ。
 - `status=completed`の`matched`・`no_match`・`skipped`、または`status=failed`の結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。失敗時の`outcome`は既存契約どおりnullのまま、`status`と`error_code`を通知する。
