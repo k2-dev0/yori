@@ -35,7 +35,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## 保存と競合
 
-- 外部待ち後の保存TXでjob lease/token/期限に加えてjob message/session/payload、受付のinput identity・会社・案件・社員・session・search action、input current revision、publication、文書検索可否、全sourceのcurrent revisionをDB現在値から再検証する。sourceの`messages`行は確認時からcommitまで共有lockし、改訂との確定順序をDBで固定する。
+- 外部待ち後は成功・provider障害の両経路でjob identity/payloadをDB現在値から再検証する。成功の保存TXではさらに受付のinput identity・会社・案件・社員・session・search action、input messageのsession・sequence、session employee、project/company、current revision、publication、文書検索可否、全sourceのcurrent revisionを再確認する。inputのmessage/session/projectとsourceの`messages`行は確認時からcommitまで共有lockし、所属変更・改訂との確定順序をDBで固定する。
 - 有効な代表候補だけ、原文message ID・revision・社員・role・日時・本文をevidenceへ保存する。assistant/agent_report由来は`agent_reported`とし、ツール実証済みとは表現しない。
 - 候補sourceのrevision変更やpublication削除は候補を無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerがjob・受付を更新しない。
 - input自身が改訂された古い検索は、外部送信前または保存TXで当該受付だけを`expired/input_revision_stale`へし、jobをcompletedにする。新revisionの結果として流用しない。
