@@ -239,4 +239,35 @@ describe('長文と応答検証', () => {
       await server.close();
     }
   });
+  it('partごとに異なる応答modelは重複除去した出現順の配列でmodel_versionへ保存する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const original = '😀日本語テキスト'.repeat(700);
+    const current = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: original });
+    let call = 0;
+    const server = await startFakeJev((request) => {
+      call += 1;
+      return {
+        body: {
+          ...jevReply(request, jevChoices({ retention: 'substantive' })),
+          model: call % 2 === 1 ? 'model-a' : 'model-b',
+        },
+      };
+    });
+    try {
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: buildWorkerConfig(server.baseUrl).apiUrl });
+      await processClassify(current.messageId, server.baseUrl);
+      assert.ok(server.requests.length >= 2, '複数partへ分割されていない');
+
+      const analysis = await readAnalysis(pool, current.messageId, 1);
+      assert.ok(analysis, 'message_analysisが保存されていない');
+      assert.equal(analysis.model_version, JSON.stringify(['model-a', 'model-b']), '混在modelの重複除去配列になっていない');
+      assert.deepEqual(
+        analysis.parts.map((part) => part.model_version),
+        server.requests.map((_, index) => (index % 2 === 0 ? 'model-a' : 'model-b')),
+        'partごとの応答modelが出現順に保存されていない',
+      );
+    } finally {
+      await server.close();
+    }
+  });
 });
