@@ -664,6 +664,65 @@ describe('M7 結果取得時の再検証', () => {
     assert.equal(correctionItem.related_to_message_id, primary.messageId);
   });
 
+  it('予算採用でneighborが落ちた保存resultでもcorrectionがprimary relationを覆えばGET matchedを返す', async () => {
+    const input = await seedSessionWithMessage('m7-budget-get-input', 1, 'BUDGET-GET-INPUT', 'user');
+    const primary = await seedSessionWithMessage('m7-budget-get-primary', 2, 'BUDGET-GET-PRIMARY');
+    const correction = await insertMessage(pool, {
+      sessionId: primary.sessionId,
+      sourceMessageId: 'msg-m7-budget-get-correction',
+      sequenceNo: 3,
+      role: 'assistant',
+      text: 'BUDGET-GET-CORRECTION',
+    });
+    await insertRelation(correction.messageId, primary.messageId, 'change');
+    const requestId = uuidv7();
+    await insertSearchRequest({
+      requestId,
+      sessionId: input.sessionId,
+      inputMessageId: input.messageId,
+      inputRevision: 1,
+      inputSequenceNo: 1,
+      result: directResult({
+        requestId,
+        inputId: input.messageId,
+        inputRevision: 1,
+        projectId: workspace.projectId,
+        evidence: [
+          {
+            messageId: primary.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:00:00.000Z',
+            text: 'BUDGET-GET-PRIMARY',
+            sourceKind: 'neighbor',
+          },
+        ],
+        related: [
+          {
+            messageId: correction.messageId,
+            revision: 1,
+            employeeId: workspace.employeeId,
+            role: 'assistant',
+            occurredAt: '2026-09-21T01:01:00.000Z',
+            text: 'BUDGET-GET-CORRECTION',
+            sourceKind: 'correction',
+            relation: 'change',
+            relatedToMessageId: primary.messageId,
+            relatedToRevision: 1,
+          },
+        ],
+      }),
+    });
+    const response = await getSearchById(app, { token: workspace.token, id: requestId });
+    const body = response.json<DirectMatchBody>();
+    assert.equal(body.outcome, 'matched');
+    assert.ok(body.matches?.[0]?.evidence?.some((item) => item.message_id === primary.messageId), '元根拠がない');
+    const correctionItem = (body.matches?.[0]?.related_evidence ?? []).find((item) => item.text === 'BUDGET-GET-CORRECTION');
+    assert.ok(correctionItem, 'correction relatedがない');
+    assert.equal(correctionItem.relation, 'change');
+  });
+
   it('保存後に元根拠への未収録change relationが追加されたらno_matchにする', async () => {
     const fixture = await seedRevalidationFixture();
     const extra = await seedSessionWithMessage('m7-reval-extra', 1, 'REVAL-EXTRA', 'user');
