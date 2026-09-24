@@ -16,7 +16,7 @@ import {
   sha256Bytes,
   type WorkspaceFixture,
 } from '../../db/tests/fixtures.js';
-import { BUILD_DOCUMENTS_PRIORITY, claimJobs, enqueueJob, type ClaimedJob } from '../../jobs/queue.js';
+import { BUILD_DOCUMENTS_PRIORITY, claimJobs, enqueueJob, recoverExpiredJobs, type ClaimedJob } from '../../jobs/queue.js';
 import { loadWorkerConfig, type WorkerConfig } from '../config.js';
 import {
   CHUNK_MAX_TOKENS,
@@ -28,6 +28,7 @@ import {
 } from '../contract.js';
 import { applyDocumentPlan, loadSessionMessages, planDocumentChunks } from '../documents.js';
 import { ensureActiveGeneration, VoyageEmbeddingProvider } from '../embedding.js';
+import { LeaseLostError, StaleApplyError } from '../errors.js';
 import { processJob, retryJob } from '../process.js';
 import { loadVoyageTokenizer } from '../tokenizer.js';
 import { runWorker } from '../runner.js';
@@ -462,6 +463,27 @@ async function waitUntil(condition: () => boolean | Promise<boolean>, timeoutMs:
   return false;
 }
 
+// 最大prefixがtargetトークンちょうどになる固定fixture。1文字追加ごとにトークン数が1増える単純な語列を使う。
+const TOKEN_FIXTURE_BASE = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu '.repeat(500);
+
+function exactTokenText(tokenizer: { encode: (text: string) => { ids: number[] } }, target: number): string {
+  let low = 1;
+  let high = TOKEN_FIXTURE_BASE.length;
+  let best = 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    if (tokenizer.encode(TOKEN_FIXTURE_BASE.slice(0, middle)).ids.length <= target) {
+      best = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  const text = TOKEN_FIXTURE_BASE.slice(0, best);
+  assert.equal(tokenizer.encode(text).ids.length, target, `token数${target}のfixture文字列を作れない`);
+  return text;
+}
+
 // ---- M4 schema reader（未実装tableはassertで理由を明示する） ----
 
 const M4_TABLES = [
@@ -591,6 +613,7 @@ interface SourceSpan {
   start: number;
   end: number;
   displayOrder: number;
+  sourceKind: string;
 }
 
 async function readSources(pool: Pool): Promise<SourceSpan[]> {
@@ -605,6 +628,7 @@ async function readSources(pool: Pool): Promise<SourceSpan[]> {
       start: pickNumber(row, ['start_offset', 'start_utf16', 'start'], 'search_document_sourcesのstart'),
       end: pickNumber(row, ['end_offset', 'end_utf16', 'end', 'stop'], 'search_document_sourcesのend'),
       displayOrder: pickNumber(row, ['display_order', 'source_order', 'ordinal', 'order_index'], 'search_document_sources.display_order'),
+      sourceKind: pickString(row, ['source_kind', 'kind'], 'search_document_sources.source_kind'),
     }))
     .sort(
       (a, b) =>
@@ -1245,6 +1269,90 @@ describe('M4 progress_onlyの索引除外', () => {
       );
     }
   });
+
+  it('非先頭sourceのprogress_only再分類はVoyage未承認でも旧publicationを残さず、成功時に再作成する', async () => {
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '先頭に残る設計メモ' });
+    const second = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: '非先頭でprogress_onlyへ再分類される実装メモ',
+    });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: first.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: second.buildJobId, config })).status,
+      'completed',
+      '後続のbuild_documentsがcompletedでない',
+    );
+    const document = (await readDocuments(pool, workspace.projectId))[0];
+    assert.ok(document, 'A+Bの公開文書がない');
+    assert.ok(
+      (await readPublications(pool, workspace.projectId)).some(
+        (publication) => publication.documentId === document.id && !publication.stale,
+      ),
+      'A+Bの公開publicationがない',
+    );
+
+    // 非先頭Bだけをprogress_onlyへ再分類し、Voyage未承認のまま再buildする。
+    await upsertAnalysis(pool, {
+      messageId: second.messageId,
+      revision: second.revision,
+      retention: 'progress_only',
+      isSearchable: false,
+    });
+    await pool.query(
+      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      [workspace.companyId, VOYAGE_PROVIDER],
+    );
+    const requestsBefore = server.requests.length;
+    await reopenJob(pool, second.buildJobId);
+    const blocked = await runBuildJob(pool, { buildJobId: second.buildJobId, config });
+    assert.equal(blocked.status, 'blocked_policy', `未承認の再buildがblocked_policyでない: ${blocked.status}/${blocked.errorCode ?? ''}`);
+    assert.equal(server.requests.length, requestsBefore, 'Voyage未承認なのに送信している');
+
+    const blockedDocument = (await readDocuments(pool, workspace.projectId)).find((item) => item.id === document.id);
+    assert.ok(blockedDocument, '再分類後もdocumentが消えた');
+    assert.equal(blockedDocument.isSearchable, true, '新desired revision用のis_searchableがfalseになった');
+    assert.ok(blockedDocument.desiredRevision > document.desiredRevision, 'desired_revisionが進んでいない');
+    assert.equal(
+      (await readPublications(pool, workspace.projectId)).filter((publication) => publication.documentId === document.id).length,
+      0,
+      'Bを含む旧publicationが即時検索不能になっていない',
+    );
+
+    // 承認を戻してretryすると、Bを含まない新revisionが公開される。
+    await pool.query(
+      `UPDATE provider_policy_approvals SET active = true, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      [workspace.companyId, VOYAGE_PROVIDER],
+    );
+    assert.equal(await retryJob(pool, second.buildJobId, config), true, 'Voyage承認後にretryできない');
+    const retried = await runBuildJob(pool, { buildJobId: second.buildJobId, config });
+    assert.equal(retried.status, 'completed', `retry後のbuild_documentsがcompletedでない: ${retried.status}/${retried.errorCode ?? ''}`);
+    const publication = (await readPublications(pool, workspace.projectId)).find(
+      (item) => item.documentId === document.id && !item.stale,
+    );
+    assert.ok(publication, '成功後にpublicationが再作成されていない');
+    assert.equal(publication.revision, blockedDocument.desiredRevision, '再作成された公開revisionがdesired_revisionと違う');
+    const publishedTexts = (await readRevisions(pool))
+      .filter((revision) => revision.documentId === document.id && revision.revision === publication.revision)
+      .map((revision) => revision.text);
+    assert.ok(
+      publishedTexts.some((text) => compact(text).includes(compact(first.text))),
+      '先頭Aの原文が公開revisionにない',
+    );
+    for (const text of publishedTexts) {
+      assert.ok(
+        !compact(text).includes(compact(second.text)),
+        'progress_onlyへ再分類されたBが公開revisionに残っている',
+      );
+    }
+  });
 });
 
 describe('M4 VoyageEmbeddingProviderの送信契約と応答検証', () => {
@@ -1873,6 +1981,108 @@ describe('M4 Green追加契約', () => {
     }
   });
 
+  it('改行なしの長文も全chunkが上限内で正のoverlapを持ち、chunk全体を複製しない', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const tokenizer = await loadVoyageTokenizer();
+    const words = Array.from({ length: 4_000 }, (_, index) => `token${String(index).padStart(4, '0')}`);
+    const text = words.join(' ');
+    assert.ok(!text.includes('\n'), 'fixtureに改行がある');
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(run.status, 'completed', `改行なし長文のbuild_documentsがcompletedでない: ${run.status}/${run.errorCode ?? ''}`);
+
+    const revisions = await readRevisions(pool);
+    assert.ok(revisions.length >= 2, `改行なし長文が複数chunkへ分割されていない: ${revisions.length}`);
+    for (const [index, revision] of revisions.entries()) {
+      const count = tokenizer.encode(revision.text).ids.length;
+      assert.ok(count > 0, `chunk ${index} が空`);
+      assert.ok(
+        count + VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE <= CHUNK_MAX_TOKENS,
+        `chunk ${index} が上限1200+prefix予約を超える: ${count}`,
+      );
+    }
+
+    const spans = await readSources(pool);
+    const messageSpans = spans.filter((span) => span.messageId === message.messageId && span.messageRevision === message.revision);
+    assertCoverage(messageSpans, text.length, '改行なし長文');
+
+    const groups = new Map<string, SourceSpan[]>();
+    for (const span of messageSpans) {
+      const key = revisionKey(span.documentId, span.revision);
+      groups.set(key, [...(groups.get(key) ?? []), span]);
+    }
+    const ordered = [...groups.values()]
+      .map((revisionSpans) => ({
+        start: Math.min(...revisionSpans.map((span) => span.start)),
+        end: Math.max(...revisionSpans.map((span) => span.end)),
+        total: totalSpanLength(revisionSpans),
+      }))
+      .sort((left, right) => left.start - right.start);
+    assert.ok(ordered.length >= 2, `source rangeから複数chunkを確認できない: ${ordered.length}`);
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      const overlap = previous.end - current.start;
+      assert.ok(overlap > 0, `隣接chunkに正のoverlapがない: ${current.start} >= ${previous.end}`);
+      assert.ok(overlap < Math.min(previous.total, current.total), '隣接chunkがchunk全体を複製している');
+    }
+  });
+
+  it('短い複数partのoverlapと上限近いatomの組合せでもwindowを破棄せず正のoverlapを保つ', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const tokenizer = await loadVoyageTokenizer();
+    const paragraph = exactTokenText(tokenizer, 50);
+    const longPiece = exactTokenText(tokenizer, 1067);
+    const longLine = [longPiece, longPiece, longPiece].join(' ');
+    const text = `${paragraph}\n\n${paragraph}\n\n${longLine}`;
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(run.status, 'completed', `複数part overlap fixtureのbuild_documentsがcompletedでない: ${run.status}/${run.errorCode ?? ''}`);
+
+    const revisions = await readRevisions(pool);
+    assert.ok(revisions.length >= 3, `複数part overlap fixtureが複数chunkへ分割されていない: ${revisions.length}`);
+    for (const [index, revision] of revisions.entries()) {
+      const count = tokenizer.encode(revision.text).ids.length;
+      assert.ok(count > 0, `chunk ${index} が空`);
+      assert.ok(
+        count + VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE <= CHUNK_MAX_TOKENS,
+        `chunk ${index} が上限1200+prefix予約を超える: ${count}`,
+      );
+    }
+
+    const spans = await readSources(pool);
+    const messageSpans = spans.filter((span) => span.messageId === message.messageId && span.messageRevision === message.revision);
+    assertCoverage(messageSpans, text.length, '複数part overlap fixture');
+
+    const groups = new Map<string, SourceSpan[]>();
+    for (const span of messageSpans) {
+      const key = revisionKey(span.documentId, span.revision);
+      groups.set(key, [...(groups.get(key) ?? []), span]);
+    }
+    const ordered = [...groups.values()]
+      .map((revisionSpans) => ({
+        start: Math.min(...revisionSpans.map((span) => span.start)),
+        end: Math.max(...revisionSpans.map((span) => span.end)),
+        total: totalSpanLength(revisionSpans),
+        overlapSources: revisionSpans.filter((span) => span.sourceKind === 'overlap').length,
+      }))
+      .sort((left, right) => left.start - right.start);
+    assert.ok(ordered.length >= 3, `source rangeから複数chunkを確認できない: ${ordered.length}`);
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      const overlap = previous.end - current.start;
+      assert.ok(overlap > 0, `隣接chunkに正のoverlapがない: ${current.start} >= ${previous.end}`);
+      assert.ok(overlap < Math.min(previous.total, current.total), '隣接chunkがchunk全体を複製している');
+    }
+    assert.ok(
+      ordered.some((group) => group.overlapSources >= 2),
+      '複数partからなるoverlap windowが保持されていない',
+    );
+  });
+
   it('active generationがconfigとspec不一致なら自動切替せず恒久エラーにする', async () => {
     const server = await startFakeVoyage(defaultVoyageResponder);
     openServers.push(server);
@@ -2187,9 +2397,23 @@ describe('M4 監査修正契約', () => {
     const edited = '別jobが置換した本文';
     const editedRevision = await advanceRevision(pool, message.messageId, edited);
     await upsertAnalysis(pool, { messageId: message.messageId, revision: editedRevision });
-    const messages = await loadSessionMessages(pool, sessionId);
-    const chunks = await planDocumentChunks(sessionId, messages);
-    await applyDocumentPlan(pool, { companyId: workspace.companyId, projectId: workspace.projectId, sessionId }, chunks);
+    const replacementJobId = await enqueueBuildJob(pool, {
+      sessionId,
+      messageId: message.messageId,
+      revision: editedRevision,
+      retention: 'substantive',
+      isSearchable: true,
+    });
+    const replacementJob = await claimBuildJob(pool, replacementJobId);
+    const plan = await loadSessionMessages(pool, sessionId);
+    const chunks = await planDocumentChunks(sessionId, plan.messages);
+    await applyDocumentPlan(
+      pool,
+      replacementJob,
+      { companyId: workspace.companyId, projectId: workspace.projectId, sessionId },
+      plan.snapshot,
+      chunks,
+    );
 
     gate.resolve();
     await processing;
@@ -2287,6 +2511,94 @@ describe('M4 監査修正契約', () => {
         (publication) => publication.documentId === failedRevision.documentId && !publication.stale,
       ),
       'retry後に文書が公開されていない',
+    );
+  });
+
+  it('snapshot後に停止した旧workerのapplyDocumentPlanは、lease回収後の別workerの公開を上書きしない', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '旧workerが見た先頭本文' });
+    const second = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: '旧workerが見た後続本文',
+    });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: first.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: second.buildJobId, config })).status,
+      'completed',
+      '後続のbuild_documentsがcompletedでない',
+    );
+
+    // 旧workerがsnapshotを取得して停止する。
+    await reopenJob(pool, second.buildJobId);
+    const staleJob = await claimBuildJob(pool, second.buildJobId);
+    const stale = await loadSessionMessages(pool, sessionId);
+    const staleChunks = await planDocumentChunks(sessionId, stale.messages);
+
+    // lease期限切れで回収し、回収後の同じjobを別workerが処理できる状態にする。
+    await pool.query(`UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1`, [staleJob.id]);
+    assert.equal(await recoverExpiredJobs(pool), 1, 'lease期限切れjobを回収できない');
+
+    // 別workerが編集後のsessionを構築・公開する。
+    const edited = '別workerが公開する編集後の先頭本文';
+    const revision2 = await advanceRevision(pool, first.messageId, edited);
+    await upsertAnalysis(pool, { messageId: first.messageId, revision: revision2 });
+    const takeover = await claimBuildJob(pool, second.buildJobId);
+    await processJob(pool, takeover, config);
+    assert.equal((await readJob(pool, second.buildJobId)).status, 'completed', '回収後の別workerがjobを完了していない');
+    assert.ok(
+      (await readRevisions(pool)).some((revision) => compact(revision.text).includes(compact(edited))),
+      '別workerが編集後の本文を公開していない',
+    );
+    const afterTakeover = await snapshotSearchState(pool, workspace.projectId);
+
+    // snapshot後に停止した旧workerが同じjobで計画適用へ進んでも、文書状態を変えない。
+    await assert.rejects(
+      applyDocumentPlan(
+        pool,
+        staleJob,
+        { companyId: workspace.companyId, projectId: workspace.projectId, sessionId },
+        stale.snapshot,
+        staleChunks,
+      ),
+      (error: unknown) => error instanceof LeaseLostError,
+      'leaseを失った旧workerの計画適用が拒否されない',
+    );
+    assert.deepEqual(
+      await snapshotSearchState(pool, workspace.projectId),
+      afterTakeover,
+      'lease喪失後の旧workerが文書状態を上書きした',
+    );
+
+    // leaseが有効なままsession snapshotだけが変わった場合も、書込前に拒否して状態を変えない。
+    const third = await seedSearchableMessage(pool, { sessionId, sequenceNo: 3, text: 'snapshot不一致を検出する追記' });
+    const inconsistentJob = await claimBuildJob(pool, third.buildJobId);
+    const beforeEdit = await loadSessionMessages(pool, sessionId);
+    const beforeChunks = await planDocumentChunks(sessionId, beforeEdit.messages);
+    const revision3 = await advanceRevision(pool, first.messageId, `${edited} さらに編集`);
+    await upsertAnalysis(pool, { messageId: first.messageId, revision: revision3 });
+    const beforeSnapshotMismatchApply = await snapshotSearchState(pool, workspace.projectId);
+    await assert.rejects(
+      applyDocumentPlan(
+        pool,
+        inconsistentJob,
+        { companyId: workspace.companyId, projectId: workspace.projectId, sessionId },
+        beforeEdit.snapshot,
+        beforeChunks,
+      ),
+      (error: unknown) => error instanceof StaleApplyError,
+      'session snapshot不一致の計画適用が拒否されない',
+    );
+    assert.deepEqual(
+      await snapshotSearchState(pool, workspace.projectId),
+      beforeSnapshotMismatchApply,
+      'snapshot不一致の旧workerが文書状態を上書きした',
     );
   });
 });
