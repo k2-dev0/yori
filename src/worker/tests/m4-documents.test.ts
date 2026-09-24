@@ -2366,8 +2366,81 @@ describe('M4 Green追加契約', () => {
 
     assert.equal(run.status, 'failed', `spec不一致がfailedにならない: ${run.status}`);
     assert.equal(run.errorCode, 'embedding_generation_mismatch', `spec不一致のerror_codeが違う: ${run.errorCode ?? ''}`);
+    // 文書planは世代spec検証より先にTXで確定するため、未公開のpending revisionだけが作られる。
+    const documents = await readDocuments(pool, workspace.projectId);
+    assert.ok(documents.length >= 1, 'spec不一致で文書計画が保存されていない');
+    const revisions = await readRevisions(pool);
+    assert.ok(revisions.length >= 1, 'spec不一致でpending revisionが作られていない');
+    assert.ok(
+      revisions.every((revision) => revision.status === 'pending'),
+      `spec不一致でpending以外のrevisionが作られた: ${revisions.map((revision) => revision.status).join(',')}`,
+    );
     assert.equal(server.requests.length, 0, 'spec不一致なのにVoyageへ送信している');
     assert.equal((await readPublications(pool, workspace.projectId)).length, 0, 'spec不一致で文書が公開された');
+  });
+
+  it('世代spec不一致でもprogress_only除外の文書planを先に反映し、旧publicationを即時削除する', async () => {
+    const { server, config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '世代不一致でも残る先頭A' });
+    const second = await seedSearchableMessage(pool, {
+      sessionId,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: 'build前にprogress_onlyとなる非先頭B',
+    });
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: first.buildJobId, config })).status,
+      'completed',
+      '最初のbuild_documentsがcompletedでない',
+    );
+    assert.equal(
+      (await runBuildJob(pool, { buildJobId: second.buildJobId, config })).status,
+      'completed',
+      '後続のbuild_documentsがcompletedでない',
+    );
+    const document = (await readDocuments(pool, workspace.projectId))[0];
+    assert.ok(document, 'A+Bの公開文書がない');
+    const publicationBefore = (await readPublications(pool, workspace.projectId)).find(
+      (publication) => publication.documentId === document.id && !publication.stale,
+    );
+    assert.ok(publicationBefore, 'A+Bの公開publicationがない');
+
+    // 非先頭Bだけをprogress_onlyへ再分類し、Aの原文・analysisは変えない。
+    await upsertAnalysis(pool, {
+      messageId: second.messageId,
+      revision: second.revision,
+      retention: 'progress_only',
+      isSearchable: false,
+    });
+
+    // 既存active generationと異なるaccountのconfigでbuildする。
+    const mismatchConfig = loadM4WorkerConfig(config.voyageApiUrl, { VOYAGE_ACCOUNT_REF: 'other-voyage-account' });
+    const requestsBefore = server.requests.length;
+    await reopenJob(pool, second.buildJobId);
+    const run = await runBuildJob(pool, { buildJobId: second.buildJobId, config: mismatchConfig });
+    assert.equal(run.status, 'failed', `世代不一致がfailedにならない: ${run.status}`);
+    assert.equal(run.errorCode, 'embedding_generation_mismatch', `世代不一致のerror_codeが違う: ${run.errorCode ?? ''}`);
+    assert.equal(server.requests.length, requestsBefore, '世代不一致でVoyageへ送信している');
+
+    const afterDocument = (await readDocuments(pool, workspace.projectId)).find((item) => item.id === document.id);
+    assert.ok(afterDocument, '再分類後にdocument行が消えた');
+    assert.equal(afterDocument.isSearchable, true, '新desired revision用のis_searchableがfalseになった');
+    assert.equal(afterDocument.desiredRevision, publicationBefore.revision + 1, 'desired_revisionが進んでいない');
+    assert.equal(
+      (await readPublications(pool, workspace.projectId)).filter((publication) => publication.documentId === document.id).length,
+      0,
+      '世代不一致時にprogress_onlyのBを含む旧publicationが残っている',
+    );
+    const newRevision = (await readRevisions(pool)).find(
+      (revision) => revision.documentId === document.id && revision.revision === afterDocument.desiredRevision,
+    );
+    assert.ok(newRevision, '新しいdesired revisionがない');
+    assert.equal(newRevision.status, 'pending', '新しいdesired revisionがpendingでない');
+    assert.ok(compact(newRevision.text).includes(compact(first.text)), '先頭Aの原文が新revisionにない');
+    assert.ok(!compact(newRevision.text).includes(compact(second.text)), 'progress_onlyのBが新revisionに残っている');
+    assert.equal(await messageRevisionText(pool, first.messageId, first.revision), first.text, 'Aの原文が消えた');
+    assert.equal(await messageRevisionText(pool, second.messageId, second.revision), second.text, 'Bの原文が消えた');
   });
 
   it('承認失効後はcache hit可能でもHTTPを送らずblocked_policyにし、cacheから公開しない', async () => {
@@ -2512,6 +2585,11 @@ describe('M4 監査修正契約', () => {
       assert.equal(run.status, 'failed', `${status}世代がfailedにならない: ${run.status}`);
       assert.equal(run.errorCode, 'embedding_generation_mismatch', `${status}世代のerror_codeが違う: ${run.errorCode ?? ''}`);
       assert.equal(server.requests.length, 0, `${status}世代なのにVoyageへ送信している`);
+      const revisions = await readRevisions(pool);
+      assert.ok(
+        revisions.length >= 1 && revisions.every((revision) => revision.status === 'pending'),
+        `${status}世代で未公開のpending revisionが作られていない: ${revisions.map((revision) => revision.status).join(',')}`,
+      );
       assert.equal((await readPublications(pool, workspace.projectId)).length, 0, `${status}世代で文書が公開された`);
     });
   }
