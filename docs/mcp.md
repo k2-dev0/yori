@@ -44,7 +44,7 @@ MCPホストには、リポジトリ直下で`npm run --silent mcp:start`を起�
 
 `get_search_result`の`wait_ms`は1回0〜5000ms。エージェント側の初期待機予算は累計10秒とし、期限後も中央の検索jobは継続する。処理中を`no_match`と扱わない。
 
-M7のmatched結果は代表根拠に加え、前後発言、後続の訂正・撤回、明示またはJevで採用した引き継ぎ先を`related_evidence`で返す。探索は最大3 hop・合計10 session・追加context約6,000 tokenで打ち切り、未探索部分があれば`truncated`とwarningを返す。結果取得時にも原文revision、案件、relation、activeなsession linkを再確認する。
+M7のmatched結果は代表根拠に加え、前後発言、後続の訂正・撤回、明示またはJevで採用した引き継ぎ先を`related_evidence`で返す。同じ訂正発言が複数根拠を対象にする場合は、原文を重複させず`relations`配列へ全関係を保持する。探索は最大3 hop・合計10 session・追加context約6,000 tokenで打ち切り、未探索部分があれば`truncated`とwarningを返す。結果取得時にも原文revision、案件、relation、activeなsession linkを再確認する。
 
 ## セッション引き継ぎ
 
