@@ -397,29 +397,76 @@ async function revalidateRelatedItem(
       return null;
     }
   } else if (sourceKind === 'explicit_session_link') {
-    const linkId = item._link_id;
-    if (typeof linkId !== 'string') {
+    // 起点primary sessionからの全link経路を検証し、1辺でも無効なら落とす。
+    const linkIdsRaw = item._link_ids;
+    if (!Array.isArray(linkIdsRaw)) {
       return null;
     }
-    const link = await pool.query(
-      `SELECT 1
-         FROM session_links l
-         JOIN messages em ON em.id = l.evidence_message_id
-         JOIN sessions es ON es.id = em.session_id
-         JOIN projects ep ON ep.id = es.project_id
-        WHERE l.id = $1 AND l.status = 'active' AND l.company_id = $2 AND l.project_id = $3
-          AND (em.session_id = l.from_session_id OR em.session_id = l.to_session_id)
-          AND em.current_revision = l.evidence_revision
-          AND es.project_id = l.project_id AND ep.company_id = l.company_id`,
-      [linkId, context.companyId, context.projectId],
-    );
-    if (link.rows.length === 0) {
+    const linkIds = linkIdsRaw.filter((value): value is string => typeof value === 'string');
+    if (linkIds.length === 0 || linkIds.length !== linkIdsRaw.length) {
       return null;
+    }
+    for (const linkId of linkIds) {
+      const link = await pool.query(
+        `SELECT 1
+           FROM session_links l
+           JOIN messages em ON em.id = l.evidence_message_id
+           JOIN sessions es ON es.id = em.session_id
+           JOIN projects ep ON ep.id = es.project_id
+          WHERE l.id = $1 AND l.status = 'active' AND l.company_id = $2 AND l.project_id = $3
+            AND (em.session_id = l.from_session_id OR em.session_id = l.to_session_id)
+            AND em.current_revision = l.evidence_revision
+            AND es.project_id = l.project_id AND ep.company_id = l.company_id`,
+        [linkId, context.companyId, context.projectId],
+      );
+      if (link.rows.length === 0) {
+        return null;
+      }
     }
   } else if (sourceKind !== 'neighbor' && sourceKind !== 'inferred_session_link') {
     return null;
   }
   return publicRelatedItem(item);
+}
+
+function correctionCoverageKey(
+  sourceMessageId: string,
+  sourceRevision: number,
+  targetMessageId: string,
+  targetRevision: number,
+  relation: string,
+): string {
+  return `${sourceMessageId}|${sourceRevision}|${targetMessageId}|${targetRevision}|${relation}`;
+}
+
+// 保存済みitemをtargetとする、案件境界内・source current revisionのchange/revoke全件。
+async function currentCorrectionsFor(
+  pool: Pool,
+  context: MatchValidationContext,
+  messageId: string,
+  revision: number,
+): Promise<Array<{ sourceMessageId: string; sourceRevision: number; relation: string }>> {
+  const result = await pool.query<{
+    source_message_id: string;
+    source_revision: number;
+    relation: string;
+  }>(
+    `SELECT r.source_message_id, r.source_revision, r.relation
+       FROM message_relations r
+       JOIN messages sm ON sm.id = r.source_message_id
+       JOIN sessions ss ON ss.id = sm.session_id
+       JOIN projects sp ON sp.id = ss.project_id
+      WHERE r.target_message_id = $1 AND r.target_revision = $2
+        AND r.relation IN ('change', 'revoke')
+        AND sm.current_revision = r.source_revision
+        AND ss.project_id = $3 AND sp.company_id = $4`,
+    [messageId, revision, context.projectId, context.companyId],
+  );
+  return result.rows.map((row) => ({
+    sourceMessageId: row.source_message_id,
+    sourceRevision: row.source_revision,
+    relation: row.relation,
+  }));
 }
 
 async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: unknown): Promise<unknown[]> {
@@ -478,25 +525,73 @@ async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: 
         valid = false;
         break;
       }
-      // 明示的なrevoke/changeは、currentなM7 correction related_evidenceが同時に残る場合だけ許容する。
-      const invalidated = await pool.query(
-        `SELECT 1
-           FROM message_relations
-          WHERE target_message_id = $1 AND target_revision = $2 AND relation IN ('revoke', 'change')
-          LIMIT 1`,
-        [messageId, revision],
+    }
+    if (!valid) {
+      continue;
+    }
+    // primary evidenceと保存済みcurrent correctionをtargetとする現在有効なchange/revokeを全件確認し、
+    // 収録済みcorrectionで覆えないrelationが1件でもあれば、保存結果をstaleとしてmatch全体を落とす。
+    const coverage = new Set<string>();
+    for (const related of relatedValid) {
+      if (related.source_kind !== 'correction' || typeof related.relation !== 'string') {
+        continue;
+      }
+      if (
+        typeof related.message_id !== 'string' ||
+        typeof related.revision !== 'number' ||
+        typeof related.related_to_message_id !== 'string' ||
+        typeof related.related_to_revision !== 'number'
+      ) {
+        continue;
+      }
+      coverage.add(
+        correctionCoverageKey(
+          related.message_id,
+          related.revision,
+          related.related_to_message_id,
+          related.related_to_revision,
+          related.relation,
+        ),
       );
-      if (invalidated.rows.length > 0) {
-        const covered = relatedValid.some(
-          (related) =>
-            related.source_kind === 'correction' &&
-            related.related_to_message_id === messageId &&
-            related.related_to_revision === revision,
+    }
+    const subjects = new Map<string, { messageId: string; revision: number }>();
+    for (const item of evidence) {
+      const subject = asObject(item);
+      if (subject !== null && typeof subject.message_id === 'string' && typeof subject.revision === 'number') {
+        subjects.set(`${subject.message_id}:${subject.revision}`, {
+          messageId: subject.message_id,
+          revision: subject.revision,
+        });
+      }
+    }
+    for (const related of relatedValid) {
+      if (related.source_kind !== 'correction') {
+        continue;
+      }
+      if (typeof related.message_id === 'string' && typeof related.revision === 'number') {
+        subjects.set(`${related.message_id}:${related.revision}`, {
+          messageId: related.message_id,
+          revision: related.revision,
+        });
+      }
+    }
+    for (const subject of subjects.values()) {
+      const corrections = await currentCorrectionsFor(pool, context, subject.messageId, subject.revision);
+      for (const correction of corrections) {
+        const key = correctionCoverageKey(
+          correction.sourceMessageId,
+          correction.sourceRevision,
+          subject.messageId,
+          subject.revision,
+          correction.relation,
         );
-        if (!covered) {
+        if (!coverage.has(key)) {
           valid = false;
           break;
         }
+      }
+      if (!valid) {
+        break;
       }
     }
     if (!valid) {
