@@ -482,6 +482,104 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
     assert.equal(currentRow.result, null, '元resultを現在受付へ複製している');
   });
 
+  it('reuse受付の現在入力revisionが失効したらoriginのpending/running/no_match/failed/expired等でもexpiredを優先する', async () => {
+    const cases: Array<{
+      label: string;
+      status: string;
+      outcome: string | null;
+      errorCode: string | null;
+      stage: string;
+      withNoMatchResult: boolean;
+    }> = [
+      { label: 'pending', status: 'pending', outcome: null, errorCode: null, stage: 'awaiting_search', withNoMatchResult: false },
+      { label: 'running', status: 'running', outcome: null, errorCode: null, stage: 'awaiting_search', withNoMatchResult: false },
+      { label: 'completed/no_match', status: 'completed', outcome: 'no_match', errorCode: null, stage: 'completed', withNoMatchResult: true },
+      { label: 'completed/skipped', status: 'completed', outcome: 'skipped', errorCode: null, stage: 'completed', withNoMatchResult: false },
+      { label: 'failed', status: 'failed', outcome: null, errorCode: 'provider_error', stage: 'completed', withNoMatchResult: false },
+      { label: 'expired', status: 'expired', outcome: null, errorCode: 'input_identity_mismatch', stage: 'completed', withNoMatchResult: false },
+    ];
+
+    for (const item of cases) {
+      const origin = await ingestUserInput(`${item.label}のrevision失効元入力`);
+      await updateSearchRequest(pool, origin.requestId, {
+        status: item.status,
+        outcome: item.outcome,
+        searchAction: item.outcome === 'skipped' ? 'skip' : 'new_search',
+        stage: item.stage,
+        errorCode: item.errorCode,
+        result: item.withNoMatchResult
+          ? {
+              request_id: origin.requestId,
+              input_id: origin.messageId,
+              input_revision: 1,
+              status: 'completed',
+              outcome: 'no_match',
+              project_id: workspace.projectId,
+              index_status: {
+                pending_documents: 0,
+                failed_documents: 0,
+                embedding_generation_id: uuidv7(),
+                search_mode: 'exact_vector_and_entity',
+              },
+              matches: [],
+              warnings: [{ code: 'candidate_limit_exceeded', excluded_count: 1 }],
+            }
+          : null,
+      });
+
+      const current = await ingestUserInput(`${item.label}のrevision失効現在入力`);
+      await updateSearchRequest(pool, current.requestId, {
+        status: 'pending',
+        outcome: null,
+        searchAction: 'reuse',
+        stage: 'awaiting_reused_search',
+        reusedFromRequestId: origin.requestId,
+        originalRequestId: origin.requestId,
+      });
+      await advanceMessageRevision(pool, current.messageId, '改訂後の現在入力');
+
+      const started = Date.now();
+      const response = await getSearchById(app, { token: workspace.token, id: current.requestId, waitMs: 1000 });
+      const elapsed = Date.now() - started;
+      assert.equal(response.statusCode, 200, `${item.label}: ${response.body}`);
+      const body = response.json<{
+        request_id?: string;
+        input_id?: string;
+        input_revision?: number;
+        reused_from_request_id?: string | null;
+        status?: string;
+        outcome?: string | null;
+        error_code?: string | null;
+        matches?: unknown[];
+        warnings?: Array<{ code?: string }>;
+        index_status?: { search_mode?: string };
+      }>();
+      assert.equal(body.status, 'expired', `${item.label}: 元status/outcomeを優先している`);
+      assert.equal(body.outcome ?? null, null, `${item.label}: expiredでoutcomeを返している`);
+      assert.equal(body.error_code, 'input_revision_stale', `${item.label}: 機械可読理由がない`);
+      assert.ok(!body.matches || body.matches.length === 0, `${item.label}: matchesを返している`);
+      assert.equal(body.request_id, current.requestId, `${item.label}: 現在受付identityを失っている`);
+      assert.equal(body.input_id, current.messageId, `${item.label}: 現在入力のinput_idを失っている`);
+      assert.equal(body.input_revision, 1, `${item.label}: 現在受付のinput_revisionを失っている`);
+      assert.equal(body.reused_from_request_id, origin.requestId, `${item.label}: reuse元の追跡を失っている`);
+      assert.ok(elapsed < 500, `${item.label}: 旧revision受付への待機を続けている (${elapsed}ms)`);
+      if (item.withNoMatchResult) {
+        assert.equal(
+          body.warnings?.[0]?.code,
+          'candidate_limit_exceeded',
+          `${item.label}: origin resultのwarningsを返していない`,
+        );
+        assert.equal(
+          body.index_status?.search_mode,
+          'exact_vector_and_entity',
+          `${item.label}: origin resultのindex_statusを返していない`,
+        );
+      }
+      const currentRow = await readSearchRequestFull(pool, current.requestId);
+      assert.equal(currentRow.result, null, `${item.label}: 元resultを現在受付へ複製している`);
+    }
+  });
+
   it('reuse元matchedは現在policyの分析がprogress_onlyまたは非searchableへ再分類されたらmatchedで返さない', async () => {
     const origin = await ingestUserInput('再分類される根拠の元入力');
     const evidence = await ingestEvent('assistant', '再分類の根拠原文');
