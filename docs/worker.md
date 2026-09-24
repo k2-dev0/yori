@@ -117,6 +117,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 目標800・上限1200・重複100トークン（provider document prefix予約32トークン込み）。message→paragraph→code block境界を優先し、上限超過blockだけをUTF-16 range付きで分割する。単一blockのatom上限は、次chunkが重複windowと区切りを保持しても上限内に収まる値にし、改行なし長文でも隣接chunkのoverlapを破棄しない。
 - projectの初回だけactive generationを作成/再利用して紐付ける。既存世代がconfigと不一致なら`embedding_generation_mismatch`の恒久失敗。
 - 文書構築TXの後、承認済みVoyageへ`voyage-4-lite`/input_type=document/1024/float/truncation=falseで送信する。応答index・件数・model・次元・finite・非ゼロを検証し、不正は`provider_contract_invalid`、他の4xxは`provider_rejected`でfailedにする。恒久エラー時はそのjobが保持するpending/embedding revisionだけをfailedにし、明示retryで同じrevisionをpendingへ戻して再埋め込みする。
+- 文書revisionの明示識別子は本文から毎回決定的に同期する。本文不変のready文書も対象にし、M5 migration前から存在する文書を通常のbuild再処理でbackfillするが、revision・publication・embeddingは作り直さない。
 - 旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭に残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）で残す。source消失・message revision変更・range変更を含む制限的変更や計画から消えた文書は、外部HTTP前の文書構築TXでpublication行を削除して即時検索不能にし、成功時に作り直す。is_searchableは新desired revisionの埋め込み用にtrueを維持する。
 - processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession fingerprint（全messageのcurrent_revision、現行policyのanalysis状態、有効revoke/change relation状態）をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionとfingerprintをDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
 - 文書計画はactive generationのspec検証より先に適用する。pending revisionがある場合だけ世代を作成/検証し、spec不一致・retired/failedは`embedding_generation_mismatch`でfailedにする（自動切替しない）。pendingが無ければ世代の作成/検証は不要として完了する。世代不一致でもprogress_only・有効revoke/change relationなどによる除外とpublication削除は外部HTTP前に反映する。
@@ -125,7 +126,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 ### execute_search
 
-- payloadの`search_request_id`、job対象message/revision、会社・案件・社員・session、`new_search`を照合し、対象受付だけを`running`へする。詳細は[m5-design.md](m5-design.md)。
+- payloadの`search_request_id`、job対象message/revision、会社・案件・社員・session、`new_search`をDB正本で照合し、対象受付だけを`running`へする。障害更新・retryでも同じscope照合を行い、不一致payloadで別受付を更新しない。詳細は[m5-design.md](m5-design.md)。
 - 開始時のactive generationを固定し、Voyageへ`input_type=query`で質問を埋め込む。世代なしは外部送信なしの`no_match`、spec不一致は`embedding_generation_mismatch`。
 - 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけで予算超過なら`input_budget_exceeded`。
