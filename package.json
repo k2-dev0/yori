@@ -17,7 +17,11 @@
     "migrate": "tsx src/db/migrate-cli.ts",
     "collector:collect": "tsx src/collector/cli.ts collect",
     "collector:flush": "tsx src/collector/cli.ts flush",
-    "collector:diagnostics": "tsx src/collector/cli.ts diagnostics"
+    "collector:diagnostics": "tsx src/collector/cli.ts diagnostics",
+    "worker:start": "tsx src/worker/cli.ts start",
+    "worker:retry": "tsx src/worker/cli.ts retry",
+    "provider:approve": "tsx src/worker/cli.ts approve",
+    "provider:revoke": "tsx src/worker/cli.ts revoke"
   },
   "dependencies": {
     "fastify": "^5.12.5",
