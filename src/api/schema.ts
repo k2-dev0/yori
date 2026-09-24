@@ -93,6 +93,26 @@ export const searchByInputQuerySchema = z.union([byInputInternalQuerySchema, byI
 
 export type ParsedSearchByInputQuery = z.infer<typeof searchByInputQuerySchema>;
 
+// M7の明示session link。取り込み元identityと根拠発言revisionをstrictに受け、unknown fieldを拒否する。
+const sessionIdentitySchema = z.strictObject({
+  source: z.enum(EVENT_SOURCES),
+  source_scope: sourceIdentifier,
+  source_session_id: sourceIdentifier,
+});
+
+export const sessionLinkRequestSchema = z.strictObject({
+  project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
+  idempotency_key: storableString.max(512),
+  from: sessionIdentitySchema,
+  to: sessionIdentitySchema,
+  evidence: sessionIdentitySchema.extend({
+    source_message_id: sourceIdentifier,
+    revision: z.int().min(1).max(2_147_483_647),
+  }),
+});
+
+export type ParsedSessionLinkRequest = z.infer<typeof sessionLinkRequestSchema>;
+
 // 原文取得は案件とrevisionを必須にし、unknown fieldを拒否する。
 export const evidenceQuerySchema = z.strictObject({
   project_id: z.uuid().transform((projectId) => projectId.toLowerCase()),
