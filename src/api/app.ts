@@ -18,7 +18,14 @@ import {
   searchByInputQuerySchema,
   searchDetailQuerySchema,
   searchRequestSchema,
+  sessionLinkRequestSchema,
 } from './schema.js';
+import {
+  SessionLinkConflictError,
+  SessionLinkInvalidError,
+  SessionLinkNotFoundError,
+  createSessionLink,
+} from './session-links.js';
 
 // 認証・入力検証・project権限・保存をHTTP境界としてまとめる。DB失敗の詳細は応答へ出さない。
 export function buildApp(deps: { pool: Pool }): FastifyInstance {
@@ -89,6 +96,36 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
       }
       if (error instanceof SearchNotFoundError) {
         return reply.code(404).send(errorBody('not_found'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  // M7の明示引き継ぎ登録。strict入力を先に検証し、不存在・別案件・他社員は404へ統一する。
+  app.post('/v1/session-links', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    const parsed = sessionLinkRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    try {
+      const created = await createSessionLink(deps.pool, auth, parsed.data);
+      return reply.code(created.statusCode).send(created.response);
+    } catch (error) {
+      if (error instanceof SessionLinkNotFoundError) {
+        return reply.code(404).send(errorBody('not_found'));
+      }
+      if (error instanceof SessionLinkConflictError || isUniqueViolation(error)) {
+        return reply.code(409).send(errorBody('conflict'));
+      }
+      if (error instanceof SessionLinkInvalidError) {
+        return reply.code(400).send(errorBody('invalid_request'));
       }
       return reply.code(500).send(errorBody('internal_error'));
     }
