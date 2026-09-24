@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1〜M5)",
+  "description": "社内開発会話の共有検索基盤 (M1〜M6)",
   "engines": {
     "node": ">=24"
   },
@@ -21,10 +21,12 @@
     "worker:start": "tsx src/worker/cli.ts start",
     "worker:retry": "tsx src/worker/cli.ts retry",
     "provider:approve": "tsx src/worker/cli.ts approve",
-    "provider:revoke": "tsx src/worker/cli.ts revoke"
+    "provider:revoke": "tsx src/worker/cli.ts revoke",
+    "mcp:start": "tsx src/mcp/server.ts"
   },
   "dependencies": {
     "@huggingface/tokenizers": "0.2.0",
+    "@modelcontextprotocol/server": "2.1.0",
     "fastify": "^5.12.5",
     "pg": "^8.23.0",
     "uuid": "^13.0.2",
