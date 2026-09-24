@@ -116,6 +116,23 @@ describe('外部送信・障害', () => {
     }
   });
 
+  it('規約確認日がNULLの承認ではJevへ送信せずblocked_policyとして原文を保持する', async () => {
+    const server = await startFakeJev(() => ({ body: {} }));
+    const config = buildWorkerConfig(server.baseUrl);
+    try {
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl, termsCheckedAt: null });
+      const sessionId = await seedSession(pool, workspace);
+      const text = '規約確認日が未設定なら送信しない';
+      const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text });
+      const classifyJobId = await processLane(seeded.messageId, 'classify_message', server);
+      assert.equal((await readJob(pool, classifyJobId)).status, 'blocked_policy', 'NULL確認日の承認で外部送信している');
+      assert.equal(server.requests.length, 0, 'NULL確認日なのに外部送信している');
+      assert.equal((await readRevision(pool, seeded.messageId, 1))?.text, text, 'NULL確認日で原文が消えた');
+    } finally {
+      await server.close();
+    }
+  });
+
   it('承認済みの外部呼出し成功で分析を適用し、usageを本文なしで記録する', async () => {
     const sessionId = await seedSession(pool, workspace);
     const text = '承認済みの分類対象本文';
