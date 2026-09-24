@@ -404,10 +404,11 @@ function partsContent(parts: readonly Part[]): string {
   return content;
 }
 
-// 先頭messageのrevision番号はkeyに含めない。先頭messageを編集して再buildしても同じ文書の新revisionにする。
-function documentKey(sessionId: string, first: PlannedSource, chunkerVersion: string): string {
+// overlapは前chunkから複製された範囲なので文書identityに使わず、chunk固有の先頭original sourceをanchorにする。
+// anchor messageのrevision番号はkeyに含めず、同じ位置の原文編集は同じ文書の新revisionにする。
+function documentKey(sessionId: string, anchor: PlannedSource, chunkerVersion: string): string {
   return createHash('sha256')
-    .update([sessionId, first.messageId, String(first.startOffset), chunkerVersion].join('\u0000'), 'utf8')
+    .update([sessionId, anchor.messageId, String(anchor.startOffset), chunkerVersion].join('\u0000'), 'utf8')
     .digest('hex');
 }
 
@@ -459,12 +460,12 @@ export async function planDocumentChunks(sessionId: string, messages: readonly S
       endOffset: part.endOffset,
       sourceKind: part.sourceKind,
     }));
-    const first = sources[0];
-    if (first === undefined) {
-      throw new Error('空の文書chunkは生成しない');
+    const anchor = sources.find((source) => source.sourceKind === 'original');
+    if (anchor === undefined) {
+      throw new Error('original sourceがない文書chunkは生成しない');
     }
     return {
-      documentKey: documentKey(sessionId, first, DOCUMENT_CHUNKER_VERSION),
+      documentKey: documentKey(sessionId, anchor, DOCUMENT_CHUNKER_VERSION),
       content,
       contentHash: createHash('sha256').update(content, 'utf8').digest(),
       chunkerVersion: DOCUMENT_CHUNKER_VERSION,
