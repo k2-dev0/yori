@@ -96,6 +96,58 @@ async function seedPair(
   return { priorSessionId, evidenceMessageId: evidence.messageId, priorRequestId, current };
 }
 
+interface ChainSeed {
+  originRequestId: string;
+  originInputId: string;
+  evidenceMessageId: string;
+  current: Awaited<ReturnType<typeof seedUserMessage>>;
+}
+
+// A(new_search)←B(reuse)←現在入力C を作り、B・Aの状態をオプションで変えられるようにする。
+async function seedReuseChain(options: { originStatus?: 'completed' | 'pending'; middleStatus?: 'completed' | 'pending' } = {}): Promise<ChainSeed> {
+  const sessionId = await seedSession(pool, workspace);
+  const evidence = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '以前の修正報告' });
+  const evidenceSeed: EvidenceSeed = {
+    messageId: evidence.messageId,
+    revision: 1,
+    employeeId: workspace.employeeId,
+    role: 'assistant',
+    occurredAt: new Date().toISOString(),
+    text: '以前の修正報告',
+  };
+  const originInput = await seedMessage(pool, { sessionId, sequenceNo: 2, role: 'user', text: '元の質問' });
+  const originStatus = options.originStatus ?? 'completed';
+  const originRequestId = await seedSearchRequest(pool, {
+    workspace,
+    sessionId,
+    inputId: originInput.messageId,
+    sequenceNo: 2,
+    status: originStatus,
+    outcome: originStatus === 'completed' ? 'matched' : null,
+    searchAction: 'new_search',
+    result: originStatus === 'completed' ? matchedResult([evidenceSeed]) : null,
+    createdAt: minutesAgo(5),
+    expiresAt: originStatus === 'completed' ? minutesFromNow(5) : null,
+  });
+  const middleInput = await seedMessage(pool, { sessionId, sequenceNo: 3, role: 'user', text: '再利用した質問' });
+  const middleStatus = options.middleStatus ?? 'pending';
+  await seedSearchRequest(pool, {
+    workspace,
+    sessionId,
+    inputId: middleInput.messageId,
+    sequenceNo: 3,
+    status: middleStatus,
+    outcome: middleStatus === 'completed' ? 'matched' : null,
+    searchAction: 'reuse',
+    reusedFromRequestId: originRequestId,
+    result: middleStatus === 'completed' ? matchedResult([evidenceSeed]) : null,
+    createdAt: minutesAgo(4),
+    expiresAt: middleStatus === 'completed' ? minutesFromNow(5) : null,
+  });
+  const current = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 4, text: '同じ症状です' });
+  return { originRequestId, originInputId: originInput.messageId, evidenceMessageId: evidence.messageId, current };
+}
+
 async function expectRouteAction(
   pair: PairSeed,
   server: FakeJevServer,
@@ -288,6 +340,88 @@ describe('再利用の制限', () => {
       await expectRouteAction(differentSession, sessionServer, 'new_search', 'session不一致');
     } finally {
       await sessionServer.close();
+    }
+  });
+  it('reuseのchainは直接のnew_search元まで適格な時だけ再利用する', async () => {
+    const cases: Array<{ label: string; seed: () => Promise<ChainSeed> }> = [
+      { label: 'B pending・A completed', seed: () => seedReuseChain() },
+      { label: 'B completed matched・A completed', seed: () => seedReuseChain({ middleStatus: 'completed' }) },
+      { label: 'B pending・A pending', seed: () => seedReuseChain({ originStatus: 'pending' }) },
+    ];
+    for (const testCase of cases) {
+      const chain = await testCase.seed();
+      const server = await startFakeJev(reuseReply());
+      try {
+        await expectRouteAction(
+          { priorSessionId: chain.current.sessionId, evidenceMessageId: chain.evidenceMessageId, priorRequestId: chain.originRequestId, current: chain.current },
+          server,
+          'reuse',
+          testCase.label,
+        );
+      } finally {
+        await server.close();
+      }
+    }
+  });
+
+  it('chainの元検索が期限切れ・failed・no_match・原文/根拠失効ならnew_searchへ戻す', async () => {
+    const revoker = async (chain: ChainSeed): Promise<void> => {
+      const message = await seedMessage(pool, { sessionId: chain.current.sessionId, sequenceNo: 5, role: 'assistant', text: '以前の報告を取り消します' });
+      await seedRelation(pool, {
+        sourceMessageId: message.messageId,
+        sourceRevision: 1,
+        targetMessageId: chain.evidenceMessageId,
+        targetRevision: 1,
+        relation: 'revoke',
+      });
+    };
+    const cases: Array<{ label: string; invalidate: (chain: ChainSeed) => Promise<void> }> = [
+      {
+        label: 'Aが期限切れ',
+        invalidate: async (chain) => {
+          await pool.query('UPDATE search_requests SET expires_at = $2 WHERE id = $1', [chain.originRequestId, minutesAgo(1)]);
+        },
+      },
+      {
+        label: 'Aがfailed',
+        invalidate: async (chain) => {
+          await pool.query("UPDATE search_requests SET status = 'failed', outcome = NULL, expires_at = NULL WHERE id = $1", [chain.originRequestId]);
+        },
+      },
+      {
+        label: 'Aがno_match',
+        invalidate: async (chain) => {
+          await pool.query("UPDATE search_requests SET outcome = 'no_match' WHERE id = $1", [chain.originRequestId]);
+        },
+      },
+      {
+        label: 'Aの原文revisionが改訂',
+        invalidate: async (chain) => {
+          await advanceRevision(pool, chain.originInputId, '改訂後の元質問');
+        },
+      },
+      {
+        label: 'Aの根拠revisionが改訂',
+        invalidate: async (chain) => {
+          await advanceRevision(pool, chain.evidenceMessageId, '改訂後の報告');
+        },
+      },
+      { label: 'Aの根拠が撤回', invalidate: revoker },
+    ];
+    for (const testCase of cases) {
+      const chain = await seedReuseChain();
+      await testCase.invalidate(chain);
+      const server = await startFakeJev(reuseReply());
+      try {
+        await expectRouteAction(
+          { priorSessionId: chain.current.sessionId, evidenceMessageId: chain.evidenceMessageId, priorRequestId: chain.originRequestId, current: chain.current },
+          server,
+          'new_search',
+          testCase.label,
+        );
+      } finally {
+        await server.close();
+      }
     }
   });
 });
