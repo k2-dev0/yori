@@ -2324,6 +2324,29 @@ describe('M4 Green追加契約', () => {
     );
   });
 
+  it('短いchunk全体をoverlapしても次chunkは別document_keyで保存できる', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const tokenizer = await loadVoyageTokenizer();
+    const shortParagraph = exactTokenText(tokenizer, 50);
+    const longParagraph = exactTokenText(tokenizer, 900);
+    const text = `${shortParagraph}\n\n${longParagraph}`;
+    const messageId = uuidv7();
+    const chunks = await planDocumentChunks('short-overlap-session', [
+      { messageId, revision: 1, text },
+    ]);
+
+    assert.equal(chunks.length, 2, `短いchunk＋長いatomが2 chunkでない: ${chunks.length}`);
+    assert.equal(new Set(chunks.map((chunk) => chunk.documentKey)).size, chunks.length, 'overlap元と次chunkのdocument_keyが衝突した');
+    assert.ok(chunks[1].sources.some((source) => source.sourceKind === 'overlap'), '次chunkにoverlap sourceがない');
+    assert.ok(chunks[1].sources.some((source) => source.sourceKind === 'original'), '次chunkに固有のoriginal sourceがない');
+
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text });
+    const run = await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    assert.equal(run.status, 'completed', `document_key衝突でbuild_documentsが完了しない: ${run.status}/${run.errorCode ?? ''}`);
+    assert.equal((await readDocuments(pool, workspace.projectId)).length, 2, '2つの検索文書として保存されていない');
+  });
+
   it('active generationがconfigとspec不一致なら自動切替せず恒久エラーにする', async () => {
     const server = await startFakeVoyage(defaultVoyageResponder);
     openServers.push(server);
