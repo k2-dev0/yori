@@ -648,6 +648,14 @@ export async function applyDocumentPlan(
       SESSION_BUILD_LOCK_NAMESPACE,
       input.sessionId,
     ]);
+    // cutover検証（projects行のFOR UPDATE）と文書計画の書込を直列化し、公開revisionのraceを閉じる。
+    const project = await client.query('SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 FOR SHARE', [
+      input.projectId,
+      input.companyId,
+    ]);
+    if (project.rows.length === 0) {
+      throw new StaleApplyError('projectがありません');
+    }
     const leased = await client.query(
       `SELECT 1 FROM jobs
         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()
