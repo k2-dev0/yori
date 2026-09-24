@@ -646,13 +646,23 @@ function buildMatch(
     occurred_at: draft.occurredAt.toISOString(),
     text: draft.text,
     source_kind: draft.sourceKind,
-    // relation/related_to_*は訂正・撤回だけが返す。
-    ...(draft.relation === undefined
+    // relation/related_to_*は訂正・撤回だけが返す。単一relationは従来fieldを維持し、
+    // 複数targetは同じmessageのrelated原文1件に全relationをrelations配列で併記する。
+    ...(draft.relations === undefined || draft.relations.length === 0
       ? {}
       : {
-          relation: draft.relation,
-          related_to_message_id: draft.relatedToMessageId,
-          related_to_revision: draft.relatedToRevision,
+          relation: draft.relations[0]?.relation,
+          related_to_message_id: draft.relations[0]?.relatedToMessageId,
+          related_to_revision: draft.relations[0]?.relatedToRevision,
+          ...(draft.relations.length > 1
+            ? {
+                relations: draft.relations.map((relation) => ({
+                  relation: relation.relation,
+                  related_to_message_id: relation.relatedToMessageId,
+                  related_to_revision: relation.relatedToRevision,
+                })),
+              }
+            : {}),
         }),
     // 結果取得時のlink経路再検証に使う内部field。API view組立時に除去する。
     ...(draft.linkIds === undefined || draft.linkIds.length === 0 ? {} : { _link_ids: draft.linkIds }),
