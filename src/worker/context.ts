@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type { EventRole } from '../api/contract.js';
 import type { ClaimedJob } from '../jobs/queue.js';
 import {
@@ -171,7 +171,7 @@ const PRIOR_SEARCH_SELECT = `SELECT sr.id, sr.input_id, sr.input_revision, sr.in
             sr.policy_version, sr.reused_from_request_id, sr.original_request_id, sr.expires_at, sr.result,
             r.text AS input_text, m.current_revision AS input_current_revision
        FROM search_requests sr
-       LEFT JOIN messages m ON m.id = sr.input_id
+       JOIN messages m ON m.id = sr.input_id
        LEFT JOIN message_revisions r ON r.message_id = sr.input_id AND r.revision = sr.input_revision`;
 
 function toPriorSearch(row: PriorSearchRow): PriorSearch {
@@ -207,14 +207,15 @@ export async function loadPriorSearch(pool: Pool, target: JobTarget): Promise<Pr
   return row === undefined ? undefined : toPriorSearch(row);
 }
 
-// reuse chainの参照先をscope内・対象sequenceより前の受付に限定してidで読む。
-// 原文revisionの存在/current一致・status適格性・期限・根拠はreuse側で判定する。
-export async function loadPriorSearchById(pool: Pool, target: JobTarget, requestId: string): Promise<PriorSearch | undefined> {
-  const result = await pool.query<PriorSearchRow>(
+// reuse保存TXで受付と元入力をロックし、検証後の改訂・受付更新をcommitまで待たせる。
+// scope内・対象sequenceより前に限定し、revision・status・期限・根拠の適格性はreuse側で判定する。
+export async function loadPriorSearchById(client: PoolClient, target: JobTarget, requestId: string): Promise<PriorSearch | undefined> {
+  const result = await client.query<PriorSearchRow>(
     `${PRIOR_SEARCH_SELECT}
       WHERE sr.id = $1 AND sr.company_id = $2 AND sr.project_id = $3 AND sr.employee_id = $4 AND sr.session_id = $5
         AND sr.input_sequence_no < $6
-      LIMIT 1`,
+      LIMIT 1
+      FOR SHARE OF sr, m`,
     [requestId, target.companyId, target.projectId, target.employeeId, target.sessionId, target.sequenceNo],
   );
   const row = result.rows[0];
