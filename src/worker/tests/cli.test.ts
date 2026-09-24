@@ -62,6 +62,8 @@ describe('worker CLI', () => {
       JEV_API_KEY: 'test-key',
       JEV_ACCOUNT_REF: 'acct-a',
       JEV_API_URL: config.apiUrl,
+      VOYAGE_API_KEY: 'test-voyage-key',
+      VOYAGE_ACCOUNT_REF: 'voyage-acct-a',
     };
     const directory = await mkdtemp(path.join(tmpdir(), 'yori-worker-cli-'));
     try {
@@ -123,6 +125,37 @@ describe('worker CLI', () => {
     }
   });
 
+  it('未知providerの承認ファイルは受理せず、Jev endpointでも登録しない', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'yori-worker-cli-'));
+    try {
+      const approvalPath = path.join(directory, 'approval.json');
+      await writeFile(
+        approvalPath,
+        JSON.stringify({
+          company_id: workspace.companyId,
+          provider: 'unknown_provider',
+          account_ref: 'acct-a',
+          endpoint: 'https://api.typesafe.ai/v1/systemone',
+          terms_url: 'https://typesafe.ai/legal/mca',
+          terms_checked_at: new Date().toISOString(),
+          learning_disabled: true,
+          retention_terms: 'retention-terms',
+          confirmed_by: 'admin-a',
+          confirmed_at: new Date().toISOString(),
+        }),
+      );
+      const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: requireDatabaseUrl() };
+      assert.equal(await runCli(['approve', approvalPath], env), 1, '未知providerの承認が成功した');
+      const rows = await pool.query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM provider_policy_approvals WHERE provider = $1',
+        ['unknown_provider'],
+      );
+      assert.equal(rows.rows[0].count, '0', '未知providerの承認が登録された');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('worker:startはSIGTERMまでjobを処理して正常終了する', async () => {
     const server = await startFakeJev((request) => ({
       body: jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })),
@@ -140,6 +173,8 @@ describe('worker CLI', () => {
         JEV_ACCOUNT_REF: 'acct-a',
         JEV_API_URL: config.apiUrl,
         JEV_WORKER_POLL_MS: '20',
+        VOYAGE_API_KEY: 'test-voyage-key',
+        VOYAGE_ACCOUNT_REF: 'voyage-acct-a',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
