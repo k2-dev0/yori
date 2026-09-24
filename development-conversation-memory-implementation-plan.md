@@ -751,7 +751,7 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 
 M3追加後の検証: API/DB・収集・workerを含む182件、配置・永続化7件が成功。typecheck・変更pathのlint・buildも成功。再利用は先行入力の有効性確認から保存完了まで同一TXの行ロックで保護し、改訂先行/保存先行の両順序を直接/chain参照で検証。Jevの実API・実会話は使用せず、公式HTTP契約に合わせた合成fixtureで検証。成功ヘッダー受信後の本文受信timeout/通信切断が恒久失敗になる問題は、ユーザー指定により保留。原文は保持され、明示retryで再開する。複数partが同じ関係を示す場合の根拠範囲の統合と、正常応答の本文受信時間の計測も今回の対象外。詳細は[worker手順の保留事項](docs/worker.md)を参照する。
 
-M5追加後の検証: srcテスト301件、配置・永続化7件、typecheck/lint/buildが成功。M5単独45件で社員横断検索、案件境界、自己根拠除外、複数階層・hidden directory・文末句読点を含むpath識別子、既存ready文書のentity backfill、payload・job sessionのscope隔離、RRF、候補・token上限と全候補予算外の失敗区別、6項目の独立候補判定と生回答保存、no_match、承認・provider障害、世代固定、stale input、原文改訂の両競合順序、publication/revision/lease競合、冪等性、runnerを実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。TypeSafe公式APIのstructured state契約は確認したが、実アカウントでの候補判定疎通は未実施。
+M5追加後の検証: srcテスト306件、配置・永続化7件、typecheck/lint/buildが成功。M5単独50件で社員横断検索、案件境界、自己根拠除外、複数階層・hidden directory・文末句読点を含むpath識別子、既存ready文書のentity backfill、payload UUID・job session・保存前identity/scopeの隔離、RRF、候補・token上限と全候補予算外の失敗区別、6項目の独立候補判定と生回答保存、no_match、承認・provider障害、世代固定、stale input、原文改訂の両競合順序、publication/revision/lease競合、冪等性、runnerを実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。TypeSafe公式APIのstructured state契約は確認したが、実アカウントでの候補判定疎通は未実施。
 
 ## 13. 必須の受け入れ条件
 
