@@ -3,24 +3,32 @@ import { pathToFileURL } from 'node:url';
 import { v7 as uuidv7 } from 'uuid';
 import { z } from 'zod';
 import { createPool } from '../db/pool.js';
-import { JEV_PROVIDER } from './contract.js';
-import { isWorkerEndpoint, loadWorkerConfig } from './config.js';
+import { JEV_PROVIDER, VOYAGE_PROVIDER } from './contract.js';
+import { isVoyageEndpoint, isWorkerEndpoint, loadWorkerConfig } from './config.js';
 import { retryJob } from './process.js';
 import { runWorker } from './runner.js';
 
 // 承認JSON。terms_checked_atは管理者が確認した日時を必須で受け、credentialは含めない。
-const approvalFileSchema = z.object({
-  company_id: z.uuid(),
-  provider: z.string().min(1).default(JEV_PROVIDER),
-  account_ref: z.string().min(1),
-  endpoint: z.string().min(1).refine(isWorkerEndpoint, { message: 'endpointが許可形式ではありません' }),
-  terms_url: z.string().min(1),
-  terms_checked_at: z.iso.datetime({ offset: true }),
-  learning_disabled: z.literal(true),
-  retention_terms: z.string().min(1),
-  confirmed_by: z.string().min(1),
-  confirmed_at: z.iso.datetime({ offset: true }),
-});
+const approvalFileSchema = z
+  .object({
+    company_id: z.uuid(),
+    provider: z.enum([JEV_PROVIDER, VOYAGE_PROVIDER]).default(JEV_PROVIDER),
+    account_ref: z.string().min(1),
+    endpoint: z.string().min(1),
+    terms_url: z.string().min(1),
+    terms_checked_at: z.iso.datetime({ offset: true }),
+    learning_disabled: z.literal(true),
+    retention_terms: z.string().min(1),
+    confirmed_by: z.string().min(1),
+    confirmed_at: z.iso.datetime({ offset: true }),
+  })
+  .superRefine((approval, context) => {
+    // providerごとに許可するAPI経路を固定し、別providerのendpointを承認として登録しない。
+    const valid = approval.provider === VOYAGE_PROVIDER ? isVoyageEndpoint(approval.endpoint) : isWorkerEndpoint(approval.endpoint);
+    if (!valid) {
+      context.addIssue({ code: 'custom', path: ['endpoint'], message: 'endpointが許可形式ではありません' });
+    }
+  });
 
 function fail(code: string): number {
   process.stderr.write(`worker: ${code}\n`);
