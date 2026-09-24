@@ -1,6 +1,6 @@
 # yori MCP の設定と起動
 
-M6で追加したローカルstdio MCPアダプターは、中央yori APIへHTTPSで接続し、保存済みの自動検索結果取得、追加検索、原文取得、短い対応記録をCodex／Claude Codeへ公開する。会話収集と検索開始はcollectorおよび中央APIの責任であり、MCPを起動しなくても継続する。
+M6で追加しM7で拡張したローカルstdio MCPアダプターは、中央yori APIへHTTPSで接続し、保存済みの自動検索結果取得、追加検索、原文取得、短い対応記録、明示的なセッション引き継ぎ登録をCodex／Claude Codeへ公開する。会話収集と検索開始はcollectorおよび中央APIの責任であり、MCPを起動しなくても継続する。
 
 ## 前提
 
@@ -40,10 +40,33 @@ MCPホストには、リポジトリ直下で`npm run --silent mcp:start`を起�
 | `get_search_result` | request ID、内部input ID、または取り込み元identityで現在入力の結果を取得する。`not_received`、処理中、失敗、`skipped`、`no_match`、`matched`を区別する |
 | `get_evidence` | 検索結果のmessage ID・revisionから保存済み原文を取得する |
 | `record_case` | 問題、対応、確認状態を短い`agent_report`として保存する。600文字超は警告するが、本文上限内なら受理する |
+| `link_session` | 引き継ぎ元・認証社員本人の引き継ぎ先・根拠発言を取り込み元identityで指定し、明示的なセッション関係を登録する |
 
 `get_search_result`の`wait_ms`は1回0〜5000ms。エージェント側の初期待機予算は累計10秒とし、期限後も中央の検索jobは継続する。処理中を`no_match`と扱わない。
 
-M7の`link_session`、前後・引き継ぎ・撤回探索、補助通知は未実装。
+M7のmatched結果は代表根拠に加え、前後発言、後続の訂正・撤回、明示またはJevで採用した引き継ぎ先を`related_evidence`で返す。探索は最大3 hop・合計10 session・追加context約6,000 tokenで打ち切り、未探索部分があれば`truncated`とwarningを返す。結果取得時にも原文revision、案件、relation、activeなsession linkを再確認する。
+
+## セッション引き継ぎ
+
+`link_session`はHTTP `POST /v1/session-links`と同じstrict入力を使う。`from`と`to`は同一案件、`to`は認証社員本人のsession、`evidence`はどちらかのsessionに属する現在revisionでなければならない。
+
+```json
+{
+  "project_id": "project-uuid",
+  "idempotency_key": "handoff-1",
+  "from": { "source": "codex", "source_scope": "github.example/team/repo", "source_session_id": "session-a" },
+  "to": { "source": "claude_code", "source_scope": "github.example/team/repo", "source_session_id": "session-b" },
+  "evidence": {
+    "source": "claude_code",
+    "source_scope": "github.example/team/repo",
+    "source_session_id": "session-b",
+    "source_message_id": "handoff-message",
+    "revision": 1
+  }
+}
+```
+
+同じ社員・同じ冪等キー・同じ内容の再送は既存linkを返す。内容違いはconflict、自己link・根拠不一致はinvalid request、別案件・他社員の引き継ぎ先は存在を開示せずnot foundになる。
 
 ## 障害時
 
