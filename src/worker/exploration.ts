@@ -722,19 +722,27 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
     }
   }
 
-  const kept: RelatedEvidenceDraft[] = [];
+  // token予算の採用順はcorrectionを最優先にし、その後neighbor→explicit→inferred。
+  // 各group内は元の安定順、出力順は既存契約（neighbor→correction→explicit→inferred）を維持する。
+  const selected = new Set<RelatedEvidenceDraft>();
   let totalTokens = 0;
   let excludedTokens = 0;
-  for (const draft of related) {
-    const tokens = input.tokenizer.encode(draft.text).ids.length;
-    if (totalTokens + tokens > TOKEN_BUDGET) {
-      excludedTokens += 1;
-      truncated = true;
-      continue;
+  for (const kind of ['correction', 'neighbor', 'explicit_session_link', 'inferred_session_link'] as const) {
+    for (const draft of related) {
+      if (draft.sourceKind !== kind) {
+        continue;
+      }
+      const tokens = input.tokenizer.encode(draft.text).ids.length;
+      if (totalTokens + tokens > TOKEN_BUDGET) {
+        excludedTokens += 1;
+        truncated = true;
+        continue;
+      }
+      totalTokens += tokens;
+      selected.add(draft);
     }
-    totalTokens += tokens;
-    kept.push(draft);
   }
+  const kept = related.filter((draft) => selected.has(draft));
   if (primaryOversized || excludedTokens > 0) {
     warnings.push({
       code: 'context_token_budget_exceeded',
