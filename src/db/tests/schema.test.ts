@@ -34,6 +34,14 @@ const REQUIRED_TABLES = [
   'provider_policy_approvals',
   'usage_events',
   'schema_migrations',
+  // M4: 決定的文書分割・埋め込み世代・公開状態。
+  'embedding_generations',
+  'search_documents',
+  'search_document_revisions',
+  'search_document_sources',
+  'document_embeddings',
+  'document_publications',
+  'embedding_cache',
 ];
 
 before(async () => {
@@ -315,6 +323,237 @@ describe('CHECK制約', () => {
       ]),
       '23514',
       'revision=0',
+    );
+  });
+});
+
+// M4のschema契約。migration名・ファイル名には依存せず、実DBのcatalogで予定schemaの振る舞いを確認する。
+const M4_REQUIRED_TABLES = [
+  'embedding_generations',
+  'search_documents',
+  'search_document_revisions',
+  'search_document_sources',
+  'document_embeddings',
+  'document_publications',
+  'embedding_cache',
+] as const;
+
+async function m4TableColumns(table: string): Promise<Map<string, { dataType: string }>> {
+  const result = await pool.query<{ column_name: string; data_type: string }>(
+    "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+    [table],
+  );
+  return new Map(result.rows.map((row) => [row.column_name, { dataType: row.data_type }]));
+}
+
+async function requireM4Columns(table: string, columns: readonly string[]): Promise<Map<string, { dataType: string }>> {
+  const found = await m4TableColumns(table);
+  assert.ok(found.size > 0, `M4の必須テーブル ${table} がない`);
+  for (const column of columns) {
+    assert.ok(found.has(column), `M4の必須カラム ${table}.${column} がない`);
+  }
+  return found;
+}
+
+function expectColumnType(
+  found: Map<string, { dataType: string }>,
+  table: string,
+  column: string,
+  expected: readonly string[],
+): void {
+  const info = found.get(column);
+  assert.ok(info, `M4の必須カラム ${table}.${column} がない`);
+  assert.ok(expected.includes(info.dataType), `${table}.${column} の型が違う: ${info.dataType}`);
+}
+
+async function m4UniqueColumnSets(table: string): Promise<string[][]> {
+  const result = await pool.query<{ columns: string[] }>(
+    `SELECT array_agg(a.attname ORDER BY key.ordinality) AS columns
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality) ON true
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
+      WHERE c.oid = to_regclass($1) AND n.nspname = 'public' AND i.indisunique
+      GROUP BY i.indexrelid`,
+    [table],
+  );
+  return result.rows.map((row) => [...row.columns].sort());
+}
+
+function expectUniqueKey(actual: readonly string[][], expected: readonly string[], label: string): void {
+  const wanted = [...expected].sort();
+  assert.ok(
+    actual.some((columns) => columns.length === wanted.length && columns.every((column, index) => column === wanted[index])),
+    `${label}: 期待するUNIQUE(${expected.join(', ')})がない。実際: ${actual.map((columns) => `(${columns.join(', ')})`).join(' ') || 'なし'}`,
+  );
+}
+
+describe('M4 schema契約', () => {
+  it('M4の必須テーブルがすべて存在する', async () => {
+    const tables = await pool.query<{ table_name: string }>(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+    );
+    const names = new Set(tables.rows.map((row) => row.table_name));
+    for (const table of M4_REQUIRED_TABLES) {
+      assert.ok(names.has(table), `M4の必須テーブル ${table} がない`);
+    }
+  });
+
+  it('projects.active_generation_idはembedding_generations(id)を参照する', async () => {
+    await requireM4Columns('embedding_generations', ['id']);
+    const constraints = await pool.query<{ columns: string[]; ref_table: string }>(
+      `SELECT array_agg(a.attname) AS columns, c.confrelid::regclass::text AS ref_table
+         FROM pg_constraint c
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.conrelid = to_regclass('projects') AND c.contype = 'f'
+        GROUP BY c.oid, c.confrelid`,
+    );
+    const target = constraints.rows.find((row) => row.columns.includes('active_generation_id'));
+    assert.ok(target, 'projects.active_generation_idの外部キーがない');
+    assert.equal(target.ref_table, 'embedding_generations', 'active_generation_idの参照先がembedding_generationsでない');
+  });
+
+  it('search_documentsは(project_id, document_key)、search_document_revisionsは(document_id, revision)が一意', async () => {
+    await requireM4Columns('search_documents', ['project_id', 'document_key']);
+    await requireM4Columns('search_document_revisions', ['document_id', 'revision']);
+    expectUniqueKey(
+      await m4UniqueColumnSets('search_documents'),
+      ['project_id', 'document_key'],
+      'search_documents',
+    );
+    expectUniqueKey(
+      await m4UniqueColumnSets('search_document_revisions'),
+      ['document_id', 'revision'],
+      'search_document_revisions',
+    );
+  });
+
+  it('document_embeddingsは(document_id, revision, generation_id)、document_publicationsは(document_id, generation_id)が一意', async () => {
+    await requireM4Columns('document_embeddings', ['document_id', 'revision', 'generation_id']);
+    await requireM4Columns('document_publications', ['document_id', 'generation_id']);
+    expectUniqueKey(
+      await m4UniqueColumnSets('document_embeddings'),
+      ['document_id', 'revision', 'generation_id'],
+      'document_embeddings',
+    );
+    expectUniqueKey(
+      await m4UniqueColumnSets('document_publications'),
+      ['document_id', 'generation_id'],
+      'document_publications',
+    );
+  });
+
+  it('document_embeddingsはvector(1024)列をちょうど1つ持つ', async () => {
+    await requireM4Columns('document_embeddings', ['document_id', 'revision', 'generation_id']);
+    const columns = await pool.query<{ attname: string; column_type: string }>(
+      `SELECT attname, format_type(atttypid, atttypmod) AS column_type
+         FROM pg_attribute
+        WHERE attrelid = to_regclass('document_embeddings') AND attnum > 0 AND NOT attisdropped`,
+    );
+    const vectors = columns.rows.filter((row) => row.column_type === 'vector(1024)');
+    assert.equal(
+      vectors.length,
+      1,
+      `vector(1024)列が1つでない。実際: ${columns.rows.map((row) => `${row.attname}:${row.column_type}`).join(', ')}`,
+    );
+    assert.ok(
+      columns.rows.some((row) => /hash/.test(row.attname)),
+      'document_embeddingsに入力hash列がない',
+    );
+  });
+
+  it('search_document_revisions.statusはpending/embedding/ready/failed/superseded/excludedだけを許す', async () => {
+    await requireM4Columns('search_document_revisions', ['status']);
+    const constraints = await pool.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition
+         FROM pg_constraint
+        WHERE conrelid = to_regclass('search_document_revisions') AND contype = 'c'`,
+    );
+    const definition = constraints.rows.map((row) => row.definition).join(' ');
+    for (const status of ['pending', 'embedding', 'ready', 'failed', 'superseded', 'excluded']) {
+      assert.ok(definition.includes(`'${status}'`), `revision status制約に ${status} がない: ${definition}`);
+    }
+  });
+
+  it('search_document_sourcesはmessage_id/message_revision/UTF-16 offset/display_orderを保持する', async () => {
+    const found = await requireM4Columns('search_document_sources', [
+      'document_id',
+      'revision',
+      'message_id',
+      'message_revision',
+      'display_order',
+    ]);
+    const names = [...found.keys()];
+    const startColumns = names.filter((name) => /(start|begin)/.test(name));
+    const endColumns = names.filter((name) => /(end|stop)/.test(name));
+    assert.ok(startColumns.length >= 1, `search_document_sourcesにstart offset列がない。実際: ${names.join(', ')}`);
+    assert.ok(endColumns.length >= 1, `search_document_sourcesにend offset列がない。実際: ${names.join(', ')}`);
+    for (const name of [...startColumns, ...endColumns]) {
+      expectColumnType(found, 'search_document_sources', name, ['smallint', 'integer', 'bigint']);
+    }
+  });
+
+  it('embedding_generationsはprovider/model/dimensions/statusとtokenizer・前処理版・metricを保持する', async () => {
+    const found = await requireM4Columns('embedding_generations', ['id', 'provider', 'model', 'dimensions', 'status']);
+    expectColumnType(found, 'embedding_generations', 'dimensions', ['smallint', 'integer', 'bigint']);
+    expectColumnType(found, 'embedding_generations', 'provider', ['text', 'character varying']);
+    expectColumnType(found, 'embedding_generations', 'model', ['text', 'character varying']);
+    const names = [...found.keys()];
+    assert.ok(names.some((name) => /token/.test(name)), `tokenizer版の列がない。実際: ${names.join(', ')}`);
+    assert.ok(names.some((name) => /(document|doc)/.test(name)), `document前処理版の列がない。実際: ${names.join(', ')}`);
+    assert.ok(names.some((name) => /query/.test(name)), `query前処理版の列がない。実際: ${names.join(', ')}`);
+    assert.ok(names.some((name) => /(metric|distance)/.test(name)), `距離方式の列がない。実際: ${names.join(', ')}`);
+  });
+
+  it('embedding_cacheはcompany_id/generation/operation/input hashで一意', async () => {
+    await requireM4Columns('embedding_cache', ['company_id']);
+    const uniqueKeys = await m4UniqueColumnSets('embedding_cache');
+    const cacheKey = uniqueKeys.find(
+      (columns) =>
+        columns.includes('company_id') &&
+        columns.some((column) => /generation/.test(column)) &&
+        columns.some((column) => /operation/.test(column)) &&
+        columns.some((column) => /hash/.test(column)),
+    );
+    assert.ok(
+      cacheKey,
+      `embedding_cacheの一意キーがcompany+generation+operation+input hashでない。実際: ${uniqueKeys.map((columns) => `(${columns.join(', ')})`).join(' ') || 'なし'}`,
+    );
+  });
+
+  it('search_documents/search_document_revisions/document_publicationsの必須カラム型', async () => {
+    const documents = await requireM4Columns('search_documents', [
+      'id',
+      'company_id',
+      'project_id',
+      'session_id',
+      'document_key',
+      'desired_revision',
+      'is_searchable',
+    ]);
+    expectColumnType(documents, 'search_documents', 'desired_revision', ['smallint', 'integer', 'bigint']);
+    expectColumnType(documents, 'search_documents', 'is_searchable', ['boolean']);
+
+    const revisions = await requireM4Columns('search_document_revisions', [
+      'document_id',
+      'revision',
+      'chunker_version',
+      'status',
+    ]);
+    expectColumnType(revisions, 'search_document_revisions', 'revision', ['smallint', 'integer', 'bigint']);
+    expectColumnType(revisions, 'search_document_revisions', 'chunker_version', ['text', 'character varying']);
+    expectColumnType(revisions, 'search_document_revisions', 'status', ['text', 'character varying']);
+    assert.ok(
+      ['text', 'search_text', 'body', 'content'].some((name) => revisions.has(name)),
+      `search_document_revisionsの検索本文列がない。実際: ${[...revisions.keys()].join(', ')}`,
+    );
+
+    const publications = await requireM4Columns('document_publications', ['document_id', 'generation_id', 'revision']);
+    expectColumnType(publications, 'document_publications', 'revision', ['smallint', 'integer', 'bigint']);
+    assert.ok(
+      [...publications.entries()].some(([name, info]) => /stale/.test(name) && info.dataType === 'boolean'),
+      'document_publicationsのstale boolean列がない',
     );
   });
 });
