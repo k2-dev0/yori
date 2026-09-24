@@ -240,8 +240,29 @@ export const CANDIDATE_RELEVANCE_CRITERIA: Record<CandidateRelevance, string> = 
 
 // 候補判定の質問ID接頭辞。candidate_id（document_id:revision）付きで呼出し内に一意にする。
 export const CANDIDATE_RELEVANCE_QUESTION_PREFIX = 'candidate_relevance';
-export const CANDIDATE_SIMILAR_SYMPTOM_QUESTION_PREFIX = 'candidate_similar_symptom';
+export const CANDIDATE_TARGET_MATCH_QUESTION_PREFIX = 'candidate_target_match';
+export const CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX = 'candidate_similar_symptom_or_request';
+export const CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX = 'candidate_similar_constraints';
+export const CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX = 'candidate_implementation_rationale';
 export const CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX = 'candidate_reusable_procedure';
+export const CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX = 'candidate_statement_status';
 export const CANDIDATE_YES_NO_CRITERIA = { yes: '当てはまる', no: '当てはまらない' };
-export const CANDIDATE_RELEVANCE_KINDS = ['similar_symptom', 'reusable_procedure'] as const;
+
+// 計画9.3の独立positive項目。手順有用性はstatement_statusと別fieldで保持する。
+export const CANDIDATE_RELEVANCE_KINDS = [
+  'target_match',
+  'similar_symptom_or_request',
+  'similar_constraints',
+  'implementation_rationale',
+  'reusable_procedure',
+] as const;
 export type CandidateRelevanceKind = (typeof CANDIDATE_RELEVANCE_KINDS)[number];
+
+export const CANDIDATE_STATEMENT_STATUSES = ['proposal', 'reported_completed', 'reported_verified', 'unknown'] as const;
+export type CandidateStatementStatus = (typeof CANDIDATE_STATEMENT_STATUSES)[number];
+export const CANDIDATE_STATEMENT_STATUS_CRITERIA: Record<CandidateStatementStatus, string> = {
+  proposal: '単なる提案',
+  reported_completed: '完了報告',
+  reported_verified: '検証済み報告（ツール実証とは扱わない）',
+  unknown: '判断不能',
+};
