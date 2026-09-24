@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { Pool } from 'pg';
+import type { PoolClient } from 'pg';
 import { WORKER_POLICY_VERSION } from './contract.js';
 import { loadPriorSearchById, type JobTarget, type PriorSearch } from './context.js';
 
@@ -40,7 +40,7 @@ function parseEvidence(result: unknown): Array<{ messageId: string; revision: nu
 }
 
 // evidenceの原文が現行revision・同案件で、progress_only化・revoke/changeで無効化されていないか確認する。
-async function evidenceReusable(pool: Pool, target: JobTarget, prior: PriorSearch): Promise<boolean> {
+async function evidenceReusable(pool: PoolClient, target: JobTarget, prior: PriorSearch): Promise<boolean> {
   if (prior.status === 'pending' || prior.status === 'running') {
     return true;
   }
@@ -92,7 +92,7 @@ async function evidenceReusable(pool: Pool, target: JobTarget, prior: PriorSearc
 
 // chainの1受付が再利用条件（policy・原文revisionの存在とcurrent一致・status/期限・根拠）を満たすか。
 // scopeと対象sequenceより前であることはloadPriorSearchById/loadPriorSearchのqueryで保証する。
-async function chainRowEligible(pool: Pool, target: JobTarget, row: PriorSearch): Promise<boolean> {
+async function chainRowEligible(pool: PoolClient, target: JobTarget, row: PriorSearch): Promise<boolean> {
   if (row.policyVersion !== WORKER_POLICY_VERSION) {
     return false;
   }
@@ -103,12 +103,10 @@ async function chainRowEligible(pool: Pool, target: JobTarget, row: PriorSearch)
 }
 
 // 直近先行検索が再利用条件（scope/権限/revision/期限/根拠）を満たす時だけ、
-// 直接のnew_search元へ解決する。chainの各受付が同じ適格性を満たさなければnew_searchへ戻す。
-export async function resolveReuse(pool: Pool, target: JobTarget, prior: PriorSearch | undefined): Promise<ReuseDecision> {
+// 呼出元の保存TXでchainの受付・元入力をロックし、直接のnew_search元へ解決する。
+// 各受付が同じ適格性を満たさなければnew_searchへ戻す。
+export async function resolveReuse(pool: PoolClient, target: JobTarget, prior: PriorSearch): Promise<ReuseDecision> {
   const ineligible: ReuseDecision = { eligible: false, originRequestId: null };
-  if (!prior) {
-    return ineligible;
-  }
   // 外部評価中に先行入力が改訂・失効するため、評価した受付を同じIDで読み直す。
   // 別の受付へ切り替えず、Jevが比較した入力revisionが今も有効な場合だけ再利用する。
   const refreshed = await loadPriorSearchById(pool, target, prior.requestId);
