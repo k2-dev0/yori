@@ -25,7 +25,7 @@ M4は決定的な検索文書生成、VoyageEmbeddingProvider、学習利用条�
 - tokenizerはVoyage公式docsが案内する`voyageai/voyage-4-lite`の公開tokenizerを固定revisionのローカル資産（`assets/voyage-4-lite/`）として使う。実行時に会話本文を配信元へ送らない。`tokenizer_version`へasset revisionと実行library版（`voyageai/voyage-4-lite@0335ddf7698395712e3220733b4079006951cfef+@huggingface/tokenizers@0.2.0`）を記録する。依存はexact 0.2.0に固定する。
 - 目標800・上限1200・重複100トークンにprovider document prefixの予約32トークンを含める。message→paragraph→code block境界を優先し、上限を超える単一blockだけをrange付きで分割する。UTF-16サロゲートペアは割らない。
 - 単一block分割時のatom上限は、次chunkが重複window（100トークン）と区切り1トークンを保持しても上限内に収まる値にする。改行のない長文でも隣接chunkのoverlapを破棄せず、chunk全体を複製しない。
-- `document_key`はsession ID+chunk先頭のmessage ID+そのrevision内start+chunker_versionの決定的hash。先頭messageのrevision番号は含めず、先頭messageを編集して再buildしても同じdocumentの新revisionにする。確定済みchunkは維持し、変化した末尾・編集影響chunkだけ新revisionにする。未公開の最新revisionは同じ番号のまま作り直す。
+- `document_key`はsession ID+chunk固有の先頭original sourceのmessage ID+そのrevision内start+chunker_versionの決定的hash。前chunkから複製したoverlap sourceはidentityへ使わない。anchor messageのrevision番号は含めず、同じ位置の原文編集は同じdocumentの新revisionにする。確定済みchunkは維持し、変化した末尾・編集影響chunkだけ新revisionにする。未公開の最新revisionは同じ番号のまま作り直す。
 - 消えた/除外された文書はis_searchable=false、publication削除、最新revision excludedへ揃える（原文rangeは保持）。再び検索対象になった文書は新revisionで再公開する。
 - 新revisionがpending/embeddingの間で、旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭にそのまま残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）にする。source消失・message revision変更・range変更を含む制限的変更では、外部HTTP前の文書構築TXでdocument_publications行を削除して即時検索不能にする。search_documents.is_searchableは新desired revisionの埋め込み用にtrueを維持し、成功時にapplyDocumentEmbeddingsがpublicationを作り直す。
 - 新revisionの公開時にstale=falseへ戻して以前のready revisionをsupersededにする。
