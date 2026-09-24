@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { v7 as uuidv7 } from 'uuid';
 import {
+  appendTranscript,
   assertStateDoesNotContain,
   buildCollectorConfig,
   buildHook,
@@ -59,7 +60,7 @@ async function readRequestBody(request: IncomingMessage): Promise<string> {
 }
 
 // 実HTTPを起こさず、collectのPOST /v1/eventsへ既存ack形式を返し、by-inputだけをtestごとに差し替える。
-async function startFakeCentral(byInput: ByInputResponder): Promise<FakeCentral> {
+async function startFakeCentral(byInput: ByInputResponder, beforeEventsResponse?: () => Promise<void>): Promise<FakeCentral> {
   const requests: RecordedHttpRequest[] = [];
   let byInputIndex = 0;
   const server = createServer((request, response) => {
@@ -74,6 +75,9 @@ async function startFakeCentral(byInput: ByInputResponder): Promise<FakeCentral>
       };
       requests.push(recorded);
       if (request.method === 'POST' && request.url === '/v1/events') {
+        if (beforeEventsResponse !== undefined) {
+          await beforeEventsResponse();
+        }
         const body = JSON.parse(rawBody) as { events?: Array<{ idempotency_key?: string; revision?: number }> };
         const events = body.events ?? [];
         response.statusCode = 202;
@@ -360,6 +364,86 @@ describe('M7 collector補助通知', () => {
         });
       },
     );
+  });
+
+  it('先行notifyのHTTP待機中に後続inputが確定しても各notifyは自分のidentityだけをby-inputへ渡す', async () => {
+    let eventsPosts = 0;
+    let signalFirstEvents: (() => void) | undefined;
+    let releaseFirstEvents: (() => void) | undefined;
+    const firstEventsStarted = new Promise<void>((resolve) => {
+      signalFirstEvents = resolve;
+    });
+    const firstEventsReleased = new Promise<void>((resolve) => {
+      releaseFirstEvents = resolve;
+    });
+    const central = await startFakeCentral(
+      (request) => {
+        const messageId = queryParams(request).get('source_message_id');
+        const marker = messageId === 'item-user-2' ? 'M7-SECOND-INPUT-TEXT' : 'M7-FIRST-INPUT-TEXT';
+        return {
+          status: 200,
+          body: searchView({
+            matches: [
+              {
+                case_or_document_id: uuidv7(),
+                relevance_kind: ['similar_symptom'],
+                claim_status: 'agent_reported',
+                evidence: [
+                  {
+                    message_id: uuidv7(),
+                    revision: 1,
+                    employee_id: uuidv7(),
+                    role: 'assistant',
+                    occurred_at: '2026-09-21T01:00:00.000Z',
+                    text: marker,
+                  },
+                ],
+                related_evidence_ids: [],
+                truncated: false,
+              },
+            ],
+          }),
+        };
+      },
+      async () => {
+        eventsPosts += 1;
+        if (eventsPosts === 1) {
+          // 先行notifyのSQLite commit後、events HTTP応答を止めて後続collectを割り込ませる。
+          signalFirstEvents?.();
+          await firstEventsReleased;
+        }
+      },
+    );
+    try {
+      await withFixture(central, {}, async (fixture) => {
+        const first = runNotify(fixture);
+        await firstEventsStarted;
+        await appendTranscript(
+          fixture.transcriptPath,
+          `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-user-2', role: 'user', text: '後続の質問本文' })}\n`,
+        );
+        const second = await runNotify(fixture);
+        releaseFirstEvents?.();
+        const firstResult = await first;
+        assert.equal(firstResult.code, 0, `先行notifyが失敗した: ${firstResult.stderr}`);
+        assert.equal(second.code, 0, `後続notifyが失敗した: ${second.stderr}`);
+
+        const firstContext = hookContext(firstResult.stdout);
+        const secondContext = hookContext(second.stdout);
+        assert.ok(firstContext.includes('M7-FIRST-INPUT-TEXT'), `先行notifyが先行inputを使っていない: ${firstContext}`);
+        assert.ok(!firstContext.includes('M7-SECOND-INPUT-TEXT'), '先行notifyが後続inputを取り違えている');
+        assert.ok(secondContext.includes('M7-SECOND-INPUT-TEXT'), `後続notifyが後続inputを使っていない: ${secondContext}`);
+        assert.ok(!secondContext.includes('M7-FIRST-INPUT-TEXT'), '後続notifyが先行inputを取り違えている');
+
+        const queried = central.byInputRequests.map((request) => {
+          const params = queryParams(request);
+          return `${params.get('source_message_id')}:${params.get('revision')}`;
+        });
+        assert.deepEqual(queried.sort(), ['item-user-1:1', 'item-user-2:1'], `by-inputのidentityが違う: ${JSON.stringify(queried)}`);
+      });
+    } finally {
+      await central.close();
+    }
   });
 
   it('同じuser messageのrevision更新を今回の入力として通知する', async () => {
