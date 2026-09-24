@@ -31,13 +31,13 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 
 ## フック
 
-フックは収集の契機で、hook JSONをstdinから読む。最初に`npm ci`と`npm run build`を実行する。以下はCodex用のサンプルで、`~/.codex/hooks.json`へ既存設定を保持して追加し、`/hooks`で信頼を確認する。Claude Codeでは`~/.claude/settings.json`の`hooks`へ同じ構造を追加し、両方のコマンドの`--source codex`を`--source claude_code`へ変更する。実行するエージェントの環境に`YORI_TOKEN`を設定し、pathは実際の絶対pathに置き換える。実設定は自動編集しない。
+フックは収集と補助通知の契機で、hook JSONをstdinから読む。最初に`npm ci`と`npm run build`を実行する。以下はCodex用のサンプルで、`~/.codex/hooks.json`へ既存設定を保持して追加し、`/hooks`で信頼を確認する。Claude Codeでは`~/.claude/settings.json`の`hooks`へ同じ構造を追加し、両方のコマンドの`--source codex`を`--source claude_code`へ変更する。実行するエージェントの環境に`YORI_TOKEN`を設定し、pathは実際の絶対pathに置き換える。実設定は自動編集しない。
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js collect --source codex --config /Users/example/.yori-collector.json" }] }
+      { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js notify --source codex --config /Users/example/.yori-collector.json", "async": true }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js collect --source codex --config /Users/example/.yori-collector.json" }] }
@@ -47,7 +47,9 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 ```
 
 - Codex/Claude Codeとも同じcommon input（`session_id`、`cwd`、`transcript_path`）を使う。`hook.prompt`や`last_assistant_message`から別IDを発明しない。
-- 両エージェントに`UserPromptSubmit`と`Stop`を登録する。Stop直後に未書込の最終発言は、次のhookまたは明示flushで回収する。入力直後の自動検索と現在入力のID照合はM6で実装する。
+- 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`の`notify`は内部でcollectも行うため、同じeventへ別のcollectを並列登録しない。今回のcollectで新規または改訂されたuser発言を特定できた場合だけ、検索結果を1回最大5秒・累計最大10秒待つ。
+- `notify`は完了結果を`hookSpecificOutput.additionalContext`として返す。Codexは現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。hook完了だけで新しいturnを強制開始しない。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。
+- Stop直後に未書込の最終発言は、次のhookまたは明示flushで回収する。入力直後の自動検索と現在入力のID照合はM6で実装済み。
 - 1回の入力処理はcursor・message・outboxを同一SQLite transactionで更新する。ネットワーク待機中はtransactionを保持しない。
 
 ## CLI
@@ -56,14 +58,16 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 
 ```sh
 npm run collector:collect -- --source codex --config ~/.yori-collector.json < hook.json
+npm run collector:notify -- --source codex --config ~/.yori-collector.json < hook.json
 npm run collector:flush -- --config ~/.yori-collector.json
 npm run collector:diagnostics -- --config ~/.yori-collector.json
 ```
 
 - `collect`: hook JSONをstdinから読み、指定transcriptの差分だけを処理する。全履歴は走査しない。
+- `notify`: collect後、今回確定したuser入力の検索結果だけを待ち、安全な次のmodel入力へ渡すJSONをstdoutへ出す。未完了・入力不明では何も出さない。
 - `flush`: 保留sourceの対応表を再確認して未読分を取り込み、未送信eventを同じbody・同じ識別子で再送する。
 - `diagnostics`: 資格情報のnamespaceに保存された診断を`[{"code":"...","byteOffset":123}]`のJSON配列でstdoutへ出す。本文・通知コンテキスト・raw errorは出さない。
-- 成功時stdoutへ本文や通知コンテキストを出さない。不正な引数・設定・token欠落は固定codeをstderrへ出して非0で終了する。
+- `collect`・`flush`の成功時はstdoutへ本文や通知コンテキストを出さない。`notify`だけが完了結果の追加context JSONをstdoutへ出す。不正な引数・設定・token欠落は固定codeをstderrへ出して非0で終了する。
 
 ## 再送とtoken rotation
 
