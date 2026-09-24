@@ -61,6 +61,37 @@ services:
       - npm ci --no-audit --no-fund && exec ./node_modules/.bin/tsx src/api/server.ts
     ports:
       - "127.0.0.1:${YORI_API_PORT:-39119}:3210"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3210/health/live').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # M3 worker。apiのhealthcheck後だけ起動し、共有node_modules volumeへの同時npm ciを避ける。
+  # migration適用後に起動する（README参照）。JEV設定が無ければ偽判定せず起動失敗する。
+  worker:
+    <<: *node-service
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - test -x node_modules/.bin/tsx || npm ci --no-audit --no-fund; exec ./node_modules/.bin/tsx src/worker/cli.ts start
+    environment:
+      DATABASE_URL: postgres://yori:yori@db:5432/yori
+      JEV_API_KEY: ${JEV_API_KEY:-}
+      JEV_ACCOUNT_REF: ${JEV_ACCOUNT_REF:-}
+      JEV_API_URL: ${JEV_API_URL:-https://api.typesafe.ai/v1/systemone}
+      JEV_MODEL: ${JEV_MODEL:-jev-latest}
+      JEV_CONFIDENCE_THRESHOLD: ${JEV_CONFIDENCE_THRESHOLD:-0.8}
+      JEV_INPUT_BUDGET_BYTES: ${JEV_INPUT_BUDGET_BYTES:-8000}
+      JEV_REQUEST_TIMEOUT_MS: ${JEV_REQUEST_TIMEOUT_MS:-20000}
+      JEV_JOB_LEASE_MS: ${JEV_JOB_LEASE_MS:-60000}
+      JEV_WORKER_POLL_MS: ${JEV_WORKER_POLL_MS:-1000}
 
   migrate:
     <<: *node-service
