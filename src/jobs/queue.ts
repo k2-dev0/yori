@@ -3,13 +3,15 @@ import { v7 as uuidv7 } from 'uuid';
 
 // route_search は分類待ちに依存させず、常に分類より先に処理する。
 export const ROUTE_SEARCH_PRIORITY = 100;
+export const EXECUTE_SEARCH_PRIORITY = 80;
+export const BUILD_DOCUMENTS_PRIORITY = 20;
 export const CLASSIFY_MESSAGE_PRIORITY = 10;
 export const DEFAULT_JOB_LEASE_MS = 60_000;
 
 // 同一sessionの分類claimを直列化するadvisory lock key1。key2はsession_idから導出する。
 const SESSION_CLAIM_LOCK_NAMESPACE = 20260923;
 
-export const JOB_KINDS = ['classify_message', 'route_search'] as const;
+export const JOB_KINDS = ['classify_message', 'route_search', 'build_documents', 'execute_search'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export const JOB_STATUSES = ['pending', 'running', 'completed', 'failed', 'blocked_policy'] as const;
@@ -267,7 +269,7 @@ export async function claimJobs(pool: Pool, input: ClaimJobsInput): Promise<Clai
 }
 
 // job id・lease token・対象revision・未失効leaseがすべて一致する完了だけを受け付ける。
-export async function completeJob(pool: Pool, input: CompleteJobInput): Promise<boolean> {
+export async function completeJob(pool: Pool | PoolClient, input: CompleteJobInput): Promise<boolean> {
   const result = await pool.query(
     `UPDATE jobs
         SET status = 'completed', lease_token = NULL, lease_expires_at = NULL, updated_at = now()
@@ -282,7 +284,7 @@ export async function completeJob(pool: Pool, input: CompleteJobInput): Promise<
 }
 
 // 一時障害はRetry-Afterと指数バックオフ+jitterでpendingへ戻し、恒久エラーはfailedとして保持する。
-export async function failJob(pool: Pool, input: FailJobInput): Promise<boolean> {
+export async function failJob(pool: Pool | PoolClient, input: FailJobInput): Promise<boolean> {
   const retryAfterMs = input.retryAfterMs ?? 0;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs < 0) {
     throw new Error('retryAfterMsが不正です');
@@ -315,12 +317,26 @@ export async function failJob(pool: Pool, input: FailJobInput): Promise<boolean>
 }
 
 // ポリシー未確認はblocked_policyとして保持し、外部送信を伴う自動再試行を止める。
-export async function blockJob(pool: Pool, input: BlockJobInput): Promise<boolean> {
+export async function blockJob(pool: Pool | PoolClient, input: BlockJobInput): Promise<boolean> {
   const result = await pool.query(
     `UPDATE jobs
         SET status = 'blocked_policy', lease_token = NULL, lease_expires_at = NULL, error_code = $3, updated_at = now()
       WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()`,
     [input.jobId, input.leaseToken, input.errorCode],
+  );
+  return result.rowCount === 1;
+}
+
+// 長いmulti-part処理の間、所有を保ったままleaseを延長する。延長できなければ所有喪失。
+export async function renewJobLease(pool: Pool | PoolClient, input: { jobId: string; leaseToken: string; leaseMs: number }): Promise<boolean> {
+  if (!Number.isFinite(input.leaseMs) || input.leaseMs < 1 || input.leaseMs > MAX_LEASE_MS) {
+    throw new Error(`leaseMsは1..${MAX_LEASE_MS}で指定してください`);
+  }
+  const result = await pool.query(
+    `UPDATE jobs
+        SET lease_expires_at = now() + interval '1 millisecond' * $3, updated_at = now()
+      WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_expires_at > now()`,
+    [input.jobId, input.leaseToken, input.leaseMs],
   );
   return result.rowCount === 1;
 }
