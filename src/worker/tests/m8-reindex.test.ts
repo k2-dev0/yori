@@ -29,8 +29,8 @@ import {
   VOYAGE_QUERY_INPUT_TYPE,
   VOYAGE_TOKENIZER_VERSION,
 } from '../contract.js';
-import { ensureActiveGeneration } from '../embedding.js';
-import { seedApproval, seedMessage, seedSession, readSearchRequest, sleep, type FakeJevServer } from './support.js';
+import { acquireCompanyGenerationLock, ensureActiveGeneration } from '../embedding.js';
+import { advanceRevision, seedApproval, seedMessage, seedSession, readSearchRequest, sleep, type FakeJevServer } from './support.js';
 import {
   allJevRawBody,
   basisVector,
@@ -252,13 +252,14 @@ async function readTargetPublications(pool: Pool, projectId: string, generationI
 interface ReindexRunRow {
   id: string;
   status: string;
+  error_code: string | null;
   source_generation_id: string | null;
   target_generation_id: string | null;
 }
 
 async function latestReindexRun(pool: Pool, projectId: string): Promise<ReindexRunRow | undefined> {
   const result = await pool.query<ReindexRunRow>(
-    `SELECT id, status, source_generation_id, target_generation_id
+    `SELECT id, status, error_code, source_generation_id, target_generation_id
        FROM reindex_runs WHERE project_id = $1
       ORDER BY created_at DESC, id DESC LIMIT 1`,
     [projectId],
@@ -291,6 +292,78 @@ function runCliProcess(argv: string[], env: NodeJS.ProcessEnv): Promise<CliProce
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+// test専用gate。pg_locksのgranted=falseを確認して、sleep依存ではなくlock待ちでraceを同期する。
+async function waitForLockWaiter(pool: Pool, classId: number, objId: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM pg_locks
+        WHERE locktype = 'advisory' AND classid::bigint = $1::bigint AND objid::bigint = $2::bigint AND granted = false`,
+      [classId, objId],
+    );
+    if (Number(result.rows[0]?.count ?? '0') > 0) {
+      return true;
+    }
+    await sleep(10);
+  }
+  return false;
+}
+
+// 別projectの初回generation設定が完了したかをDB状態で確認する。
+async function waitForProjectGeneration(pool: Pool, projectId: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ active_generation_id: string | null }>(
+      'SELECT active_generation_id FROM projects WHERE id = $1',
+      [projectId],
+    );
+    if (result.rows[0]?.active_generation_id != null) {
+      return true;
+    }
+    await sleep(10);
+  }
+  return false;
+}
+
+async function waitForNewTargetPublication(
+  pool: Pool,
+  projectId: string,
+  sourceGenerationId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM document_publications p
+         JOIN search_documents d ON d.id = p.document_id
+        WHERE d.project_id = $1 AND p.generation_id <> $2`,
+      [projectId, sourceGenerationId],
+    );
+    if (Number(result.rows[0]?.count ?? '0') > 0) {
+      return true;
+    }
+    await sleep(10);
+  }
+  return false;
+}
+
+async function waitForReindexRun(pool: Pool, projectId: string, sourceGenerationId: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM reindex_runs
+        WHERE project_id = $1 AND source_generation_id = $2 AND status IN ('pending', 'running', 'blocked_policy')`,
+      [projectId, sourceGenerationId],
+    );
+    if (Number(result.rows[0]?.count ?? '0') > 0) {
+      return true;
+    }
+    await sleep(10);
+  }
+  return false;
 }
 
 interface MetricsJson {
@@ -1028,6 +1101,190 @@ describe('M8 再索引と世代切替', () => {
       '拒否すべきreindex参照世代が消えた',
     );
   });
+  it('cutoverのretireと別projectの初回generation設定が競合してもretired generationをactive参照しない', { timeout: 30_000 }, async () => {
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const projectB = await insertProject(pool, workspace.companyId, `repo-race-${uuidv7()}`);
+    await addProjectMember(pool, projectB, workspace.employeeId);
+
+    // cutoverのsource retireだけをtest用triggerで停止し、company lock待ちを固定する。
+    const gate = await pool.connect();
+    let gateLocked = false;
+    try {
+      await pool.query(
+        `CREATE OR REPLACE FUNCTION m8_test_pause_retire() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           PERFORM pg_advisory_xact_lock(20261002, 770001);
+           RETURN NEW;
+         END $$`,
+      );
+      await pool.query('DROP TRIGGER IF EXISTS m8_test_pause_retire_trigger ON embedding_generations');
+      await pool.query(
+        `CREATE TRIGGER m8_test_pause_retire_trigger
+           AFTER UPDATE OF status ON embedding_generations
+           FOR EACH ROW WHEN (NEW.status = 'retired')
+           EXECUTE FUNCTION m8_test_pause_retire()`,
+      );
+      await gate.query('SELECT pg_advisory_lock(20261002, 770001)');
+      gateLocked = true;
+
+      const reindexing = runCli(['reindex', workspace.projectId], env);
+      assert.ok(await waitForLockWaiter(pool, 20261002, 770001, 5_000), 'cutoverのretireがtest gateで停止しなかった');
+      const ensureB = ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: projectB }, config);
+      // fix前はretire commit前に別project pointerがsource世代へ進む。fix後はcompany lockで待つ。
+      await waitForProjectGeneration(pool, projectB, 1_000);
+      await gate.query('SELECT pg_advisory_unlock(20261002, 770001)');
+      gateLocked = false;
+      const [code] = await Promise.all([reindexing, ensureB]);
+      assert.equal(code, 0, `reindexが成功終了しなかった: ${code}`);
+
+      const activeB = await pool.query<{ active_generation_id: string | null; status: string }>(
+        `SELECT p.active_generation_id, g.status
+           FROM projects p
+           JOIN embedding_generations g ON g.id = p.active_generation_id
+          WHERE p.id = $1`,
+        [projectB],
+      );
+      assert.ok(activeB.rows[0]?.active_generation_id, '別projectのactive generationが設定されていない');
+      assert.equal(activeB.rows[0]?.status, 'active', '別projectがretired generationをactive参照した');
+      assert.notEqual(activeB.rows[0]?.active_generation_id, source.id, '別projectがretire対象sourceを参照した');
+      const retiredSource = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [
+        source.id,
+      ]);
+      assert.equal(retiredSource.rows[0]?.status, 'retired', 'source generationがretireされていない');
+    } finally {
+      if (gateLocked) {
+        await gate.query('SELECT pg_advisory_unlock(20261002, 770001)').catch(() => undefined);
+      }
+      await pool.query('DROP TRIGGER IF EXISTS m8_test_pause_retire_trigger ON embedding_generations').catch(() => undefined);
+      await pool.query('DROP FUNCTION IF EXISTS m8_test_pause_retire()').catch(() => undefined);
+      gate.release();
+    }
+  });
+
+  it('desired revisionのsourceが現行revisionでなくなった文書はtargetへ公開しない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const document = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-stale-source',
+      text: 'M8-STALE-SOURCE',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    // source messageだけを改訂し、document desired revisionのsourceを現行でなくする。
+    await advanceRevision(pool, document.messageId, 'M8-STALE-SOURCE-REVISED');
+
+    assert.notEqual(await runCli(['reindex', workspace.projectId], env), 0, '現行でないsourceのreindexが成功扱いになった');
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), source.id, 'source不整合でactive世代を切り替えた');
+    const run = await latestReindexRun(pool, workspace.projectId);
+    assert.ok(run, 'reindex runが残っていない');
+    assert.notEqual(run.status, 'completed', 'source不整合のrunをcompletedにした');
+    assert.ok(run.target_generation_id);
+    const publications = await pool.query('SELECT 1 FROM document_publications WHERE generation_id = $1', [
+      run.target_generation_id,
+    ]);
+    assert.equal(publications.rows.length, 0, '現行でないsourceのtarget publicationを作成した');
+    const embeddings = await pool.query('SELECT 1 FROM document_embeddings WHERE generation_id = $1', [
+      run.target_generation_id,
+    ]);
+    assert.equal(embeddings.rows.length, 0, '現行でないsourceのtarget embeddingを作成した');
+  });
+
+  it('cutover時にproject pointerがrun開始時sourceと違えばpointerを上書きしない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const other = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl, status: 'active' });
+
+    const lock = await pool.connect();
+    try {
+      await lock.query('BEGIN');
+      // cutoverと同じcompany generation lockをtest側で先に保持し、cutoverだけをrun作成後に停止する。
+      await acquireCompanyGenerationLock(lock, workspace.companyId);
+      const reindexing = runCli(['reindex', workspace.projectId], env);
+      assert.ok(await waitForReindexRun(pool, workspace.projectId, source.id, 5_000), 'reindex runが作成されなかった');
+      await lock.query('UPDATE projects SET active_generation_id = $2, updated_at = now() WHERE id = $1', [
+        workspace.projectId,
+        other,
+      ]);
+      await lock.query('COMMIT');
+      assert.notEqual(await reindexing, 0, 'source mismatchのcutoverが成功扱いになった');
+    } finally {
+      await lock.query('ROLLBACK').catch(() => undefined);
+      lock.release();
+    }
+
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), other, 'run開始時sourceと違うpointerを上書きした');
+    const run = await latestReindexRun(pool, workspace.projectId);
+    assert.ok(run, 'reindex runが残っていない');
+    assert.equal(run.status, 'pending', 'source mismatchのrunをresume可能な状態にしていない');
+    assert.equal(run.error_code, 'source_changed');
+    assert.ok(run.target_generation_id !== null && run.target_generation_id !== other, 'source mismatchでtargetを別世代にした');
+    const target = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [
+      run.target_generation_id,
+    ]);
+    assert.notEqual(target.rows[0]?.status, 'active', 'source mismatchでtarget generationをactiveにした');
+  });
+  it('target publication作成後・cutover直前にsourceが改訂されたら旧sourceのまま切り替えない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const document = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-cutover-race',
+      text: 'M8-CUTOVER-RACE',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+
+    const lock = await pool.connect();
+    try {
+      await lock.query('BEGIN');
+      // cutoverと同じcompany lockを先に保持し、applyEmbeddings完了後・完全性確認前に停止する。
+      await acquireCompanyGenerationLock(lock, workspace.companyId);
+      const reindexing = runCli(['reindex', workspace.projectId], env);
+      assert.ok(
+        await waitForNewTargetPublication(pool, workspace.projectId, source.id, 5_000),
+        'target publicationがgate前に作成されなかった',
+      );
+      // publication作成後にsource messageだけを改訂し、cutover直前のsource検証と競合させる。
+      await advanceRevision(pool, document.messageId, 'M8-CUTOVER-RACE-REVISED');
+      await lock.query('COMMIT');
+      assert.notEqual(await reindexing, 0, '旧sourceのままcutoverが成功扱いになった');
+    } finally {
+      await lock.query('ROLLBACK').catch(() => undefined);
+      lock.release();
+    }
+
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), source.id, '旧sourceのままactive世代を切り替えた');
+    const run = await latestReindexRun(pool, workspace.projectId);
+    assert.ok(run, 'reindex runが残っていない');
+    assert.notEqual(run.status, 'completed', '旧sourceのrunをcompletedにした');
+  });
 });
 
 describe('M8 運用metrics', () => {
@@ -1191,5 +1448,28 @@ describe('M8 運用metrics', () => {
     assert.equal(metricsB.jobs.pending, 1, 'project Bのjob件数が違う');
     assert.ok(metricsB.search_duration_ms.p50 >= 1000, '他projectのdurationを混ぜた');
     assert.ok(!JSON.stringify(metricsB).includes(docOne.text), 'project Bのmetricsへproject Aの本文を含めた');
+  });
+
+  it('durationはsample行数に比例してNodeへ読まず、SQL集約のcount/p50/p95を返す', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const env = workerEnv();
+    const config = loadWorkerConfig(env).config;
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    await pool.query(
+      `INSERT INTO search_duration_samples (id, company_id, project_id, generation_id, duration_ms)
+       SELECT gen_random_uuid(), $1, $2, $3, value FROM generate_series(1, 101) AS value`,
+      [workspace.companyId, workspace.projectId, source.id],
+    );
+
+    const result = await runCliProcess(['metrics', workspace.projectId], env);
+    assert.equal(result.code, 0, `metricsが失敗した: ${result.stderr}`);
+    const metrics = JSON.parse(result.stdout) as MetricsJson;
+    assert.equal(metrics.search_duration_ms.samples, 101, 'sample件数の集約が違う');
+    assert.equal(metrics.search_duration_ms.p50, 51, 'p50のSQL集約が違う');
+    assert.equal(metrics.search_duration_ms.p95, 96, 'p95のSQL集約が違う');
   });
 });
