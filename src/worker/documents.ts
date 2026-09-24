@@ -735,6 +735,15 @@ export async function applyDocumentPlan(
         continue;
       }
       if (unchanged && document.is_searchable) {
+        // 0005適用前にreadyだった文書など、entityが空/古い場合も現在contentから決定的に同期する。
+        // revision/publication/embeddingは変更せず、削除→挿入で余剰entityも残さない。
+        await replaceEntities(client, {
+          documentId: document.id,
+          revision: latest.revision,
+          companyId: input.companyId,
+          projectId: input.projectId,
+          content: chunk.content,
+        });
         continue;
       }
       if (unchanged && !document.is_searchable) {
