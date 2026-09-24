@@ -69,6 +69,7 @@ interface M7Evidence {
   relation?: string;
   related_to_message_id?: string;
   related_to_revision?: number;
+  relations?: Array<{ relation?: string; related_to_message_id?: string; related_to_revision?: number }>;
   source_kind?: string;
 }
 
@@ -715,6 +716,60 @@ describe('M7 revoke・changeの後続探索', () => {
     const ids = related.map((item) => item.message_id);
     assert.equal(new Set(ids).size, ids.length, 'related_evidenceに重複messageがある');
     assert.deepEqual(match.related_evidence_ids, [...new Set(ids)], 'related_evidence_idsが初出順の重複除去になっていない');
+  });
+
+  it('1つのchangeが代表文書内の2つのprimary evidenceを訂正してもrelated原文1件・relation 2件で返す', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace, { sourceSessionId: 'm7-dual-correction' });
+    const textA = 'PRIMARY-DUAL-A';
+    const a = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: textA });
+    const correction = await seedMessage(pool, { sessionId, sequenceNo: 2, text: 'DUAL-CORRECTION' });
+    const textB = 'PRIMARY-DUAL-B';
+    const b = await seedMessage(pool, { sessionId, sequenceNo: 3, role: 'assistant', text: textB });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 5, text: 'QUERY-M7-DUAL' });
+    const content = `${textA}\n${textB}`;
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId,
+      documentKey: 'm7-dual-correction-doc',
+      content,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [
+        { messageId: a.messageId, messageRevision: 1, startOffset: 0, endOffset: textA.length },
+        { messageId: b.messageId, messageRevision: 1, startOffset: textA.length + 1, endOffset: content.length },
+      ],
+    });
+    await seedRelation(pool, { sourceMessageId: correction.messageId, sourceRevision: 1, targetMessageId: a.messageId, targetRevision: 1, relation: 'change' });
+    await seedRelation(pool, { sourceMessageId: correction.messageId, sourceRevision: 1, targetMessageId: b.messageId, targetRevision: 1, relation: 'change' });
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    const evidenceIds = (match.evidence ?? []).map((item) => item.message_id);
+    assert.ok(evidenceIds.includes(a.messageId) && evidenceIds.includes(b.messageId), '2つのprimary evidenceがない');
+    const items = relatedEvidence(match).filter((item) => item.text.includes('DUAL-CORRECTION'));
+    assert.equal(items.length, 1, `related原文がmessage単位で1件になっていない: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+    const item = items[0] as M7Evidence;
+    assert.equal(item.source_kind, 'correction');
+    assert.equal(item.relations?.length, 2, '複数targetのrelation metadataが失われている');
+    assert.deepEqual(
+      new Set((item.relations ?? []).map((relation) => relation.related_to_message_id)),
+      new Set([a.messageId, b.messageId]),
+    );
+    for (const relation of item.relations ?? []) {
+      assert.equal(relation.relation, 'change');
+      assert.equal(relation.related_to_revision, 1);
+    }
+    assert.equal(item.relation, 'change', '単一relation公開fieldとの互換がない');
   });
 
   it('代表根拠の前後2以内にあるchange/revokeもcorrection metadataで返す', async () => {
