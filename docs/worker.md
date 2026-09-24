@@ -129,7 +129,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 開始時のactive generationを固定し、Voyageへ`input_type=query`で質問を埋め込む。世代なしは外部送信なしの`no_match`、spec不一致は`embedding_generation_mismatch`。
 - 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけで予算超過なら`input_budget_exceeded`。
-- Jevのuseful/direct候補から代表1件を選び、原文revision・社員・role・日時・本文をresultへ保存する。保存直前にlease、入力revision、publication、source revision、scopeを再検証する。
+- Jevのuseful/direct候補から代表1件を選ぶ。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
 - input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
 
 ### 評価キャッシュ
