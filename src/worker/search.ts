@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import { validate as validateUuid } from 'uuid';
+import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
 import { completeJob, type ClaimedJob } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import {
@@ -32,8 +32,8 @@ import {
   type JevState,
 } from './contract.js';
 import { InputBudgetError, loadJobTarget, type JobTarget } from './context.js';
-import { loadFixedGeneration, VoyageEmbeddingProvider, type EmbeddingGeneration } from './embedding.js';
-import { TargetMissingError, LeaseLostError, PolicyBlockedError, StaleApplyError } from './errors.js';
+import { loadPinnedGeneration, VoyageEmbeddingProvider, type EmbeddingGeneration } from './embedding.js';
+import { GenerationMismatchError, TargetMissingError, LeaseLostError, PolicyBlockedError, StaleApplyError } from './errors.js';
 import { extractEntityReferences } from './identifiers.js';
 import {
   JevCallError,
@@ -68,6 +68,7 @@ interface SearchRequestRow {
   input_revision: number;
   input_sequence_no: number;
   question: string | null;
+  embedding_generation_id: string | null;
 }
 
 interface CandidateSource {
@@ -297,6 +298,7 @@ async function loadCandidates(
 ): Promise<Candidate[]> {
   // 検索の識別子経路は検索質問から抽出する。autoはinput原文、manualは受付へ保存した質問を使う。
   const identifiers = extractEntityReferences(input.question);
+  const startedAt = Date.now();
   const client = await pool.connect();
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
@@ -343,6 +345,12 @@ async function loadCandidates(
         });
       }
     }
+    // DB候補検索のdurationだけをproject/generation scopeで観測する。本文・質問は保存しない。
+    await client.query(
+      `INSERT INTO search_duration_samples (id, company_id, project_id, generation_id, duration_ms)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [uuidv7(), input.target.companyId, input.target.projectId, input.generation.id, Math.max(0, Date.now() - startedAt)],
+    );
     await client.query('COMMIT');
     return [...candidates.values()].sort((left, right) => right.rrfScore - left.rrfScore || compareCandidates(left, right));
   } catch (error) {
@@ -900,8 +908,8 @@ async function saveSearchResult(
     ) {
       throw new StaleApplyError('jobのidentityまたはpayloadが変化しました');
     }
-    const request = await client.query<{ status: string }>(
-      `SELECT status FROM search_requests
+    const request = await client.query<{ status: string; embedding_generation_id: string | null }>(
+      `SELECT status, embedding_generation_id FROM search_requests
         WHERE id = $1 AND status = 'running'
           AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
           AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8
@@ -920,6 +928,11 @@ async function saveSearchResult(
     );
     if (request.rows.length === 0) {
       throw new StaleApplyError('search_requestのidentityまたはscopeが変化しました');
+    }
+    // 開始時に固定した世代を候補比較・結果のindex_statusまで一貫して使う。
+    const expectedGenerationId = input.generation === null ? null : input.generation.id;
+    if (request.rows[0].embedding_generation_id !== expectedGenerationId) {
+      throw new StaleApplyError('search_requestの固定世代が変化しました');
     }
     // input messageのscope正本（message/session/project）を共有lockし、commitまで所属変更を待たせる。
     const inputMessage = await client.query<{
@@ -1054,7 +1067,8 @@ export function searchRequestIdFromPayload(payload: unknown): string | null {
 // jobのmessage/revisionとsearch_requestのscope・input revision・new_searchを照合する。
 async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
-    `SELECT id, trigger, search_action, status, result, input_id, input_revision, input_sequence_no, question
+    `SELECT id, trigger, search_action, status, result, input_id, input_revision, input_sequence_no, question,
+              embedding_generation_id
        FROM search_requests
       WHERE id = $1
         AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
@@ -1075,6 +1089,56 @@ async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: strin
     throw new TargetMissingError('execute_searchのsearch_requestがjobの対象と一致しません');
   }
   return request;
+}
+
+// 検索要求の開始世代を固定する。既存pinはproject切替後も再利用し、NULLなら現在activeを
+// request行のロック下で保存してから返す。activeが無ければnullを返し、外部送信しない。
+async function resolveSearchGeneration(
+  pool: Pool,
+  input: { target: JobTarget; request: SearchRequestRow; config: WorkerConfig },
+): Promise<EmbeddingGeneration | null> {
+  let generationId = input.request.embedding_generation_id;
+  if (generationId === null) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query<{ embedding_generation_id: string | null }>(
+        'SELECT embedding_generation_id FROM search_requests WHERE id = $1 FOR UPDATE',
+        [input.request.id],
+      );
+      if (request.rows.length === 0) {
+        throw new StaleApplyError('search_requestの固定世代を確認できません');
+      }
+      generationId = request.rows[0].embedding_generation_id;
+      if (generationId === null) {
+        const project = await client.query<{ active_generation_id: string | null }>(
+          'SELECT active_generation_id FROM projects WHERE id = $1 AND company_id = $2 FOR SHARE',
+          [input.target.projectId, input.target.companyId],
+        );
+        if (project.rows.length === 0) {
+          throw new GenerationMismatchError('projectがありません');
+        }
+        const activeId = project.rows[0].active_generation_id;
+        if (activeId !== null) {
+          await client.query(
+            'UPDATE search_requests SET embedding_generation_id = $2, updated_at = now() WHERE id = $1 AND embedding_generation_id IS NULL',
+            [input.request.id, activeId],
+          );
+          generationId = activeId;
+        }
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  if (generationId === null) {
+    return null;
+  }
+  return loadPinnedGeneration(pool, { companyId: input.target.companyId, generationId }, input.config);
 }
 
 // execute_search 1件を処理する。期待される外部障害はprocessJob側でjob/search状態へ反映する。
@@ -1111,7 +1175,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   }
   // 外部HTTPへ進む前に、対象requestだけをrunningにする。
   await markSearchRunning(pool, job, target, request);
-  const generation = await loadFixedGeneration(pool, { companyId: target.companyId, projectId: target.projectId }, config);
+  const generation = await resolveSearchGeneration(pool, { target, request, config });
   if (generation === null) {
     await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], evaluations: [], exploration: null });
     return;
