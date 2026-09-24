@@ -72,8 +72,9 @@ async function insertJob(options: InsertJobOptions = {}): Promise<string> {
   const id = uuidv7();
   jobClock += 1;
   await pool.query(
+    // next_run_atの既定はDB時刻にする。host時計とDB時計のskewで未到来扱いになるのを避ける。
     `INSERT INTO jobs (id, kind, status, priority, session_id, message_id, target_revision, payload, idempotency_key, lease_token, lease_expires_at, next_run_at, error_code, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, '{}'::jsonb, $8, $9, $10, $11, $12, $13)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, '{}'::jsonb, $8, $9, $10, COALESCE($11, now()), $12, $13)`,
     [
       id,
       options.kind ?? 'classify_message',
@@ -85,7 +86,7 @@ async function insertJob(options: InsertJobOptions = {}): Promise<string> {
       `job-${id}`,
       options.leaseToken ?? null,
       options.leaseExpiresAt ?? null,
-      options.nextRunAt ?? new Date(),
+      options.nextRunAt ?? null,
       options.errorCode ?? null,
       new Date(jobClock),
     ],
