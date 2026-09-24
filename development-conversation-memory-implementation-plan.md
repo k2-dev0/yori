@@ -3,7 +3,7 @@
 - 文書作成日：2026-09-21
 - 対象：Codex／Claude Code と社員の会話を集約し、別の社員・別のセッションから再利用する社内システム
 - 文書の用途：別の実装エージェントへの引き継ぎ
-- 状態：M1〜M6のローカル実装・合成fixture検証済み。M3/M4にはユーザー指定の保留事項あり（12.1節）。M0の外部仕様確認とM7〜M8は残作業。実端末への導入・実データ送信・クラウド配置・性能検証は未実施
+- 状態：M1〜M7のローカル実装・合成fixture検証済み。M3/M4にはユーザー指定の保留事項あり（12.1節）。M0の外部仕様確認とM8は残作業。実端末への導入・実データ送信・クラウド配置・性能検証は未実施
 - 改訂方針：2026-09-21、管理型の記憶・検索サービスを採用せず、PostgreSQL＋pgvectorで自作する。旧MySQL＋Supermemory案は廃止。
 - 用語：本書の「必須」は実装要件、「初期値」は設定変更可能な出発点、「将来」は今回の実装対象外
 
@@ -732,7 +732,7 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 
 全段階を対象とするが、最初の縦通しは「Aの発言保存→Bの検索→原文表示」。深い引き継ぎ探索はその後に追加する。
 
-### 12.1 実装状況（2026-09-24）
+### 12.1 実装状況（2026-09-25）
 
 | 段階 | 状況・残件 |
 |---|---|
@@ -743,7 +743,7 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 | M4 | ローカル実装済み。決定的文書分割、VoyageEmbeddingProvider、送信ゲート、世代・公開revision・原文対応・cache。確定仕様は[実装契約](docs/m4-design.md) |
 | M5 | ローカル実装済み。案件内の厳密vector検索、明示識別子完全一致、RRF、Jev候補判定、原文根拠付き結果保存、世代・revision・lease競合制御。確定仕様は[実装契約](docs/m5-design.md) |
 | M6 | ローカル実装済み。HTTP/MCPの入力ID照合、最大5秒の結果待機、追加検索、原文取得、短い対応記録。確定仕様は[実装契約](docs/m6-design.md)、設定・起動は[MCP手順](docs/mcp.md) |
-| M7 | 未実装。前後・引き継ぎ・撤回探索、link_session、公式フックで安全に実現可能な補助通知 |
+| M7 | ローカル実装済み。前後・明示／限定推定の引き継ぎ・撤回／訂正探索、link_session、上限・循環検知、結果取得時の再検証、公式非同期フック用の補助通知。確定仕様は[実装契約](docs/m7-design.md) |
 | M8 | 未実装。再索引・世代切替・VM配置・HTTPS・資源監視・性能検証 |
 
 検証: 収集単独63件、既存API/DBと収集を含む130件が成功。配置・永続化7件、typecheck/lint/buildも成功。外部AIへ実データ送信なし。対応確認版はCodex Desktop `0.155.0-alpha.9.2`とClaude Code `2.1.220`。未知版は保留。実Gitの既存repository解決は確認したが、実worktree作成のスモークは環境の`.git`保護により未確認。Stop時点でまだログにない発言は次のhookまたは明示flushで回収するため、M6の即時検索完了とは扱わない。
@@ -755,6 +755,8 @@ M3追加後の検証: API/DB・収集・workerを含む182件、配置・永続�
 M5追加後の検証: srcテスト310件、配置・永続化7件、typecheck/lint/buildが成功。M5単独54件で社員横断検索、案件境界、自己根拠除外、複数階層・hidden directory・文末句読点を含むpath識別子、既存ready文書のentity backfill、payload UUID・job session・成功/障害保存前identityとinput所属scopeの隔離、RRF、候補・token上限と全候補予算外の失敗区別、6項目の独立候補判定と生回答保存、no_match、承認・provider障害、世代固定、stale input、原文改訂の両競合順序、publication/revision/lease競合、冪等性、runnerを実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。TypeSafe公式APIのstructured state契約は確認したが、実アカウントでの候補判定疎通は未実施。
 
 M6追加後の検証: srcテスト353件、typecheck/lint/buildが成功。M6 API 26件とstdio MCP 16件で、検索状態・outcomeの区別、reuse元追跡と根拠revision再検証、内部／外部入力ID照合、not_received、最大5秒のlong-poll、manual検索の冪等性・force refresh・質問本文のVoyage/Jev利用、案件・認証境界、4ツール、strict入力、中央API応答検証、HTTPS／loopback制約、標準出力非汚染、短い対応記録と600文字警告を実PostgreSQLとloopback fixtureで検証。原文取得は同一案件の保存済みrevisionを返すsmokeを実施。公式TypeScript SDK `@modelcontextprotocol/server` 2.1.0を固定した。実端末へのMCP登録、実Jev・実Voyage・実会話送信、M7の探索・通知は未実施。
+
+M7追加後の検証: srcテスト404件、typecheck/lint/buildが成功。M7単独44件で、session linkの保存制約・外部identity解決・認証社員の引き継ぎ先境界・冪等性・根拠revision競合、HTTP/MCP `link_session`、代表根拠の前後2発言、別sessionを起点とする明示linkの両方向3 hop・合計10 session・循環検知、同社員の前後各3 sessionと共通Issue／PR候補のJev判定、撤回／訂正chain、約6,000 token予算、保存直前とGET時のrevision・relation・active link再検証、UserPromptSubmit非同期hook用の補助通知を実PostgreSQLとloopback fixtureで検証。実Jev・実Voyage・実会話は使用していない。補助通知は安全な次のmodel入力へ追加するだけで、新しいturnを強制開始せず、MCPの明示取得を置き換えない。実端末へのhook・MCP登録は未実施。
 
 ## 13. 必須の受け入れ条件
 
