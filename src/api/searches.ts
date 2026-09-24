@@ -1,0 +1,501 @@
+import { createHash } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import type { Pool } from 'pg';
+import { v7 as uuidv7 } from 'uuid';
+import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contract.js';
+import type { AuthContext } from './events.js';
+import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
+import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
+
+// M6の明示検索受付・結果取得・入力照合・原文取得。認証はroute側で行い、
+// ここでは会社・案件membershipを含むscope照合と固定codeへ写せる失敗だけを返す。
+
+export class SearchNotFoundError extends Error {}
+export class SearchConflictError extends Error {}
+export class SearchTargetError extends Error {}
+
+export interface CreatedSearch {
+  requestId: string;
+  reused: boolean;
+}
+
+interface InputTargetRow {
+  id: string;
+  role: string;
+  current_revision: number;
+  sequence_no: number;
+  session_id: string;
+  employee_id: string;
+  project_id: string;
+  company_id: string;
+  text: string;
+}
+
+interface SearchRequestRow {
+  id: string;
+  company_id: string;
+  project_id: string;
+  employee_id: string;
+  session_id: string;
+  input_id: string;
+  input_revision: number;
+  trigger: string;
+  status: string;
+  outcome: string | null;
+  search_action: string | null;
+  reused_from_request_id: string | null;
+  original_request_id: string | null;
+  result: unknown;
+  error_code: string | null;
+}
+
+export interface SearchView {
+  request_id: string;
+  input_id: string;
+  input_revision: number;
+  trigger: string;
+  search_action: string | null;
+  reused_from_request_id: string | null;
+  status: string;
+  outcome: string | null;
+  error_code: string | null;
+  project_id: string;
+  matches: unknown[];
+  warnings: unknown[];
+  index_status?: unknown;
+}
+
+export interface NotReceivedView {
+  lookup_status: 'not_received';
+  request_id: null;
+  input_id: null;
+  input_revision: null;
+  trigger: null;
+  status: null;
+  outcome: null;
+}
+
+export type SearchLookupView = NotReceivedView | ({ lookup_status: 'found' } & SearchView);
+
+export interface EvidenceView {
+  message_id: string;
+  revision: number;
+  employee_id: string;
+  role: string;
+  occurred_at: string;
+  text: string;
+}
+
+// 明示受付の条件hash。同じ冪等キーで質問・入力・force_refreshが変わった再送をconflictにする。
+function manualConditionHash(input: ParsedSearchRequest): Buffer {
+  const canonical = {
+    question: input.query,
+    input_id: input.input_id,
+    input_revision: input.input_revision,
+    project_id: input.project_id,
+    force_refresh: input.force_refresh,
+    policy_version: AUTO_SEARCH_POLICY_VERSION,
+  };
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest();
+}
+
+// 明示検索を受付ける。同条件の自動受付は処理状態にかかわらず再利用し、
+// それ以外は冪等キー単位でmanual受付とexecute_search jobを同一TXで作る。
+export async function createSearch(pool: Pool, auth: AuthContext, request: ParsedSearchRequest): Promise<CreatedSearch> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // イベント受付と同じ社員単位ロックを取り、入力revisionの判定と受付作成を直列化する。
+    await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [
+      EVENT_WRITE_LOCK_NAMESPACE,
+      `${auth.companyId}:${auth.employeeId}`,
+    ]);
+    const targetResult = await client.query<InputTargetRow>(
+      `SELECT m.id, m.role, m.current_revision, m.sequence_no, m.session_id,
+              s.employee_id, s.project_id, p.company_id, r.text
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         JOIN projects p ON p.id = s.project_id
+         JOIN message_revisions r ON r.message_id = m.id AND r.revision = m.current_revision
+        WHERE m.id = $1`,
+      [request.input_id],
+    );
+    const target = targetResult.rows[0];
+    if (
+      target === undefined ||
+      target.company_id !== auth.companyId ||
+      target.project_id !== request.project_id ||
+      target.employee_id !== auth.employeeId
+    ) {
+      // 他社員・他案件のmessageは存在を開示せず404へ写す。
+      throw new SearchNotFoundError();
+    }
+    if (target.role !== 'user') {
+      throw new SearchTargetError();
+    }
+    if (target.current_revision !== request.input_revision) {
+      throw new SearchConflictError();
+    }
+    if (!request.force_refresh && request.query === target.text) {
+      const auto = await client.query<{ id: string }>(
+        `SELECT id
+           FROM search_requests
+          WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND employee_id = $4`,
+        [target.id, target.current_revision, AUTO_SEARCH_POLICY_VERSION, auth.employeeId],
+      );
+      const reused = auto.rows[0];
+      if (reused !== undefined) {
+        await client.query('COMMIT');
+        return { requestId: reused.id, reused: true };
+      }
+    }
+    const conditionHash = manualConditionHash(request);
+    const existing = await client.query<{ id: string; condition_hash: Buffer }>(
+      `SELECT id, condition_hash
+         FROM search_requests
+        WHERE company_id = $1 AND employee_id = $2 AND trigger = 'manual' AND idempotency_key = $3
+        FOR UPDATE`,
+      [auth.companyId, auth.employeeId, request.idempotency_key],
+    );
+    const duplicate = existing.rows[0];
+    if (duplicate !== undefined) {
+      if (!duplicate.condition_hash.equals(conditionHash)) {
+        throw new SearchConflictError();
+      }
+      await client.query('COMMIT');
+      return { requestId: duplicate.id, reused: true };
+    }
+    const requestId = uuidv7();
+    await client.query(
+      `INSERT INTO search_requests
+         (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no,
+          trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $9, $10, $11, $12)`,
+      [
+        requestId,
+        auth.companyId,
+        request.project_id,
+        auth.employeeId,
+        target.session_id,
+        target.id,
+        target.current_revision,
+        target.sequence_no,
+        AUTO_SEARCH_POLICY_VERSION,
+        request.query,
+        request.idempotency_key,
+        conditionHash,
+      ],
+    );
+    await enqueueJob(client, {
+      kind: 'execute_search',
+      idempotencyKey: `execute_search:${requestId}:${AUTO_SEARCH_POLICY_VERSION}`,
+      priority: EXECUTE_SEARCH_PRIORITY,
+      sessionId: target.session_id,
+      messageId: target.id,
+      targetRevision: target.current_revision,
+      payload: { search_request_id: requestId },
+    });
+    await client.query('COMMIT');
+    return { requestId, reused: false };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+const SEARCH_REQUEST_COLUMNS = `sr.id, sr.company_id, sr.project_id, sr.employee_id, sr.session_id, sr.input_id, sr.input_revision,
+       sr.trigger, sr.status, sr.outcome, sr.search_action, sr.reused_from_request_id,
+       sr.original_request_id, sr.result, sr.error_code`;
+
+async function loadSearchRow(pool: Pool, auth: AuthContext, requestId: string): Promise<SearchRequestRow> {
+  const result = await pool.query<SearchRequestRow>(
+    `SELECT ${SEARCH_REQUEST_COLUMNS}
+       FROM search_requests sr
+       JOIN projects p ON p.id = sr.project_id AND p.company_id = $2
+       JOIN sessions s ON s.id = sr.session_id AND s.project_id = sr.project_id
+      WHERE sr.id = $1 AND sr.company_id = $2
+        AND EXISTS (
+          SELECT 1 FROM project_members pm
+           WHERE pm.project_id = sr.project_id AND pm.employee_id = $3
+        )`,
+    [requestId, auth.companyId, auth.employeeId],
+  );
+  const row = result.rows[0];
+  if (row === undefined) {
+    throw new SearchNotFoundError();
+  }
+  return row;
+}
+
+// reuse元は現在受付と同じ会社・案件・社員・sessionの範囲だけで解決する。
+async function loadOriginRow(pool: Pool, current: SearchRequestRow, originId: string): Promise<SearchRequestRow | null> {
+  const result = await pool.query<SearchRequestRow>(
+    `SELECT ${SEARCH_REQUEST_COLUMNS}
+       FROM search_requests sr
+      WHERE sr.id = $1 AND sr.company_id = $2 AND sr.project_id = $3 AND sr.employee_id = $4 AND sr.session_id = $5`,
+    [originId, current.company_id, current.project_id, current.employee_id, current.session_id],
+  );
+  const row = result.rows[0];
+  if (row === undefined) {
+    return null;
+  }
+  return row;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function resultMatches(result: unknown): unknown[] {
+  const object = asObject(result);
+  return object !== null && Array.isArray(object.matches) ? object.matches : [];
+}
+
+function resultWarnings(result: unknown): unknown[] {
+  const object = asObject(result);
+  return object !== null && Array.isArray(object.warnings) ? object.warnings : [];
+}
+
+// completed結果がobjectならoutcomeにかかわらずindex_status/warningsを返し、matchesはmatchedだけ返す。
+function completedResultParts(row: SearchRequestRow): { matches: unknown[]; warnings: unknown[]; index_status?: unknown } {
+  if (row.status !== 'completed') {
+    return { matches: [], warnings: [] };
+  }
+  const object = asObject(row.result);
+  if (object === null) {
+    return { matches: [], warnings: [] };
+  }
+  return {
+    matches: row.outcome === 'matched' ? resultMatches(row.result) : [],
+    warnings: resultWarnings(row.result),
+    index_status: object.index_status,
+  };
+}
+
+// reuse取得時に現在入力のrevisionとscopeが変わっていないか再検証する。
+async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise<boolean> {
+  const result = await pool.query<{
+    current_revision: number;
+    session_id: string;
+    employee_id: string;
+    project_id: string;
+    company_id: string;
+  }>(
+    `SELECT m.current_revision, m.session_id, s.employee_id, s.project_id, p.company_id
+       FROM messages m
+       JOIN sessions s ON s.id = m.session_id
+       JOIN projects p ON p.id = s.project_id
+      WHERE m.id = $1`,
+    [current.input_id],
+  );
+  const input = result.rows[0];
+  return (
+    input !== undefined &&
+    input.current_revision === current.input_revision &&
+    input.session_id === current.session_id &&
+    input.employee_id === current.employee_id &&
+    input.project_id === current.project_id &&
+    input.company_id === current.company_id
+  );
+}
+
+// reuse先のmatched根拠を現在の原文revisionと案件所属で再検証し、無効なmatchを落とす。
+async function revalidateMatches(pool: Pool, origin: SearchRequestRow, result: unknown): Promise<unknown[]> {
+  const kept: unknown[] = [];
+  for (const match of resultMatches(result)) {
+    const matchObject = asObject(match);
+    const evidence = matchObject !== null && Array.isArray(matchObject.evidence) ? matchObject.evidence : [];
+    if (evidence.length === 0) {
+      continue;
+    }
+    let valid = true;
+    for (const item of evidence) {
+      const evidenceObject = asObject(item);
+      const messageId = evidenceObject?.message_id;
+      const revision = evidenceObject?.revision;
+      if (typeof messageId !== 'string' || typeof revision !== 'number') {
+        valid = false;
+        break;
+      }
+      const current = await pool.query(
+        `SELECT 1
+           FROM messages m
+           JOIN sessions s ON s.id = m.session_id
+           JOIN projects p ON p.id = s.project_id
+          WHERE m.id = $1 AND m.current_revision = $2 AND s.project_id = $3 AND p.company_id = $4`,
+        [messageId, revision, origin.project_id, origin.company_id],
+      );
+      if (current.rows.length === 0) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) {
+      kept.push(match);
+    }
+  }
+  return kept;
+}
+
+function baseView(row: SearchRequestRow): SearchView {
+  return {
+    request_id: row.id,
+    input_id: row.input_id,
+    input_revision: row.input_revision,
+    trigger: row.trigger,
+    search_action: row.search_action,
+    reused_from_request_id: row.reused_from_request_id,
+    status: row.status,
+    outcome: row.outcome,
+    error_code: row.error_code,
+    project_id: row.project_id,
+    matches: [],
+    warnings: [],
+  };
+}
+
+async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView> {
+  const originId = row.original_request_id ?? row.reused_from_request_id;
+  if (originId === null) {
+    return { ...baseView(row), ...completedResultParts(row) };
+  }
+  const origin = await loadOriginRow(pool, row, originId);
+  if (origin === null) {
+    return baseView(row);
+  }
+  const tracking: SearchView = {
+    ...baseView(row),
+    reused_from_request_id: origin.id,
+    status: origin.status,
+    outcome: origin.outcome,
+    error_code: origin.error_code,
+  };
+  const parts = completedResultParts(origin);
+  if (origin.status === 'completed' && origin.outcome === 'matched') {
+    const inputValid = await currentInputValid(pool, row);
+    const matches = inputValid ? await revalidateMatches(pool, origin, origin.result) : [];
+    if (matches.length === 0) {
+      return { ...tracking, outcome: 'no_match', matches: [], warnings: parts.warnings, index_status: parts.index_status };
+    }
+    return { ...tracking, matches, warnings: parts.warnings, index_status: parts.index_status };
+  }
+  return { ...tracking, matches: [], warnings: parts.warnings, index_status: parts.index_status };
+}
+
+function isPendingStatus(status: string): boolean {
+  return status === 'pending' || status === 'running';
+}
+
+// request IDで受付を取得する。pending/runningは期限まで短い間隔で再読込し、状態を変更しない。
+export async function readSearch(pool: Pool, auth: AuthContext, requestId: string, waitMs: number): Promise<SearchView> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const row = await loadSearchRow(pool, auth, requestId);
+    const view = await buildView(pool, row);
+    if (!isPendingStatus(view.status) || Date.now() >= deadline) {
+      return view;
+    }
+    await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
+  }
+}
+
+function notReceived(): NotReceivedView {
+  return { lookup_status: 'not_received', request_id: null, input_id: null, input_revision: null, trigger: null, status: null, outcome: null };
+}
+
+interface LookupRow {
+  id: string;
+  status: string;
+  outcome: string | null;
+  input_id: string;
+  input_revision: number;
+}
+
+// 内部input_idまたは外部取り込み元identityで自動受付を照合する。
+// 内部IDも「現在入力」なので、受付とsessionの社員が認証employeeと一致する場合だけ返す。
+// not_receivedはそのまま返し、foundはreadSearchと同じlong-poll後の完全なSearchViewへlookup_statusを付けて返す。
+export async function lookupSearchByInput(
+  pool: Pool,
+  auth: AuthContext,
+  query: ParsedSearchByInputQuery,
+  waitMs: number,
+): Promise<SearchLookupView> {
+  let result;
+  if ('input_id' in query) {
+    result = await pool.query<LookupRow>(
+      `SELECT sr.id, sr.status, sr.outcome, sr.input_id, sr.input_revision
+         FROM search_requests sr
+         JOIN messages m ON m.id = sr.input_id
+         JOIN sessions s ON s.id = m.session_id
+        WHERE sr.trigger = 'auto'
+          AND sr.company_id = $1 AND sr.project_id = $2 AND sr.employee_id = $3
+          AND s.employee_id = $3 AND s.project_id = $2
+          AND m.id = $4 AND sr.input_revision = $5`,
+      [auth.companyId, query.project_id, auth.employeeId, query.input_id, query.input_revision],
+    );
+  } else {
+    // 外部IDはイベント受付と同じ会社・社員namespaceへ変換し、接続全体の最新受付を推測しない。
+    const sourceScope = `v1|${auth.companyId}|${auth.employeeId}|${query.source_scope}`;
+    result = await pool.query<LookupRow>(
+      `SELECT sr.id, sr.status, sr.outcome, sr.input_id, sr.input_revision
+         FROM sessions s
+         JOIN messages m ON m.session_id = s.id AND m.source_message_id = $5
+         JOIN search_requests sr ON sr.input_id = m.id AND sr.input_revision = $6 AND sr.trigger = 'auto'
+        WHERE s.source = $1 AND s.source_scope = $2 AND s.source_session_id = $3
+          AND s.project_id = $4 AND s.employee_id = $7
+          AND sr.company_id = $8 AND sr.project_id = $4 AND sr.employee_id = $7`,
+      [query.source, sourceScope, query.source_session_id, query.project_id, query.source_message_id, query.revision, auth.employeeId, auth.companyId],
+    );
+  }
+  const row = result.rows[0];
+  if (row === undefined) {
+    return notReceived();
+  }
+  const view = await readSearch(pool, auth, row.id, waitMs);
+  return { lookup_status: 'found', ...view };
+}
+
+interface EvidenceRow {
+  message_id: string;
+  role: string;
+  occurred_at: Date;
+  employee_id: string;
+  text: string;
+}
+
+// 保存済みrevisionの原文を同一会社・案件membershipで取得する。別案件・別会社・未保存revisionはnullにする。
+export async function loadEvidence(
+  pool: Pool,
+  auth: AuthContext,
+  messageId: string,
+  projectId: string,
+  revision: number,
+): Promise<EvidenceView | null> {
+  const result = await pool.query<EvidenceRow>(
+    `SELECT m.id AS message_id, m.role, m.occurred_at, s.employee_id, r.text
+       FROM messages m
+       JOIN sessions s ON s.id = m.session_id
+       JOIN projects p ON p.id = s.project_id
+       JOIN message_revisions r ON r.message_id = m.id AND r.revision = $4
+      WHERE m.id = $1 AND p.company_id = $2 AND s.project_id = $3
+        AND EXISTS (
+          SELECT 1 FROM project_members pm
+           WHERE pm.project_id = $3 AND pm.employee_id = $5
+        )`,
+    [messageId, auth.companyId, projectId, revision, auth.employeeId],
+  );
+  const row = result.rows[0];
+  if (row === undefined) {
+    return null;
+  }
+  return {
+    message_id: row.message_id,
+    revision,
+    employee_id: row.employee_id,
+    role: row.role,
+    occurred_at: row.occurred_at.toISOString(),
+    text: row.text,
+  };
+}
