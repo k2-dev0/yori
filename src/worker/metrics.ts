@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { countIncompleteDocuments } from './reindex.js';
 
 // M8の運用metrics。project scopeの集計だけを返し、message/document本文・credential・検索条件は含めない。
 
@@ -94,22 +95,8 @@ export async function loadProjectMetrics(pool: Pool, projectId: string): Promise
     }
   }
 
-  let pendingDocuments = 0;
-  if (run !== undefined) {
-    const pending = await pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count
-         FROM search_documents d
-         JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
-         LEFT JOIN document_embeddings e
-           ON e.document_id = d.id AND e.revision = d.desired_revision AND e.generation_id = $2
-         LEFT JOIN document_publications p
-           ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
-        WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
-          AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale)`,
-      [projectId, run.target_generation_id],
-    );
-    pendingDocuments = Number(pending.rows[0]?.count ?? '0');
-  }
+  // cutover・no-opと同じcompleteness契約（embedding/publication/hash/stale/source現行性）で残件を数える。
+  const pendingDocuments = run === undefined ? 0 : await countIncompleteDocuments(pool, projectId, run.target_generation_id);
 
   // sample全行をNodeへ読まず、project scopeのcount/p50/p95をSQL集約1行で得る。0件は0。
   const duration = await pool.query<{ samples: number; p50: number; p95: number }>(
