@@ -4,7 +4,7 @@ M3の`src/worker/`は、`classify_message`と`route_search`のjobをJevで評価
 
 ## 前提
 
-- `0002_m3.sql`適用済みのPostgreSQL。workerはmigrationを実行しない。
+- `0003_m3_response_model.sql`適用済みのPostgreSQL（M3の`0002_m3.sql`を含む）。workerはmigrationを実行しない。
 - `JEV_API_KEY`と`JEV_ACCOUNT_REF`。未設定・不正なら偽の判定へ進まず`invalid_worker_config`で起動に失敗する。
 - `JEV_API_URL`はHTTPS（開発用loopback HTTPのみ）で、pathは`/v1/systemone`固定。userinfo・query・fragmentは拒否する。3xxは追従せず、承認外endpointへ資格情報や本文を送らない。
 - 実データを送る前に、管理者がTypeSafe側のアカウント設定を確認する。この承認記録は設定を変更・証明しない。
@@ -67,7 +67,7 @@ npm run provider:revoke -- <approval-id>
 ```
 
 - `terms_checked_at`は管理者が規約を確認した日時で必須。既存seedとの互換のため、未設定行は`confirmed_at`を確認日として扱う。
-- 各HTTP送信の直前にDBの承認を確認する。part・再試行・評価キャッシュ再利用でも同じ。
+- 各HTTP送信の直前にDBの承認を確認する。part・再試行・評価キャッシュ再利用でも同じ。lease更新などDB待機の後も送信直前へ再確認し、待機中に失効していれば送信せず`blocked_policy`にする。
 - 未承認は`classify_message`/`route_search`とも`blocked_policy`として保持し、検索受付は`failed`/`provider_policy_unverified`にする。`no_match`にはしない。
 - account・endpointを変えた承認は継承しない。承認失効後は再登録するまで外部送信しない。
 
@@ -93,6 +93,7 @@ workerはroute laneとclassify laneを各1、合計2並列で走らせ、各lane
 - 入力が8,000バイト予算を超える場合は、Unicodeを壊さない連続UTF-16範囲のpartへ分割し、1request 1partで送る。原文範囲（offset/length）は判定と一緒に保存し、原文は切り捨てない。
 - retentionは`substantive`→`decision_signal`→`unknown`→`progress_only`の順に保守的に統合する。全partが高信頼`progress_only`の時だけ`is_searchable=false`。
 - retention以外の単一分類は全part一致時だけ採用し、不一致はunknownにする。technical_labelsは採用ラベルの和集合。低信頼は採用しない。
+- `message_analysis.model_version`は全partの実応答modelが同一ならその値、混在なら重複除去した応答modelのJSON配列文字列（出現順）にする。partごとの応答modelも`parts[].model_version`へ保存する。
 - relation_targetはstateへ実際に入れた候補発言ID・none・unknownだけを許可する。decision_actionがaccept/reject/revoke/changeで、対象と明示/推定が高信頼の時だけ`message_relations`へ保存する。低信頼・unknown・候補外は保存しない。
 - 適用時はjob lease・対象revisionを同一TXで再確認し、`message_analysis`・関係・`build_documents` job・job完了をまとめて反映する。leaseを失った場合は適用しない。古いrevisionは現在状態へ適用しない。
 
@@ -101,18 +102,18 @@ workerはroute laneとclassify laneを各1、合計2並列で走らせ、各lane
 分類の完了を待たず、routeとclassifyは同じstate/questionsから独立に判定する。検索振り分けは保存分類と独立して決まる。
 
 - `new_search`: 条件hashと段階`awaiting_search`を保存し、受付はpendingのまま`execute_search`をenqueueする。
-- `reuse`: 高信頼`reuse`＋`same_topic`＋条件同一、同一会社・案件・社員・session・policy、先行入力のcurrent revision一致、権限・根拠が有効な場合だけ。直近の先行検索だけを判定し、不適格でも古い候補へ飛ばない。参照は循環・過長chainを拒否して直接の`new_search`元へ解決する。既存結果はコピーせず、段階`awaiting_reused_search`と`reused_from_request_id`/`original_request_id`を保存する。
+- `reuse`: 高信頼`reuse`＋`same_topic`＋条件同一、同一会社・案件・社員・session・policy、先行入力のcurrent revision一致、権限・根拠が有効な場合だけ。直近の先行検索だけを判定し、不適格でも古い候補へ飛ばない。参照は循環・過長chainを拒否して直接の`new_search`元へ解決するが、chain上の各受付でもscope・対象sequenceより前・原文revisionの存在とcurrent一致・status適格性・期限・根拠を検証し、1つでも不適格なら`new_search`へ戻す。既存結果はコピーせず、段階`awaiting_reused_search`と`reused_from_request_id`/`original_request_id`を保存する。
 - `skip`: 全part高信頼`skip`の時だけ`completed`/`skipped`にする（`no_match`とは表現しない）。
 - `pending`/`running`の先行検索は共有できる。`completed`は`matched`かつ10分以内の時だけ。`failed`/`expired`/`skipped`/`no_match`・対象不明・失効・条件変更・不確実・低信頼は`new_search`。
 - matchedの根拠はevidenceのmessage_id/revisionが現行revision・同案件であること、最新分析がprogress_onlyでないこと、revoke/change関係で無効化されていないことを検証する。不明な形式・根拠なしは再利用しない。
 
 ### 評価キャッシュ
 
-同一会社・provider/account/endpoint・model・閾値・policy版・質問版・state hashが一致する完了済み評価だけを`jev_evaluations`から再利用する。cache利用でも承認を再確認する。同時missでの二重外部評価は許容する。
+同一会社・provider/account/endpoint・要求model・閾値・policy版・質問版・state hashが一致する完了済み評価だけを`jev_evaluations`から再利用する。実応答model（`response_model`）がNULLの旧行は応答model不明として再利用せず、再評価して同keyの行を実応答model付きで更新する。cache利用でも承認を再確認する。同時missでの二重外部評価は許容する。
 
 ### usage
 
-外部呼出しの試行ごとに`usage_events`へ会社・provider/account/endpoint・operation・model・実usage（不明はnull）・所要時間・成功/error_codeを記録する。原文・credential・外部error bodyは保存しない。
+外部呼出しの試行ごとに`usage_events`へ会社・provider/account/endpoint・operation・要求model・実応答model（`response_model`、応答本文を取得できない失敗はnull）・実usage（不明はnull）・所要時間・成功/error_codeを記録する。応答契約不正でも本文からmodelを取得できた場合は記録する。原文・credential・外部error bodyは保存しない。
 
 ## 失敗と再開
 
