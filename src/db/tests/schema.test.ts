@@ -96,7 +96,7 @@ describe('migration管理', () => {
     }
 
     const versions = await pool.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    assert.deepEqual(versions.rows.map((row) => row.version), ['0001_init.sql', '0002_m3.sql']);
+    assert.deepEqual(versions.rows.map((row) => row.version), ['0001_init.sql', '0002_m3.sql', '0003_m3_response_model.sql']);
   });
 
   it('並行実行でもadvisory lockで1回だけ適用される', async () => {
@@ -104,13 +104,14 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '2');
+    assert.equal(versions.rows[0].count, '3');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
     const files = await readdir(new URL('../migrations', import.meta.url));
     assert.ok(files.includes('0001_init.sql'), '0001_init.sql がない');
     assert.ok(files.includes('0002_m3.sql'), '0002_m3.sql がない');
+    assert.ok(files.includes('0003_m3_response_model.sql'), '0003_m3_response_model.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
@@ -146,6 +147,8 @@ describe('カラム型', () => {
       ['jobs', 'lease_expires_at', 'timestamp with time zone'],
       ['search_requests', 'result', 'jsonb'],
       ['search_requests', 'created_at', 'timestamp with time zone'],
+      ['jev_evaluations', 'response_model', 'text'],
+      ['usage_events', 'response_model', 'text'],
     ];
     for (const [table, column, expected] of expectations) {
       assert.equal(typeOf(table, column), expected, `${table}.${column} の型が違う`);
