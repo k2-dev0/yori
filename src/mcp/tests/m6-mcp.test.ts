@@ -197,6 +197,7 @@ describe('M6 MCP toolから中央APIへの契約', () => {
 
   it('get_search_resultはrequest_idでGET /v1/searches/:idへwait_msを渡し、処理状態を返す', async () => {
     const requestId = uuidv7();
+    const projectId = uuidv7();
     central.requests.length = 0;
     central.setResponder(() => ({
       status: 200,
@@ -209,7 +210,7 @@ describe('M6 MCP toolから中央APIへの契約', () => {
         reused_from_request_id: null,
         status: 'running',
         outcome: null,
-        project_id: uuidv7(),
+        project_id: projectId,
         matches: [],
         warnings: [],
       },
@@ -217,7 +218,7 @@ describe('M6 MCP toolから中央APIへの契約', () => {
     const session = await startSession();
     try {
       const result = await session.callTool('get_search_result', {
-        project_id: uuidv7(),
+        project_id: projectId,
         request_id: requestId,
         wait_ms: 1000,
       });
@@ -237,6 +238,41 @@ describe('M6 MCP toolから中央APIへの契約', () => {
       const structured = result.structuredContent as { status?: string; outcome?: string | null } | undefined;
       assert.equal(structured?.status, 'running');
       assert.equal(structured?.outcome ?? null, null);
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('get_search_resultはrequest_id応答のproject_idが入力と不一致ならtool errorにする', async () => {
+    const requestId = uuidv7();
+    const responseProjectId = uuidv7();
+    central.requests.length = 0;
+    central.setResponder(() => ({
+      status: 200,
+      body: {
+        request_id: requestId,
+        input_id: uuidv7(),
+        input_revision: 1,
+        trigger: 'auto',
+        search_action: 'new_search',
+        reused_from_request_id: null,
+        status: 'completed',
+        outcome: 'matched',
+        project_id: responseProjectId,
+        matches: [],
+        warnings: [],
+      },
+    }));
+    const session = await startSession();
+    try {
+      const result = await session.callTool('get_search_result', {
+        project_id: uuidv7(),
+        request_id: requestId,
+        wait_ms: 0,
+      });
+      assert.equal(result.isError, true, `別案件のproject_idを受理した: ${JSON.stringify(result)}`);
+      assert.ok(!JSON.stringify(result).includes(TOKEN), 'tokenがtool結果へ出ている');
+      assert.ok(!JSON.stringify(result).includes(responseProjectId), '応答のproject_idをtool結果へ出している');
     } finally {
       await session.close();
     }
