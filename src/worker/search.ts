@@ -3,12 +3,17 @@ import { v7 as uuidv7 } from 'uuid';
 import { completeJob, type ClaimedJob } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import {
+  CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX,
   CANDIDATE_RELEVANCE_CRITERIA,
-  CANDIDATE_RELEVANCE_KINDS,
   CANDIDATE_RELEVANCE_QUESTION_PREFIX,
   CANDIDATE_RELEVANCES,
   CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX,
-  CANDIDATE_SIMILAR_SYMPTOM_QUESTION_PREFIX,
+  CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX,
+  CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX,
+  CANDIDATE_STATEMENT_STATUS_CRITERIA,
+  CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX,
+  CANDIDATE_STATEMENT_STATUSES,
+  CANDIDATE_TARGET_MATCH_QUESTION_PREFIX,
   CANDIDATE_YES_NO_CRITERIA,
   JEV_PROVIDER,
   SEARCH_CANDIDATE_BUDGET_TOKENS,
@@ -21,6 +26,7 @@ import {
   WORKER_POLICY_VERSION,
   type CandidateRelevance,
   type CandidateRelevanceKind,
+  type CandidateStatementStatus,
   type JevChoiceQuestion,
   type JevRequest,
   type JevState,
@@ -73,10 +79,21 @@ interface Candidate {
   sources: CandidateSource[];
 }
 
+// Jevへ送った候補ごとの独立Choice質問。overallとstatement_statusはrelevance_kindと別fieldで保持する。
+type CandidateQuestionKind = 'overall' | 'statement_status' | CandidateRelevanceKind;
+
+interface RawChoiceAnswer {
+  choice: string;
+  probabilities: Record<string, number>;
+  confidence: number;
+}
+
 interface CandidateAssessment {
   candidate: Candidate;
   relevance: CandidateRelevance;
   relevanceKinds: CandidateRelevanceKind[];
+  statementStatus: CandidateStatementStatus;
+  answers: Partial<Record<CandidateQuestionKind, RawChoiceAnswer>>;
 }
 
 interface SearchWarning {
@@ -328,36 +345,75 @@ async function loadCandidates(
   }
 }
 
-// 候補ごとのrelevanceと、計画9.3の独立choiceで得られる最小のrelevance_kindを質問する。
+// overall relevanceと、計画9.3の6つの独立Choice質問を候補ごとに組み立てる。
 function buildCandidateQuestions(candidates: readonly Candidate[]): {
   questions: Record<string, JevChoiceQuestion>;
-  index: Map<string, { candidate: Candidate; kind: 'relevance' | 'similar_symptom' | 'reusable_procedure' }>;
+  index: Map<string, { candidate: Candidate; kind: CandidateQuestionKind }>;
 } {
   const questions: Record<string, JevChoiceQuestion> = {};
-  const index = new Map<string, { candidate: Candidate; kind: 'relevance' | 'similar_symptom' | 'reusable_procedure' }>();
+  const index = new Map<string, { candidate: Candidate; kind: CandidateQuestionKind }>();
+  const addQuestion = (
+    candidate: Candidate,
+    kind: CandidateQuestionKind,
+    prefix: string,
+    instructions: string,
+    criteria: Record<string, string>,
+  ): void => {
+    const questionId = `${prefix}:${candidateKey(candidate)}#0`;
+    questions[questionId] = { type: 'choice', instructions, criteria: { ...criteria } };
+    index.set(questionId, { candidate, kind });
+  };
   for (const candidate of candidates) {
     const key = candidateKey(candidate);
-    const relevanceId = `${CANDIDATE_RELEVANCE_QUESTION_PREFIX}:${key}#0`;
-    questions[relevanceId] = {
-      type: 'choice',
-      instructions: `state.candidatesのcandidate_id=${key}が現在の質問の対象・症状・手順にどれだけ当てはまるかrelevanceを選ぶ。`,
-      criteria: { ...CANDIDATE_RELEVANCE_CRITERIA },
-    };
-    index.set(relevanceId, { candidate, kind: 'relevance' });
-    const similarId = `${CANDIDATE_SIMILAR_SYMPTOM_QUESTION_PREFIX}:${key}#0`;
-    questions[similarId] = {
-      type: 'choice',
-      instructions: `candidate_id=${key}の症状または修正依頼が現在の質問と似ているか選ぶ。`,
-      criteria: { ...CANDIDATE_YES_NO_CRITERIA },
-    };
-    index.set(similarId, { candidate, kind: 'similar_symptom' });
-    const reusableId = `${CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX}:${key}#0`;
-    questions[reusableId] = {
-      type: 'choice',
-      instructions: `candidate_id=${key}の解決方法または調査手順を再利用できるか選ぶ。`,
-      criteria: { ...CANDIDATE_YES_NO_CRITERIA },
-    };
-    index.set(reusableId, { candidate, kind: 'reusable_procedure' });
+    addQuestion(
+      candidate,
+      'overall',
+      CANDIDATE_RELEVANCE_QUESTION_PREFIX,
+      `state.candidatesのcandidate_id=${key}が現在の質問へどれだけ答えるかoverall relevanceを選ぶ。`,
+      CANDIDATE_RELEVANCE_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'target_match',
+      CANDIDATE_TARGET_MATCH_QUESTION_PREFIX,
+      `candidate_id=${key}が現在の質問の対象と一致するか選ぶ。`,
+      CANDIDATE_YES_NO_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'similar_symptom_or_request',
+      CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX,
+      `candidate_id=${key}の症状または修正依頼が現在の質問と類似しているか選ぶ。`,
+      CANDIDATE_YES_NO_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'similar_constraints',
+      CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX,
+      `candidate_id=${key}の環境・制約が現在の質問と近いか選ぶ。`,
+      CANDIDATE_YES_NO_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'implementation_rationale',
+      CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX,
+      `candidate_id=${key}が実装理由の根拠になるか選ぶ。`,
+      CANDIDATE_YES_NO_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'reusable_procedure',
+      CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX,
+      `candidate_id=${key}の解決方法または調査手順を再利用できるか選ぶ。`,
+      CANDIDATE_YES_NO_CRITERIA,
+    );
+    addQuestion(
+      candidate,
+      'statement_status',
+      CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX,
+      `candidate_id=${key}の発言が提案・完了報告・検証済み報告のどれかstatement_statusを選ぶ。実行証跡の有無は推定しない。`,
+      CANDIDATE_STATEMENT_STATUS_CRITERIA,
+    );
   }
   return { questions, index };
 }
@@ -479,7 +535,13 @@ async function evaluateCandidates(
 
   const assessments = new Map<string, CandidateAssessment>();
   for (const candidate of input.candidates) {
-    assessments.set(candidateKey(candidate), { candidate, relevance: 'unrelated', relevanceKinds: [] });
+    assessments.set(candidateKey(candidate), {
+      candidate,
+      relevance: 'unrelated',
+      relevanceKinds: [],
+      statementStatus: 'unknown',
+      answers: {},
+    });
   }
   for (const [questionId, question] of index.entries()) {
     const answer = validated.answers[questionId];
@@ -487,17 +549,25 @@ async function evaluateCandidates(
     if (answer === undefined || assessment === undefined) {
       continue;
     }
-    if (question.kind === 'relevance') {
+    assessment.answers[question.kind] = {
+      choice: answer.choice,
+      probabilities: { ...answer.probabilities },
+      confidence: answer.confidence,
+    };
+    if (question.kind === 'overall') {
       if ((CANDIDATE_RELEVANCES as readonly string[]).includes(answer.choice)) {
         assessment.relevance = answer.choice as CandidateRelevance;
       }
       continue;
     }
-    if (answer.choice === 'yes') {
-      const kind = question.kind === 'similar_symptom' ? CANDIDATE_RELEVANCE_KINDS[0] : CANDIDATE_RELEVANCE_KINDS[1];
-      if (!assessment.relevanceKinds.includes(kind)) {
-        assessment.relevanceKinds.push(kind);
+    if (question.kind === 'statement_status') {
+      if ((CANDIDATE_STATEMENT_STATUSES as readonly string[]).includes(answer.choice)) {
+        assessment.statementStatus = answer.choice as CandidateStatementStatus;
       }
+      continue;
+    }
+    if (answer.choice === 'yes' && !assessment.relevanceKinds.includes(question.kind)) {
+      assessment.relevanceKinds.push(question.kind);
     }
   }
   return [...assessments.values()];
@@ -522,20 +592,8 @@ async function loadValidCandidate(
   generation: EmbeddingGeneration,
   candidate: Candidate,
 ): Promise<{ stale: boolean; evidence: EvidenceRow[] } | null> {
-  const document = await client.query<{ stale: boolean }>(
-    `SELECT p.stale, p.revision
-       FROM search_documents d
-       JOIN document_publications p
-         ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = $3
-       JOIN search_document_revisions r
-         ON r.document_id = d.id AND r.revision = $3 AND r.status = 'ready'
-      WHERE d.id = $1 AND d.company_id = $4 AND d.project_id = $5 AND d.is_searchable
-      FOR UPDATE OF d, p, r`,
-    [candidate.documentId, generation.id, candidate.revision, target.companyId, target.projectId],
-  );
-  if (document.rows.length === 0) {
-    return null;
-  }
+  // source messageのcurrent_revision確認とsaveのcommitまで、同じmessages行を共有lockで保持する。
+  // eventsのrevision更新と競合した場合は検索commitか改訂のどちらかが先に確定し、旧原文のmatched保存を作らない。
   const sources = await client.query<EvidenceRow>(
     `SELECT s.message_id, s.message_revision, m.current_revision, m.sequence_no, m.session_id,
             sess.project_id AS session_project_id, m.role, sess.employee_id, m.occurred_at, rev.text
@@ -544,7 +602,8 @@ async function loadValidCandidate(
        JOIN sessions sess ON sess.id = m.session_id
        JOIN message_revisions rev ON rev.message_id = s.message_id AND rev.revision = s.message_revision
       WHERE s.document_id = $1 AND s.revision = $2
-      ORDER BY s.display_order`,
+      ORDER BY s.display_order
+      FOR SHARE OF m`,
     [candidate.documentId, candidate.revision],
   );
   if (sources.rows.length === 0) {
@@ -560,6 +619,20 @@ async function loadValidCandidate(
     if (source.session_project_id !== target.projectId) {
       return null;
     }
+  }
+  const document = await client.query<{ stale: boolean }>(
+    `SELECT p.stale, p.revision
+       FROM search_documents d
+       JOIN document_publications p
+         ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = $3
+       JOIN search_document_revisions r
+         ON r.document_id = d.id AND r.revision = $3 AND r.status = 'ready'
+      WHERE d.id = $1 AND d.company_id = $4 AND d.project_id = $5 AND d.is_searchable
+      FOR UPDATE OF d, p, r`,
+    [candidate.documentId, generation.id, candidate.revision, target.companyId, target.projectId],
+  );
+  if (document.rows.length === 0) {
+    return null;
   }
   return { stale: document.rows[0].stale, evidence: sources.rows };
 }
@@ -585,12 +658,29 @@ function buildMatch(assessment: CandidateAssessment, valid: { stale: boolean; ev
   const agentReported = valid.evidence.some((source) => source.role === 'assistant' || source.role === 'agent_report');
   return {
     case_or_document_id: assessment.candidate.documentId,
+    relevance: assessment.relevance,
     relevance_kind: assessment.relevanceKinds,
+    statement_status: assessment.statementStatus,
+    // claim_statusは報告の種類。reported_verifiedをツール実証済みへ格上げしない。
     claim_status: agentReported ? 'agent_reported' : 'not_reported',
     evidence,
     related_evidence_ids: [],
     truncated: false,
   };
+}
+
+// Jevへ渡した全候補のvalidated Choice回答を、採用有無とともにresultへ残す。
+// 原文・credential・外部error bodyは複製せず、choice/probabilities/confidenceだけを保存する。
+function buildCandidateEvaluations(evaluations: readonly CandidateAssessment[], adoptedKey: string | null): unknown[] {
+  return evaluations.map((assessment) => ({
+    document_id: assessment.candidate.documentId,
+    revision: assessment.candidate.revision,
+    relevance: assessment.relevance,
+    relevance_kind: assessment.relevanceKinds,
+    statement_status: assessment.statementStatus,
+    adopted: adoptedKey !== null && candidateKey(assessment.candidate) === adoptedKey,
+    answers: assessment.answers,
+  }));
 }
 
 async function loadIndexStatus(
@@ -746,7 +836,7 @@ async function saveSearchResult(
     request: SearchRequestRow;
     generation: EmbeddingGeneration | null;
     warnings: readonly SearchWarning[];
-    accepted: readonly CandidateAssessment[];
+    evaluations: readonly CandidateAssessment[];
   },
 ): Promise<void> {
   const client = await pool.connect();
@@ -794,9 +884,10 @@ async function saveSearchResult(
 
     const warnings: SearchWarning[] = [...input.warnings];
     let match: unknown = null;
+    let adoptedKey: string | null = null;
     let outcome = 'no_match';
     if (input.generation !== null) {
-      for (const assessment of input.accepted) {
+      for (const assessment of rankAccepted(input.evaluations)) {
         const valid = await loadValidCandidate(client, input.target, input.generation, assessment.candidate);
         if (valid === null) {
           continue;
@@ -809,6 +900,7 @@ async function saveSearchResult(
           });
         }
         match = buildMatch(assessment, valid);
+        adoptedKey = candidateKey(assessment.candidate);
         outcome = 'matched';
         break;
       }
@@ -826,6 +918,7 @@ async function saveSearchResult(
       project_id: input.target.projectId,
       index_status: indexStatus,
       matches: match === null ? [] : [match],
+      candidate_evaluations: buildCandidateEvaluations(input.evaluations, adoptedKey),
       warnings,
     };
     const updated = await client.query(
@@ -913,7 +1006,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   await markSearchRunning(pool, job, target, request);
   const generation = await loadFixedGeneration(pool, { companyId: target.companyId, projectId: target.projectId }, config);
   if (generation === null) {
-    await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], accepted: [] });
+    await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], evaluations: [] });
     return;
   }
   // Jev本文予算は現在質問と候補本文の合計。質問だけで使い切る場合はno_matchに偽装せず恒久failedにする。
@@ -927,7 +1020,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   const candidates = await loadCandidates(pool, { target, generation, queryVector });
   const { selected, warnings } = await selectCandidates(candidates, questionTokens);
   if (selected.length === 0) {
-    await saveSearchResult(pool, { job, target, request, generation, warnings, accepted: [] });
+    await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [] });
     return;
   }
   const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind });
@@ -937,6 +1030,6 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     request,
     generation,
     warnings,
-    accepted: rankAccepted(assessments),
+    evaluations: assessments,
   });
 }
