@@ -416,6 +416,7 @@ export interface StoredAnalysisPart {
   length: number;
   text?: string;
   retention?: string;
+  model_version?: string;
 }
 
 export interface StoredAnalysis {
@@ -530,6 +531,45 @@ export async function usageEventRows(pool: Pool, companyId: string): Promise<str
     [companyId],
   );
   return result.rows.map((row) => row.row_text);
+}
+
+export interface StoredUsageEvent {
+  operation: string;
+  model: string;
+  response_model: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  success: boolean;
+  error_code: string | null;
+}
+
+// 試行ごとのusageを古い順に読み、要求modelと実応答modelの区別を検証できるようにする。
+export async function readUsageEvents(pool: Pool, companyId: string): Promise<StoredUsageEvent[]> {
+  await assertM3Tables(pool);
+  const result = await pool.query<StoredUsageEvent>(
+    `SELECT operation, model, response_model, input_tokens, output_tokens, success, error_code
+       FROM usage_events WHERE company_id = $1 ORDER BY created_at, id`,
+    [companyId],
+  );
+  return result.rows;
+}
+
+export interface StoredEvaluation {
+  model: string;
+  response_model: string | null;
+  answers: Record<string, unknown>;
+  state_hash: Buffer;
+}
+
+// 評価キャッシュを読み、要求model・実応答model・state hashの対応を検証できるようにする。
+export async function readEvaluations(pool: Pool, companyId: string): Promise<StoredEvaluation[]> {
+  await assertM3Tables(pool);
+  const result = await pool.query<StoredEvaluation>(
+    `SELECT model, response_model, answers, state_hash
+       FROM jev_evaluations WHERE company_id = $1 ORDER BY created_at, id`,
+    [companyId],
+  );
+  return result.rows;
 }
 
 export async function advanceRevision(pool: Pool, messageId: string, text: string): Promise<number> {
