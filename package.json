@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "社内開発会話の共有検索基盤 (M1〜M4)",
+  "description": "社内開発会話の共有検索基盤 (M1〜M5)",
   "engines": {
     "node": ">=24"
   },
