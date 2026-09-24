@@ -2,7 +2,6 @@ import { z } from 'zod';
 import type { EventSource } from '../api/contract.js';
 import { collectFromHook, type CollectorHookInput } from './collect.js';
 import type { CollectorConfig } from './config.js';
-import { closeCollectorState, collectorNamespace, openCollectorState } from './state.js';
 
 // M7の補助通知。UserPromptSubmit hookで既存collectを実行した後、その呼出しで確定できた
 // 最新user message identityをcollector stateから特定し、GET /v1/searches/by-inputを最大5秒×2で待つ。
@@ -29,70 +28,6 @@ interface LatestUserInput {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-interface UserInputSnapshot {
-  entries: Map<string, { revision: number; sequenceNo: number }>;
-}
-
-// collect前後の比較用に、state上のuser発言identityとrevisionだけを読む。本文やpromptは読まない。
-function readUserInputs(input: NotifyFromHookInput): UserInputSnapshot {
-  const namespace = collectorNamespace(input.config.api_url, input.token);
-  const state = openCollectorState(input.config.state_dir);
-  try {
-    const rows = state.db
-      .prepare(
-        `SELECT source_message_id, revision, sequence_no
-           FROM stored_messages
-          WHERE namespace = ? AND source = ? AND source_session_id = ? AND role = 'user'`,
-      )
-      .all(namespace, input.source, input.hook.session_id);
-    const entries = new Map<string, { revision: number; sequenceNo: number }>();
-    for (const row of rows) {
-      entries.set(String(row.source_message_id), { revision: Number(row.revision), sequenceNo: Number(row.sequence_no) });
-    }
-    return { entries };
-  } finally {
-    closeCollectorState(state);
-  }
-}
-
-interface ConfirmedUserInput {
-  sourceMessageId: string;
-  revision: number;
-  sequenceNo: number;
-}
-
-// 今回のcollectで新規追加またはrevision更新されたuser発言だけを対象にし、最新sequenceを選ぶ。
-function confirmedUserInput(before: UserInputSnapshot, after: UserInputSnapshot): ConfirmedUserInput | null {
-  let latest: ConfirmedUserInput | null = null;
-  for (const [sourceMessageId, current] of after.entries) {
-    const previous = before.entries.get(sourceMessageId);
-    if (previous !== undefined && previous.revision >= current.revision) {
-      continue;
-    }
-    if (
-      latest === null ||
-      current.sequenceNo > latest.sequenceNo ||
-      (current.sequenceNo === latest.sequenceNo && current.revision > latest.revision)
-    ) {
-      latest = { sourceMessageId, revision: current.revision, sequenceNo: current.sequenceNo };
-    }
-  }
-  return latest;
-}
-
-function sessionScope(input: NotifyFromHookInput): { projectId: string; sourceScope: string } | null {
-  const namespace = collectorNamespace(input.config.api_url, input.token);
-  const state = openCollectorState(input.config.state_dir);
-  try {
-    const row = state.db
-      .prepare('SELECT source_scope, project_id FROM source_sessions WHERE namespace = ? AND source = ? AND source_session_id = ?')
-      .get(namespace, input.source, input.hook.session_id) as { source_scope: string; project_id: string } | undefined;
-    return row === undefined ? null : { projectId: String(row.project_id), sourceScope: String(row.source_scope) };
-  } finally {
-    closeCollectorState(state);
-  }
 }
 
 // 1回最大5秒、累計最大10秒。応答が返れば再試行せず、timeout/network失敗のときだけ1回再試行する。
@@ -234,24 +169,22 @@ function buildNotificationContext(payload: unknown): string | null {
   return lines.join('\n');
 }
 
-// collectを先に実行し、その呼出しで新規追加・revision更新が確定したuser入力だけを通知する。
-// 過去stateにuserがいても今回の差分がなければby-inputを呼ばず無出力で終了する。
+// collectを先に実行し、その呼出しのSQLite commitで新規追加・revision更新として確定した
+// user入力だけを通知する。共有stateを前後比較しないため、HTTP待機中に別collectが後続入力を
+// 取り込んでも先行呼出しのidentityは混ざらない。確定差分がなければ無出力で終了する。
 export async function notifyFromHook(input: NotifyFromHookInput): Promise<void> {
-  const before = readUserInputs(input);
-  await collectFromHook({ source: input.source, hook: input.hook, config: input.config, token: input.token });
-  const after = readUserInputs(input);
-  const confirmed = confirmedUserInput(before, after);
-  if (confirmed === null) {
+  const result = await collectFromHook({ source: input.source, hook: input.hook, config: input.config, token: input.token });
+  if (result.confirmedUserInputs.length === 0) {
     return;
   }
-  const scope = sessionScope(input);
-  if (scope === null) {
-    return;
-  }
+  // 同一呼出しで複数差分がある場合は、その呼出し内でsequence最大のuserを通知対象にする。
+  const confirmed = result.confirmedUserInputs.reduce((latest, current) =>
+    current.sequenceNo > latest.sequenceNo ? current : latest,
+  );
   const target: LatestUserInput = {
-    projectId: scope.projectId,
+    projectId: confirmed.projectId,
     source: input.source,
-    sourceScope: scope.sourceScope,
+    sourceScope: confirmed.sourceScope,
     sourceSessionId: input.hook.session_id,
     sourceMessageId: confirmed.sourceMessageId,
     revision: confirmed.revision,
