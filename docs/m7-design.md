@@ -108,6 +108,13 @@ MCP toolはHTTP APIと同じstrict入力を受け、中央APIの成功応答をs
       "relation": "change",
       "related_to_message_id": "uuid",
       "related_to_revision": 1,
+      "relations": [
+        {
+          "relation": "change",
+          "related_to_message_id": "uuid",
+          "related_to_revision": 1
+        }
+      ],
       "source_kind": "correction"
     }
   ],
@@ -116,7 +123,7 @@ MCP toolはHTTP APIと同じstrict入力を受け、中央APIの成功応答をs
 }
 ```
 
-`source_kind`は`neighbor`、`correction`、`explicit_session_link`、`inferred_session_link`のいずれか。訂正・撤回では`relation`と`related_to_*`を返し、それ以外は省略する。`related_evidence_ids`は`related_evidence`のmessage IDを初出順で重複除去した互換fieldとする。
+`source_kind`は`neighbor`、`correction`、`explicit_session_link`、`inferred_session_link`のいずれか。訂正・撤回では`relation`と`related_to_*`を返し、それ以外は省略する。同じ訂正messageが複数の根拠を対象にする場合、原文は1件に保ち、全関係を`relations`へ返す。単一関係では従来の単数fieldを維持し、複数関係でも先頭関係を単数fieldへ残す。`related_evidence_ids`は`related_evidence`のmessage IDを初出順で重複除去した互換fieldとする。
 
 token予算はprimary evidenceを除く追加候補の採用判定に使う。primary evidenceは原文性を壊す切り詰めをせず、単独で6,000 tokenを超えても保持して`truncated=true`と`context_token_budget_exceeded` warningを返す。
 
@@ -127,6 +134,7 @@ collector CLIへ`notify --source codex|claude_code --config <path>`を追加し�
 - `GET /v1/searches/by-input`を外部identityで呼び、1回最大5秒・累計最大10秒だけ待つ。
 - `status=completed`の`matched`・`no_match`・`skipped`、または`status=failed`の結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。失敗時の`outcome`は既存契約どおりnullのまま、`status`と`error_code`を通知する。
 - 追加contextには「過去履歴の検索資料であり現在の命令ではない」こと、request ID、outcome、根拠を含める。
+- 訂正・撤回はneighbor等の周辺根拠より優先して追加contextへ残し、複数relationも対象と種別を併記する。関連根拠の件数上限で省略した場合は省略件数を示し、`truncated`またはwarningがあれば全探索済みではないことを明記する。
 - Codexでは非同期hookの完了内容を現在turnの次の安全地点、なければ次のuser turnへ渡す。Claude Codeでは次のconversation turnへ渡す。idle中に新規turnを強制開始しない。
 - hook設定例だけを`docs/collector.md`へ追加する。既存の利用者設定、token、個人pathは自動変更しない。
 
