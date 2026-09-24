@@ -56,7 +56,8 @@ export interface RelatedEvidenceDraft {
   relation?: string;
   relatedToMessageId?: string;
   relatedToRevision?: number;
-  linkId?: string;
+  // 起点primary sessionからこのitemのsessionまでの明示link ID経路（1辺以上）。
+  linkIds?: string[];
   relationSourceRevision?: number;
 }
 
@@ -250,7 +251,13 @@ async function loadSessionScope(
 }
 
 // link先に根拠messageが属すればその前後2発言、属しなければ順方向は先頭5・逆方向は末尾5発言。
-async function loadLinkContext(input: ExplorationInput, link: LinkRow, currentSessionId: string, discoveredSessionId: string): Promise<RelatedEvidenceDraft[]> {
+async function loadLinkContext(
+  input: ExplorationInput,
+  link: LinkRow,
+  currentSessionId: string,
+  discoveredSessionId: string,
+  linkIds: readonly string[],
+): Promise<RelatedEvidenceDraft[]> {
   // endpoint所属と、保存したevidence_revision == current revisionを確認する。
   // 改訂済み・endpoint外のlinkはstaleとして辿らない（先頭/末尾windowも作らない）。
   const evidence = await input.pool.query<{ session_id: string; current_revision: number }>(
@@ -310,7 +317,7 @@ async function loadLinkContext(input: ExplorationInput, link: LinkRow, currentSe
     );
     rows = [...last.rows].reverse();
   }
-  return rows.map((row) => draftOf(row, 'explicit_session_link', { linkId: link.id }));
+  return rows.map((row) => draftOf(row, 'explicit_session_link', { linkIds: [...linkIds] }));
 }
 
 // primary evidenceのsession情報。推定隣接のemployee/project/started_atの基準にする。
@@ -549,10 +556,17 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
     related.push(draft);
   };
 
+  // change/revoke発言は前後2発言に含まれてもcorrection metadataを保持する。
+  // correctionを先に確定してneighbor集合から除外し、その後にneighbor→correctionの順で追加する。
+  const corrections = await loadCorrections(input);
+  const correctionMessageIds = new Set(corrections.map((draft) => draft.messageId));
   for (const draft of await loadNeighbors(input)) {
+    if (correctionMessageIds.has(draft.messageId)) {
+      continue;
+    }
     add(draft);
   }
-  for (const draft of await loadCorrections(input)) {
+  for (const draft of corrections) {
     add(draft);
   }
 
@@ -560,9 +574,13 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
   const originSessionIds = [...new Set(input.primaryEvidence.map((source) => source.session_id))];
   const visitedSessions = new Set([...originSessionIds, ...relatedSessions]);
   let sessionLimitReached = false;
-  let frontier: Array<{ sessionId: string; hop: number }> = originSessionIds.map((sessionId) => ({ sessionId, hop: 0 }));
+  let frontier: Array<{ sessionId: string; hop: number; linkIds: string[] }> = originSessionIds.map((sessionId) => ({
+    sessionId,
+    hop: 0,
+    linkIds: [],
+  }));
   while (frontier.length > 0 && !sessionLimitReached) {
-    const next: Array<{ sessionId: string; hop: number }> = [];
+    const next: Array<{ sessionId: string; hop: number; linkIds: string[] }> = [];
     for (const current of frontier) {
       if (current.hop >= HOP_LIMIT) {
         // 3 hopで打ち切った先に未訪問sessionがある場合は、探索が未完であることをwarningで示す。
@@ -619,8 +637,9 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
           continue;
         }
         visitedSessions.add(other);
-        next.push({ sessionId: other, hop: current.hop + 1 });
-        for (const draft of await loadLinkContext(input, link, current.sessionId, other)) {
+        const linkIds = [...current.linkIds, link.id];
+        next.push({ sessionId: other, hop: current.hop + 1, linkIds });
+        for (const draft of await loadLinkContext(input, link, current.sessionId, other, linkIds)) {
           add(draft);
         }
       }
@@ -745,21 +764,32 @@ export async function revalidateRelatedEvidence(
     if (row.session_id === target.sessionId && row.sequence_no >= target.sequenceNo) {
       continue;
     }
-    if (draft.linkId !== undefined) {
-      const link = await client.query(
-        `SELECT 1
-           FROM session_links l
-           JOIN messages em ON em.id = l.evidence_message_id
-           JOIN sessions es ON es.id = em.session_id
-           JOIN projects ep ON ep.id = es.project_id
-          WHERE l.id = $1 AND l.status = 'active' AND l.company_id = $2 AND l.project_id = $3
-            AND (em.session_id = l.from_session_id OR em.session_id = l.to_session_id)
-            AND em.current_revision = l.evidence_revision
-            AND es.project_id = l.project_id AND ep.company_id = l.company_id
-          FOR SHARE OF l, em`,
-        [draft.linkId, target.companyId, target.projectId],
-      );
-      if (link.rows.length === 0) {
+    // 起点からの全link経路を検証し、1辺でも無効ならこのrelated itemを落とす。
+    if (draft.sourceKind === 'explicit_session_link') {
+      if (draft.linkIds === undefined || draft.linkIds.length === 0) {
+        continue;
+      }
+      let linksValid = true;
+      for (const linkId of draft.linkIds) {
+        const link = await client.query(
+          `SELECT 1
+             FROM session_links l
+             JOIN messages em ON em.id = l.evidence_message_id
+             JOIN sessions es ON es.id = em.session_id
+             JOIN projects ep ON ep.id = es.project_id
+            WHERE l.id = $1 AND l.status = 'active' AND l.company_id = $2 AND l.project_id = $3
+              AND (em.session_id = l.from_session_id OR em.session_id = l.to_session_id)
+              AND em.current_revision = l.evidence_revision
+              AND es.project_id = l.project_id AND ep.company_id = l.company_id
+            FOR SHARE OF l, em`,
+          [linkId, target.companyId, target.projectId],
+        );
+        if (link.rows.length === 0) {
+          linksValid = false;
+          break;
+        }
+      }
+      if (!linksValid) {
         continue;
       }
     }
