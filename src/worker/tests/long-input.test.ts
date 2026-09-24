@@ -69,8 +69,11 @@ describe('長文と応答検証', () => {
     const current = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 9, text: currentText });
     const server = await startFakeJev((request) => ({ body: jevReply(request, jevChoices({ retention: 'substantive' })) }));
     try {
-      await seedApproval(pool, { companyId: workspace.companyId, endpoint: buildWorkerConfig(server.baseUrl).apiUrl });
-      await processClassify(current.messageId, server.baseUrl);
+      // 候補ごとのrelation_explicit質問を含めても6件の文脈が入る予算で、文脈選択の検証を保つ。
+      const config = buildWorkerConfig(server.baseUrl, { inputBudgetBytes: 10_000 });
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: config.apiUrl });
+      const job = await claimJobForMessage(pool, 'classify_message', current.messageId);
+      await processJob(pool, job, config);
       assert.equal(server.requests.length, 1, 'Jev呼出し回数が1回でない');
       const request = server.requests[0];
       const state = request.body.state;
@@ -90,7 +93,7 @@ describe('長文と応答検証', () => {
       assert.equal(raw.includes('過去発言-2-本文'), false, '古い文脈が入っている');
       assert.equal(raw.includes('現在より後の発言'), false, '現在以降の発言が入っている');
       assert.equal(raw.includes('別セッションの発言'), false, '別sessionの発言が入っている');
-      assert.ok(Buffer.byteLength(raw, 'utf8') <= 8_000, '送信bodyが入力予算を超えている');
+      assert.ok(Buffer.byteLength(raw, 'utf8') <= config.inputBudgetBytes, '送信bodyが入力予算を超えている');
     } finally {
       await server.close();
     }
