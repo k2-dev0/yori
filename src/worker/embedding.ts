@@ -12,6 +12,7 @@ import {
   VOYAGE_TOKENIZER_VERSION,
 } from './contract.js';
 import { GenerationMismatchError, PolicyBlockedError } from './errors.js';
+import { hasActiveProviderApproval } from './approvals.js';
 import type { WorkerConfig } from './config.js';
 import {
   callVoyage,
@@ -224,6 +225,36 @@ export async function ensureActiveGeneration(
   }
 }
 
+// 検索開始時にprojectのactive generationを固定して返す。NULLならnullを返し、外部送信せずno_matchにする。
+// 会社不一致・activeでない・provider spec不一致は自動切替せずGenerationMismatchErrorにする（世代切替はM8）。
+export async function loadFixedGeneration(
+  pool: Pool,
+  input: { companyId: string; projectId: string },
+  config: WorkerConfig,
+): Promise<EmbeddingGeneration | null> {
+  const project = await pool.query<{ active_generation_id: string | null }>(
+    'SELECT active_generation_id FROM projects WHERE id = $1 AND company_id = $2',
+    [input.projectId, input.companyId],
+  );
+  if (project.rows.length === 0) {
+    throw new GenerationMismatchError('projectがありません');
+  }
+  const activeId = project.rows[0].active_generation_id;
+  if (activeId === null) {
+    return null;
+  }
+  const generation = await loadGeneration(pool, activeId);
+  if (
+    generation === null ||
+    generation.companyId !== input.companyId ||
+    generation.status !== 'active' ||
+    !specMatches(generation, config)
+  ) {
+    throw new GenerationMismatchError('active generationが現在のprovider specと一致しません');
+  }
+  return generation;
+}
+
 function inputHash(text: string): Buffer {
   return createHash('sha256').update(text, 'utf8').digest();
 }
@@ -251,17 +282,12 @@ interface CachedRow {
 
 // 各HTTP送信の直前に承認を確認する。cache hitでも未確認policyの結果を公開へ使わせない。
 async function hasActiveVoyageApproval(pool: Pool, generation: EmbeddingGeneration): Promise<boolean> {
-  const result = await pool.query(
-    `SELECT 1
-       FROM provider_policy_approvals
-      WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND active AND learning_disabled
-        AND confirmed_at <= now()
-        AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
-      LIMIT 1`,
-    [generation.companyId, generation.provider, generation.accountRef, generation.endpoint],
-  );
-  return result.rows.length > 0;
+  return hasActiveProviderApproval(pool, {
+    companyId: generation.companyId,
+    provider: generation.provider,
+    accountRef: generation.accountRef,
+    endpoint: generation.endpoint,
+  });
 }
 
 // VoyageEmbeddingProviderは承認確認→cache→HTTP→usage/cache保存の順で扱う。vector以外は再利用しない。
