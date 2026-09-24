@@ -77,6 +77,30 @@ export type RelationAction = (typeof RELATION_ACTIONS)[number];
 // 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
 export const JEV_QUESTIONS_VERSION = 'm3-2';
 
+// ---- M4 Voyage埋め込みの固定契約（計画3.3） ----
+export const VOYAGE_PROVIDER = 'voyage_direct';
+export const VOYAGE_API_PATH = '/v1/embeddings';
+export const DEFAULT_VOYAGE_API_URL = `https://api.voyageai.com${VOYAGE_API_PATH}`;
+export const VOYAGE_MODEL = 'voyage-4-lite';
+// Voyageはmodelの不変revisionを公開しないため、取得できた識別情報とtokenizer資産のrevisionだけを固定する。
+export const VOYAGE_TOKENIZER_VERSION =
+  'voyageai/voyage-4-lite@0335ddf7698395712e3220733b4079006951cfef+@huggingface/tokenizers@0.2.0';
+export const VOYAGE_DIMENSIONS = 1024;
+export const VOYAGE_METRIC = 'cosine';
+export const VOYAGE_OUTPUT_DTYPE = 'float';
+export const VOYAGE_DOCUMENT_INPUT_TYPE = 'document';
+export const VOYAGE_QUERY_INPUT_TYPE = 'query';
+// アプリ側で追加の正規化・接頭文を重ねない。input_typeの前処理はproviderへ委ねる。
+export const VOYAGE_NORMALIZATION = 'provider_default';
+// providerのdocument prefixに充てるtoken数の保守的な予約。target/max/overlapはこの分を含めて数える。
+export const VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE = 32;
+
+// 決定的な文書分割のcontract（計画8.2）。target 800 / max 1200 / overlap 100 token。
+export const CHUNK_TARGET_TOKENS = 800;
+export const CHUNK_MAX_TOKENS = 1_200;
+export const CHUNK_OVERLAP_TOKENS = 100;
+export const DOCUMENT_CHUNKER_VERSION = 'm4-1';
+
 // partごとに独立して質問するfield。検索振り分けもpart単位で確認して集約する。
 export const JEV_PART_FIELDS = [
   'retention',
