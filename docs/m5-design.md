@@ -11,7 +11,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 
 ## 検索開始と世代
 
-- `execute_search`はjob payloadの`search_request_id`とjob対象message/revision、会社・案件・社員・session、`new_search`をDB正本で照合する。他の受付を入力IDから推測せず、障害更新とretryも同じscope一致を必須にする。不一致payloadで実在する別受付を更新しない。
+- `execute_search`はjob payloadの`search_request_id`とjob対象message/revision、job session、会社・案件・社員・session、`new_search`をDB正本で照合する。他の受付を入力IDから推測せず、障害更新とretryも同じscope一致を必須にする。不一致payloadやmessage所属と異なるjob sessionでは外部送信・受付更新を行わない。
 - 完了済みresultの再実行はresultを変更せず、同じjobだけをlease条件付きで完了する。
 - 外部送信前にjob leaseとscopeを再確認し、対象受付だけを`running`にする。失敗・retry・明示再開もpayloadの受付1件だけを更新する。
 - 開始時にprojectの`active_generation_id`を固定する。NULLなら外部送信せず`completed/no_match`。会社、status、provider/model、次元、metric、tokenizer、document/query前処理が現在configと一致しなければ`embedding_generation_mismatch`でfailedにし、自動切替しない。
@@ -23,7 +23,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 - company/project、`is_searchable`、ready revision、固定世代のpublicationをSQLで強制する。現在input自身と、現在input以降の同session発言をsourceに含む文書は除外する。別sessionは社員横断。
 - route順位`r`へ`1/(60+r)`を加算し、同じ文書revisionを統合する。同点は文書ID・revisionで安定順にする。
 - 同じ原文range集合は1件へまとめ、上位10件までをJevへ渡す。重複range、10件上限、token予算による除外は機械可読なwarningへ記録する。
-- Jevへ渡す現在質問本文と候補本文の合計を固定Voyage tokenizerで8,000 token相当以下にする。質問だけで予算を使い切る場合は`input_budget_exceeded`でfailedにし、`no_match`へ変換しない。
+- Jevへ渡す現在質問本文と候補本文の合計を固定Voyage tokenizerで8,000 token相当以下にする。質問だけで予算を使い切る場合、または候補は存在するが全件が残予算に収まらない場合は`input_budget_exceeded`でfailedにし、`no_match`へ変換しない。
 
 ## Jev候補判定
 
