@@ -16,9 +16,10 @@ import {
   sha256Bytes,
   type WorkspaceFixture,
 } from '../../db/tests/fixtures.js';
-import { enqueueJob } from '../../jobs/queue.js';
+import { BUILD_DOCUMENTS_PRIORITY, claimJobs, enqueueJob } from '../../jobs/queue.js';
 import { runCli } from '../cli.js';
 import { loadWorkerConfig, type WorkerConfig } from '../config.js';
+import { WORKER_POLICY_VERSION } from '../contract.js';
 import {
   VOYAGE_DIMENSIONS,
   VOYAGE_DOCUMENT_INPUT_TYPE,
@@ -30,7 +31,9 @@ import {
   VOYAGE_TOKENIZER_VERSION,
 } from '../contract.js';
 import { acquireCompanyGenerationLock, ensureActiveGeneration } from '../embedding.js';
-import { advanceRevision, seedApproval, seedMessage, seedSession, readSearchRequest, sleep, type FakeJevServer } from './support.js';
+import { processJob, retryJob } from '../process.js';
+import { deleteGeneration } from '../reindex.js';
+import { advanceRevision, readJob, seedApproval, seedMessage, seedSession, readSearchRequest, sleep, type FakeJevServer } from './support.js';
 import {
   allJevRawBody,
   basisVector,
@@ -364,6 +367,53 @@ async function waitForReindexRun(pool: Pool, projectId: string, sourceGeneration
     await sleep(10);
   }
   return false;
+}
+
+// lock待ちのbackendをpg_stat_activityで確認し、sleep依存ではなくDB待ち状態でraceを同期する。
+async function waitForBackendWaiting(pool: Pool, queryFragment: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM pg_stat_activity
+        WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
+          AND query LIKE '%' || $1 || '%'`,
+      [queryFragment],
+    );
+    if (Number(result.rows[0]?.count ?? '0') > 0) {
+      return true;
+    }
+    await sleep(10);
+  }
+  return false;
+}
+
+// build_documents再試行用の検索可能なanalysisとjobを作る。
+async function upsertAnalysis(pool: Pool, input: { messageId: string; revision: number }): Promise<void> {
+  await pool.query(
+    `INSERT INTO message_analysis
+       (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
+        continuity, statement_status, is_searchable, model_version, state_hash, parts)
+     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', true,
+             'test-model', $5, '[]'::jsonb)
+     ON CONFLICT (message_id, revision, policy_version) DO UPDATE
+       SET retention = EXCLUDED.retention, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
+    [uuidv7(), input.messageId, input.revision, WORKER_POLICY_VERSION, sha256Bytes(`${input.messageId}:${input.revision}`)],
+  );
+}
+
+async function enqueueBuildJob(pool: Pool, input: { sessionId: string; messageId: string; revision: number }): Promise<string> {
+  const jobId = await enqueueJob(pool, {
+    kind: 'build_documents',
+    idempotencyKey: `build_documents:${input.messageId}:${input.revision}:${WORKER_POLICY_VERSION}`,
+    priority: BUILD_DOCUMENTS_PRIORITY,
+    sessionId: input.sessionId,
+    messageId: input.messageId,
+    targetRevision: input.revision,
+    payload: { retention: 'substantive', is_searchable: true },
+  });
+  // host時計とDB時計のskewで直後のclaimが未到来扱いになるのを避け、DB時刻へ揃える。
+  await pool.query('UPDATE jobs SET next_run_at = LEAST(next_run_at, now()) WHERE id = $1', [jobId]);
+  return jobId;
 }
 
 interface MetricsJson {
@@ -1328,6 +1378,238 @@ describe('M8 再索引と世代切替', () => {
     const sent = voyage.requests.flatMap((request) => request.body.input ?? []);
     assert.deepEqual([...sent].sort(), [first.text, second.text].sort(), '同じ文書を重複送信した');
   });
+  it('pending desired revisionはcandidate公開だけではreadyにならず、通常build_documentsが旧activeへ公開できる', { timeout: 30_000 }, async () => {
+    let documentCallCount = 0;
+    let phase: 'partial' | 'ok' = 'partial';
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, (request) => {
+      if (request.input_type !== 'document') {
+        return vectorQueryResponder(basisVector(0, 1))(request);
+      }
+      documentCallCount += 1;
+      if (phase === 'partial' && documentCallCount >= 2) {
+        return { status: 503, body: {} };
+      }
+      return vectorQueryResponder(basisVector(0, 1))(request);
+    });
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+
+    // 1件目をpending desired revisionとして先頭pageへ入れ、後続fillerで2回目のVoyage呼出しを作る。
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-partial-first',
+      text: 'M8-PARTIAL-FIRST',
+    });
+    await pool.query(`UPDATE search_document_revisions SET status = 'pending' WHERE document_id = $1 AND revision = 1`, [
+      first.documentId,
+    ]);
+    const fillerSession = await seedSession(pool, workspace);
+    for (let index = 0; index < 64; index += 1) {
+      await seedDocument(pool, {
+        workspace,
+        sessionId: fillerSession,
+        sequenceNo: index + 1,
+        key: `m8-partial-filler-${String(index).padStart(2, '0')}`,
+        text: `M8-PARTIAL-FILLER-${String(index).padStart(2, '0')}`,
+        generationId: source.id,
+        embedding: basisVector(2, 1),
+      });
+    }
+
+    assert.notEqual(await runCli(['reindex', workspace.projectId], env), 0, 'provider障害のreindexが成功扱いになった');
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), source.id, 'provider障害でactive世代を切り替えた');
+    const run = await latestReindexRun(pool, workspace.projectId);
+    assert.ok(run, 'reindex runが残っていない');
+    assert.notEqual(run.status, 'completed', 'provider障害のrunをcompletedにした');
+    assert.ok(run.target_generation_id, 'runのtarget generationがない');
+    assert.ok(documentCallCount >= 2, '後続batchのprovider障害を作れていない');
+
+    // 1回目のbatchはcandidateへ公開済みでも、revision statusはpendingのまま。
+    const candidatePublication = await pool.query<{ revision: number }>(
+      'SELECT revision FROM document_publications WHERE document_id = $1 AND generation_id = $2',
+      [first.documentId, run.target_generation_id],
+    );
+    assert.equal(candidatePublication.rows[0]?.revision, 1, 'candidate publicationが作成されていない');
+    const revision = await pool.query<{ status: string }>(
+      'SELECT status FROM search_document_revisions WHERE document_id = $1 AND revision = 1',
+      [first.documentId],
+    );
+    assert.equal(revision.rows[0]?.status, 'pending', 'candidate公開だけで旧世代共通revision statusをreadyにした');
+
+    // 通常のbuild_documents再試行が、旧active generationへ公開できる。
+    await upsertAnalysis(pool, { messageId: first.messageId, revision: 1 });
+    const buildJobId = await enqueueBuildJob(pool, { sessionId, messageId: first.messageId, revision: 1 });
+    phase = 'ok';
+    const [buildJob] = await claimJobs(pool, { kinds: ['build_documents'], limit: 1, leaseMs: 60_000 });
+    assert.ok(buildJob, 'build_documents jobをclaimできない');
+    assert.equal(buildJob.id, buildJobId);
+    await processJob(pool, buildJob, config);
+    assert.equal((await readJob(pool, buildJobId)).status, 'completed', 'build_documents再試行が完了しない');
+    const oldActivePublication = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM document_publications p
+         JOIN search_documents d ON d.id = p.document_id
+         JOIN search_document_sources s ON s.document_id = d.id AND s.revision = p.revision
+        WHERE d.project_id = $1 AND p.generation_id = $2 AND s.message_id = $3`,
+      [workspace.projectId, source.id, first.messageId],
+    );
+    assert.ok(
+      Number(oldActivePublication.rows[0]?.count) >= 1,
+      '通常build_documentsが旧active generationへ公開できない',
+    );
+  });
+
+  it('完了済みreindexの再実行はno-opで世代・run・provider送信を増やさない', { timeout: 30_000 }, async () => {
+    const { config, env, voyage } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const document = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-noop-a',
+      text: 'M8-NOOP-A',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    assert.equal(await runCli(['reindex', workspace.projectId], env), 0, '初回reindexが成功しなかった');
+    const activeAfterFirst = await readActiveGeneration(pool, workspace.projectId);
+    assert.ok(activeAfterFirst !== null && activeAfterFirst !== source.id, '初回reindexで切替していない');
+    const readyRevision = await pool.query<{ status: string }>(
+      'SELECT status FROM search_document_revisions WHERE document_id = $1 AND revision = 1',
+      [document.documentId],
+    );
+    assert.equal(readyRevision.rows[0]?.status, 'ready', 'cutover後にdesired revisionがreadyでない');
+
+    const runsBefore = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM reindex_runs WHERE project_id = $1', [
+        workspace.projectId,
+      ])).rows[0]?.count,
+    );
+    const generationsBefore = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM embedding_generations WHERE company_id = $1', [
+        workspace.companyId,
+      ])).rows[0]?.count,
+    );
+    const requestsBefore = voyage.requests.length;
+    const runBefore = await latestReindexRun(pool, workspace.projectId);
+
+    assert.equal(await runCli(['reindex', workspace.projectId], env), 0, 'no-op再実行が成功終了しなかった');
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), activeAfterFirst, 'no-opでactive世代を変更した');
+    const runsAfter = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM reindex_runs WHERE project_id = $1', [
+        workspace.projectId,
+      ])).rows[0]?.count,
+    );
+    const generationsAfter = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM embedding_generations WHERE company_id = $1', [
+        workspace.companyId,
+      ])).rows[0]?.count,
+    );
+    assert.equal(runsAfter, runsBefore, 'no-opでrunを増やした');
+    assert.equal(generationsAfter, generationsBefore, 'no-opでgenerationを増やした');
+    assert.equal(voyage.requests.length, requestsBefore, 'no-opでVoyageへ送信した');
+    const runAfter = await latestReindexRun(pool, workspace.projectId);
+    assert.equal(runAfter?.id, runBefore?.id, 'no-opで別runを作成した');
+    assert.equal(runAfter?.status, 'completed');
+  });
+
+  it('retryでpendingへ戻したrequestが参照するgenerationは削除できない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 1, text: 'M8-RETRY-DELETE' });
+    const pinned = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl, status: 'retired' });
+    await pool.query(
+      `UPDATE search_requests
+          SET embedding_generation_id = $2, status = 'failed', outcome = NULL,
+              error_code = 'provider_unavailable', updated_at = now()
+        WHERE id = $1`,
+      [seeded.requestId, pinned],
+    );
+    await pool.query(
+      `UPDATE jobs SET status = 'failed', error_code = 'provider_unavailable', updated_at = now() WHERE id = $1`,
+      [seeded.jobId],
+    );
+
+    const lock = await pool.connect();
+    try {
+      await lock.query('BEGIN');
+      await lock.query('SELECT 1 FROM search_requests WHERE id = $1 FOR UPDATE', [seeded.requestId]);
+      const retry = retryJob(pool, seeded.jobId, config);
+      assert.ok(await waitForBackendWaiting(pool, 'FOR SHARE OF sr', 5_000), 'retryがrequest lock待ちにならなかった');
+      const deletion = deleteGeneration(pool, pinned);
+      assert.ok(
+        await waitForBackendWaiting(pool, 'embedding_generations', 5_000),
+        'deleteがgeneration lock待ちにならなかった',
+      );
+      await lock.query('COMMIT');
+      assert.equal(await retry, true, 'retryが成功しなかった');
+      assert.equal(await deletion, 'generation_referenced', 'pending requestが参照するgenerationを削除した');
+    } finally {
+      await lock.query('ROLLBACK').catch(() => undefined);
+      lock.release();
+    }
+
+    const request = await pool.query<{ status: string; embedding_generation_id: string | null }>(
+      'SELECT status, embedding_generation_id FROM search_requests WHERE id = $1',
+      [seeded.requestId],
+    );
+    assert.equal(request.rows[0]?.status, 'pending', 'retry後にrequestがpendingでない');
+    assert.equal(request.rows[0]?.embedding_generation_id, pinned, 'retryがgenerationをpinし直した');
+    assert.equal((await pool.query('SELECT 1 FROM embedding_generations WHERE id = $1', [pinned])).rows.length, 1);
+  });
+
+  it('failed requestが参照するgenerationを削除した後のretryは別世代へpinし直さない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const active = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 1, text: 'M8-DELETE-THEN-RETRY' });
+    const pinned = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl, status: 'retired' });
+    assert.notEqual(active.id, pinned, 'precondition: activeとpin対象が同じ');
+    await pool.query(
+      `UPDATE search_requests
+          SET embedding_generation_id = $2, status = 'failed', outcome = NULL,
+              error_code = 'provider_unavailable', updated_at = now()
+        WHERE id = $1`,
+      [seeded.requestId, pinned],
+    );
+    await pool.query(
+      `UPDATE jobs SET status = 'failed', error_code = 'provider_unavailable', updated_at = now() WHERE id = $1`,
+      [seeded.jobId],
+    );
+
+    assert.equal(await deleteGeneration(pool, pinned), 'deleted', 'failed requestが参照する世代を削除できない');
+    assert.equal(await retryJob(pool, seeded.jobId, config), false, '削除済み世代を参照するrequestのretryが成功した');
+    const request = await pool.query<{ status: string; embedding_generation_id: string | null; error_code: string | null }>(
+      'SELECT status, embedding_generation_id, error_code FROM search_requests WHERE id = $1',
+      [seeded.requestId],
+    );
+    assert.equal(request.rows[0]?.status, 'expired', '削除後にfailed requestがexpiredになっていない');
+    assert.equal(request.rows[0]?.embedding_generation_id, null, '削除後にrequestが別世代へpinされている');
+    assert.equal(request.rows[0]?.error_code, 'embedding_generation_deleted');
+    const job = await readJob(pool, seeded.jobId);
+    assert.equal(job.status, 'failed', '削除後のretryでjobがfailedのまま残っていない');
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), active.id, 'retryで別世代へpinし直した');
+    const claimed = await claimJobs(pool, { kinds: ['execute_search'], limit: 1, leaseMs: 60_000 });
+    assert.equal(claimed.length, 0, 'failedのままのexecute_search jobがclaimされた');
+    assert.equal((await pool.query('SELECT 1 FROM embedding_generations WHERE id = $1', [pinned])).rows.length, 0);
+  });
 });
 
 describe('M8 運用metrics', () => {
@@ -1514,5 +1796,63 @@ describe('M8 運用metrics', () => {
     assert.equal(metrics.search_duration_ms.samples, 101, 'sample件数の集約が違う');
     assert.equal(metrics.search_duration_ms.p50, 51, 'p50のSQL集約が違う');
     assert.equal(metrics.search_duration_ms.p95, 96, 'p95のSQL集約が違う');
+  });
+
+  it('target完成後にsource messageだけ改訂された残件をpending_documentsへ数える', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const env = workerEnv();
+    const config = loadWorkerConfig(env).config;
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const document = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-metrics-stale',
+      text: 'M8-METRICS-STALE-SOURCE',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    const target = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl });
+    await pool.query(
+      `INSERT INTO document_embeddings (document_id, revision, generation_id, embedding, input_hash)
+       VALUES ($1, 1, $2, $3::vector, $4)`,
+      [document.documentId, target, toVectorLiteral(basisVector(4, 1)), sha256Bytes(document.text)],
+    );
+    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, stale) VALUES ($1, $2, 1, false)', [
+      document.documentId,
+      target,
+    ]);
+    await pool.query(
+      `INSERT INTO reindex_runs (id, company_id, project_id, source_generation_id, target_generation_id, status)
+       VALUES ($1, $2, $3, $4, $5, 'running')`,
+      [uuidv7(), workspace.companyId, workspace.projectId, source.id, target],
+    );
+    // embedding/publication/hash/staleは完成している。
+    const incompleteBefore = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM search_documents d
+         JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
+         LEFT JOIN document_embeddings e
+           ON e.document_id = d.id AND e.revision = d.desired_revision AND e.generation_id = $2
+         LEFT JOIN document_publications p
+           ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
+        WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
+          AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale)`,
+      [workspace.projectId, target],
+    );
+    assert.equal(Number(incompleteBefore.rows[0]?.count), 0, 'embedding/publication/hashが完成していない');
+
+    await advanceRevision(pool, document.messageId, 'M8-METRICS-STALE-REVISED');
+    const result = await runCliProcess(['metrics', workspace.projectId], env);
+    assert.equal(result.code, 0, `metricsが失敗した: ${result.stderr}`);
+    const metrics = JSON.parse(result.stdout) as MetricsJson;
+    assert.equal(metrics.reindex.pending_documents, 1, 'source現行性をreindex残件へ含めていない');
+    assert.ok(!result.stdout.includes('M8-METRICS-STALE'), 'metricsへ本文を出した');
+    assert.ok(!result.stdout.includes('test-voyage-key'), 'metricsへcredentialを出した');
   });
 });
