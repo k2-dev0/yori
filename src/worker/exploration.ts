@@ -418,7 +418,7 @@ async function loadInferredSessions(
     `SELECT DISTINCT d.session_id
        FROM document_entities e
        JOIN search_documents d ON d.id = e.document_id
-       JOIN search_document_revisions r ON r.document_id = e.document_id AND r.revision = e.revision AND r.status = 'ready'
+       JOIN search_document_revisions r ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
        JOIN document_publications pub ON pub.document_id = e.document_id AND pub.generation_id = $8 AND pub.revision = e.revision
       WHERE e.company_id = $1 AND e.project_id = $2 AND d.company_id = $1 AND d.project_id = $2 AND d.is_searchable
         AND d.session_id <> $3 AND d.session_id <> ALL($4::uuid[])
