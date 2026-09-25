@@ -4,6 +4,7 @@ import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contract.js';
 import type { AuthContext } from './events.js';
+import { redactConversationText } from './redaction.js';
 import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
 import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import { WORKER_POLICY_VERSION } from '../worker/contract.js';
@@ -103,7 +104,9 @@ function manualConditionHash(input: ParsedSearchRequest): Buffer {
 
 // 明示検索を受付ける。同条件の自動受付は処理状態にかかわらず再利用し、
 // それ以外は冪等キー単位でmanual受付とexecute_search jobを同一TXで作る。
-export async function createSearch(pool: Pool, auth: AuthContext, request: ParsedSearchRequest): Promise<CreatedSearch> {
+export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: ParsedSearchRequest): Promise<CreatedSearch> {
+  // 質問本文も保存・Jev送信の前に置換し、条件hashと自動受付の再利用判定も置換後の本文で行う。
+  const request: ParsedSearchRequest = { ...rawRequest, query: redactConversationText(rawRequest.query) };
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
