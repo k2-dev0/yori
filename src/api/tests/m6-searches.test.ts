@@ -1104,6 +1104,35 @@ describe('M6 POST /v1/searches 受付', () => {
     assert.equal(autoRow.search_action, null, 'manual受付が自動受付を上書きしている');
   });
 
+  it('秘匿値を含むqueryはplaceholderへ置換して保存し、置換後の条件で冪等判定する', async () => {
+    const input = await ingestUserInput('置換対象の入力文');
+    const idempotencyKey = `search-idem-${randomUUID()}`;
+    const rawKey = `AKIA${'A'.repeat(16)}`;
+    const response = await postSearch(app, {
+      token: workspace.token,
+      body: buildSearchBody({ messageId: input.messageId, query: `キーは ${rawKey} のままでよいか`, idempotencyKey, forceRefresh: true }),
+    });
+    assertAccepted(response, 'manual受付に失敗');
+    const body = response.json<{ request_id: string }>();
+
+    const stored = JSON.stringify(await readSearchRequestFull(pool, body.request_id));
+    assert.ok(stored.includes('キーは [REDACTED:aws_access_key] のままでよいか'), `queryが置換されていない: ${stored}`);
+    assert.ok(!stored.includes(rawKey), 'queryへ生値が保存されている');
+
+    // 別の生値でも置換後が同じなら、同じ冪等キーの再送として409にせず同じ受付を返す。
+    const sameMasked = await postSearch(app, {
+      token: workspace.token,
+      body: buildSearchBody({
+        messageId: input.messageId,
+        query: `キーは ${`AKIA${'B'.repeat(16)}`} のままでよいか`,
+        idempotencyKey,
+        forceRefresh: true,
+      }),
+    });
+    assert.equal(sameMasked.statusCode, 200, `置換後の条件が同じ再送を拒否した: ${sameMasked.body}`);
+    assert.equal(sameMasked.json<{ request_id: string }>().request_id, body.request_id, '置換後の条件が同じ再送で別の受付を作っている');
+  });
+
   it('force_refresh=trueは同じ原文でもmanual受付とexecute_search jobを作る', async () => {
     const input = await ingestUserInput('強制再検索の原文');
     const response = await postSearch(app, {
