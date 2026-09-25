@@ -43,12 +43,13 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 `execute_search`はrequest行をロックし、未固定ならその時点の案件active世代を`search_requests.embedding_generation_id`へ保存する。既に固定済みなら案件切替後も同じ世代を使う。
 
 - 固定済み世代は同一会社・完全spec一致で、`active`または`retired`なら利用できる。`candidate`と`failed`は拒否する。
+- 世代別publicationが指すrevisionは`ready`または`superseded`を許可する。切替後も旧世代を固定した実行中検索は有効な旧publicationを使い続け、pending / embedding / failed / excludedは候補にしない。
 - 質問埋め込み、vector/entity候補、Jev候補判定、結果の`index_status`まで同一generation IDを使う。
 - DB候補検索に成功した試行だけ、所要時間を`search_duration_samples`へ記録する。
 
 ## 世代削除とmetrics
 
-`worker:generation-delete -- <generation-uuid>`は、active案件、未完了reindex run、pending/running検索要求が参照する世代を拒否する。検索retryはgeneration行、request行の順でロックし、削除と直列化する。削除可能な世代を固定していたfailed検索要求は、同じTXで`expired / embedding_generation_deleted`へ終端してから世代参照を外し、後から別active世代へ再固定しない。参照の確認と削除は同一TXで行う。
+`worker:generation-delete -- <generation-uuid>`は、active案件、未完了reindex run、pending/running検索要求、または自動retry待ちのpending/running `execute_search` jobが参照する世代を拒否する。検索retryはgeneration行、request行の順でロックし、削除と直列化する。削除可能な世代を固定していたfailed検索要求は、同じTXで`expired / embedding_generation_deleted`へ終端してから世代参照を外し、後から別active世代へ再固定しない。参照の確認と削除は同一TXで行う。
 
 `worker:metrics -- <project-uuid>`は案件単位のJSONだけをstdoutへ返す。
 
