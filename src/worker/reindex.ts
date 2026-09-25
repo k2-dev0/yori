@@ -640,7 +640,20 @@ export async function deleteGeneration(pool: Pool, generationId: string): Promis
         LIMIT 1`,
       [generationId],
     );
-    if (active.rows.length > 0 || runs.rows.length > 0 || requests.rows.length > 0) {
+    // failed requestでも自動retry待ちのexecute_search jobが残っている間は削除しない。
+    // expiredへ終端するとjobが再claim後にrunningへ進めず回収ループになるため。
+    // payloadはDB正本のrequest idとtext比較し、不正値のcastでSQL errorにしない。
+    const retryJobs = await client.query(
+      `SELECT 1
+         FROM jobs j
+         JOIN search_requests sr ON sr.id::text = j.payload->>'search_request_id'
+        WHERE j.kind = 'execute_search'
+          AND j.status IN ('pending', 'running')
+          AND sr.embedding_generation_id = $1
+        LIMIT 1`,
+      [generationId],
+    );
+    if (active.rows.length > 0 || runs.rows.length > 0 || requests.rows.length > 0 || retryJobs.rows.length > 0) {
       await client.query('ROLLBACK');
       return 'generation_referenced';
     }
