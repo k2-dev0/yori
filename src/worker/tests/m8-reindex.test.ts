@@ -1812,6 +1812,8 @@ describe('M8 再索引と世代切替', () => {
     const run = await latestReindexRun(pool, workspace.projectId);
     assert.equal(run?.status, 'completed', '1本目のrunがcompletedでない');
     assert.equal(run?.target_generation_id, targetId);
+    const targetStatus = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [targetId]);
+    assert.equal(targetStatus.rows[0]?.status, 'active', '切替後target generationがactiveでない');
     const generationsAfter = Number(
       (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM embedding_generations WHERE company_id = $1', [
         workspace.companyId,
@@ -1875,7 +1877,7 @@ describe('M8 再索引と世代切替', () => {
     const newTargetStatus = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [
       newRun.target_generation_id,
     ]);
-    assert.notEqual(newTargetStatus.rows[0]?.status, 'failed', 'retry可能な失敗で新targetをfailedにした');
+    assert.equal(newTargetStatus.rows[0]?.status, 'candidate', '新runのtarget generationがcandidateでない');
   });
 });
 
