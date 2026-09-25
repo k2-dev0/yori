@@ -740,3 +740,49 @@ describe('POST /v1/events 入力検証', () => {
     await assertNoEventWrites(pool);
   });
 });
+
+describe('POST /v1/events 秘匿値の置換', () => {
+  it('textの秘匿値をplaceholderへ置換して保存し、再送・過去revision再送も置換後の本文で照合する', async () => {
+    const rawKey = `AKIA${'A'.repeat(16)}`;
+    const masked = 'キーは [REDACTED:aws_access_key] です';
+    const event = buildEventInput({ idempotency_key: 'idem-redact-1', source_message_id: 'msg-redact', text: `キーは ${rawKey} です` });
+
+    const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
+    assert.equal(response.statusCode, 202, `受付に失敗: ${response.body}`);
+    const [result] = response.json<EventsResponse>().results;
+    assert.ok(result, '受付結果がない');
+
+    const stored = await pool.query<{ text: string; content_hash: Buffer }>(
+      'SELECT text, content_hash FROM message_revisions WHERE message_id = $1 AND revision = 1',
+      [result.message_id],
+    );
+    assert.equal(stored.rows[0]?.text, masked, '保存本文が置換されていない');
+    assert.ok(stored.rows[0]?.content_hash.equals(sha256Bytes(masked)), 'content_hashが置換後の本文と一致しない');
+
+    const receipt = await pool.query<{ request_hash: Buffer }>('SELECT request_hash FROM event_receipts WHERE idempotency_key = $1', [
+      'idem-redact-1',
+    ]);
+    const canonical = canonicalReceiptHash({
+      ...event,
+      text: masked,
+      company_id: workspace.companyId,
+      employee_id: workspace.employeeId,
+      project_id: workspace.projectId,
+    });
+    assert.ok(receipt.rows[0]?.request_hash.equals(canonical), 'receipt hashが置換後の本文と一致しない');
+
+    // 同じ本文の再送は同じmessageを返し、revision・job・検索受付を増やさない。
+    const resend = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
+    assert.equal(resend.statusCode, 202, `再送に失敗: ${resend.body}`);
+    assert.equal(resend.json<EventsResponse>().results[0]?.message_id, result.message_id);
+
+    // 別の冪等キーでの過去revision再送も、保存済みの置換後本文と一致すれば409にしない。
+    const pastResend = buildEventInput({ ...event, idempotency_key: 'idem-redact-past' });
+    const pastResponse = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [pastResend]) });
+    assert.equal(pastResponse.statusCode, 202, `過去revisionの再送が拒否された: ${pastResponse.body}`);
+    const revisions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM message_revisions WHERE message_id = $1', [
+      result.message_id,
+    ]);
+    assert.equal(revisions.rows[0]?.count, '1', '再送でrevisionが増えている');
+  });
+});
