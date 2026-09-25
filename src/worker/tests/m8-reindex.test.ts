@@ -1610,6 +1610,141 @@ describe('M8 再索引と世代切替', () => {
     assert.equal(claimed.length, 0, 'failedのままのexecute_search jobがclaimされた');
     assert.equal((await pool.query('SELECT 1 FROM embedding_generations WHERE id = $1', [pinned])).rows.length, 0);
   });
+  it('cutover後も旧generation固定の検索はsupersededの旧publication revisionで照合する', { timeout: 30_000 }, async () => {
+    const { config, env, jev } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    const rev1Text = 'M8-SUPER-REV1';
+    const document = await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-super',
+      text: rev1Text,
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    const rev2Text = 'M8-SUPER-REV2';
+    await appendDesiredRevision(pool, {
+      documentId: document.documentId,
+      messageId: document.messageId,
+      nextRevision: 2,
+      content: rev2Text,
+    });
+
+    // cutover前に旧generationを固定したexecute_searchを用意する。
+    const searchSession = await seedSession(pool, workspace);
+    const pinned = await seedExecuteSearch(pool, {
+      workspace,
+      sessionId: searchSession,
+      sequenceNo: 1,
+      text: 'M8-SUPER-QUERY',
+    });
+    await pool.query('UPDATE search_requests SET embedding_generation_id = $2, updated_at = now() WHERE id = $1', [
+      pinned.requestId,
+      source.id,
+    ]);
+
+    assert.equal(await runCli(['reindex', workspace.projectId], env), 0, 'reindexが成功終了しなかった');
+    const targetId = await readActiveGeneration(pool, workspace.projectId);
+    assert.ok(targetId !== null && targetId !== source.id, 'active generationが切り替わっていない');
+    const revisions = await pool.query<{ revision: number; status: string }>(
+      'SELECT revision, status FROM search_document_revisions WHERE document_id = $1 ORDER BY revision',
+      [document.documentId],
+    );
+    assert.deepEqual(
+      revisions.rows.map((row) => row.status),
+      ['superseded', 'ready'],
+      'cutover後のrevision statusが想定と違う',
+    );
+
+    await runExecuteSearch(pool, { jobId: pinned.jobId, config });
+    const request = await readSearchRequest(pool, pinned.requestId);
+    assert.equal(request.status, 'completed');
+    assert.equal(request.outcome, 'matched', 'supersededの旧publication revisionでmatchedにならない');
+    const result = request.result as
+      | {
+          index_status?: { embedding_generation_id?: string };
+          matches?: { case_or_document_id?: string; evidence?: { message_id?: string }[] }[];
+          candidate_evaluations?: { document_id?: string; revision?: number }[];
+        }
+      | null;
+    assert.equal(result?.index_status?.embedding_generation_id, source.id, '開始時に固定した旧generationを使っていない');
+    assert.equal(result?.matches?.[0]?.case_or_document_id, document.documentId);
+    assert.ok(
+      result?.matches?.[0]?.evidence?.some((item) => item.message_id === document.messageId),
+      '旧rev1のevidenceがない',
+    );
+    assert.equal(result?.candidate_evaluations?.[0]?.document_id, document.documentId);
+    assert.equal(result?.candidate_evaluations?.[0]?.revision, 1, '旧generationのrev1ではなく別revisionを候補にした');
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes(rev1Text), '旧rev1の候補本文をJevへ渡していない');
+    assert.ok(!jevBody.includes(rev2Text), '新generationのrev2を旧世代固定検索へ混ぜた');
+  });
+
+  it('自動retry待ちのexecute_search jobが参照する固定generationは削除を拒否する', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config } = await startReindexProviders(pool, workspace.companyId, vectorQueryResponder(basisVector(0, 1)));
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 1, text: 'M8-RETRY-PENDING' });
+    const pinned = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl, status: 'retired' });
+    // retryable障害: requestはfailed、execute_search jobはpendingで自動retry待ち。
+    await pool.query(
+      `UPDATE search_requests
+          SET embedding_generation_id = $2, status = 'failed', outcome = NULL,
+              error_code = 'provider_unavailable', updated_at = now()
+        WHERE id = $1`,
+      [seeded.requestId, pinned],
+    );
+    await pool.query(
+      `UPDATE jobs
+          SET status = 'pending', error_code = 'provider_unavailable', lease_token = NULL,
+              lease_expires_at = NULL, next_run_at = now(), updated_at = now()
+        WHERE id = $1`,
+      [seeded.jobId],
+    );
+    // 不正payloadのjobが混在してもcast errorにせず、参照判定を壊さない。
+    await enqueueJob(pool, {
+      kind: 'execute_search',
+      idempotencyKey: `m8-delete-invalid-payload:${uuidv7()}`,
+      sessionId,
+      messageId: seeded.messageId,
+      targetRevision: 1,
+      payload: { search_request_id: 'not-a-uuid' },
+    });
+
+    assert.equal(
+      await deleteGeneration(pool, pinned),
+      'generation_referenced',
+      '自動retry待ちjobが参照するgenerationを削除した',
+    );
+    assert.equal((await pool.query('SELECT 1 FROM embedding_generations WHERE id = $1', [pinned])).rows.length, 1);
+    const failedRequest = await pool.query<{ status: string; embedding_generation_id: string | null }>(
+      'SELECT status, embedding_generation_id FROM search_requests WHERE id = $1',
+      [seeded.requestId],
+    );
+    assert.equal(failedRequest.rows[0]?.status, 'failed', '拒否時にrequestをexpiredにした');
+    assert.equal(failedRequest.rows[0]?.embedding_generation_id, pinned, '拒否時にpinを外した');
+    assert.equal((await readJob(pool, seeded.jobId)).status, 'pending', '拒否時にjob状態を変えた');
+
+    // jobがterminal failedになれば、failed requestのexpiryを経て削除できる。
+    await pool.query(`UPDATE jobs SET status = 'failed', updated_at = now() WHERE id = $1`, [seeded.jobId]);
+    assert.equal(await deleteGeneration(pool, pinned), 'deleted', 'terminal job後のgeneration削除が失敗した');
+    const expiredRequest = await pool.query<{
+      status: string;
+      embedding_generation_id: string | null;
+      error_code: string | null;
+    }>('SELECT status, embedding_generation_id, error_code FROM search_requests WHERE id = $1', [seeded.requestId]);
+    assert.equal(expiredRequest.rows[0]?.status, 'expired');
+    assert.equal(expiredRequest.rows[0]?.embedding_generation_id, null);
+    assert.equal(expiredRequest.rows[0]?.error_code, 'embedding_generation_deleted');
+    assert.equal(await retryJob(pool, seeded.jobId, config), false, '世代削除後のretryが成功した');
+    assert.equal((await readJob(pool, seeded.jobId)).status, 'failed');
+  });
 });
 
 describe('M8 運用metrics', () => {
