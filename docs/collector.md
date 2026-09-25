@@ -78,7 +78,8 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 
 ## 診断と制約
 
-- 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。
+- 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
+- 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。本文長の判定は置換後に行う。
 - 完成行を文字列へ変換する前にUTF-8を検証する。不正バイトを含む行は置換せず除外し、`transcript_invalid_utf8`とoffsetを記録する。正常なUnicodeと後続行は保持する。未完行の途中で切れた文字は完成まで判定しない。
 - 未知版・session不一致で保留したscanは、そのscanで積んだmessage/outbox/採番/cursorを一体でrollbackし、保留原因の診断だけを残す。原因が解消すると同じ行を先頭から同じ順で読み直し、重複しないsequenceを採番する。
 - 1MiB超の行は本文を保持せず改行まで読み捨てる。読み捨て中の元行startと読取済みoffsetは`file_cursors`へ保存し、次回は途中から再開する。4MiBの読取予算は読み捨て中の読取も含む。inode交換・短縮・fingerprint不一致の再読込時は読み捨て状態も捨てる。旧schemaのstateには列を後方互換で追加する。
