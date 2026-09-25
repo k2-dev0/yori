@@ -1745,6 +1745,138 @@ describe('M8 再索引と世代切替', () => {
     assert.equal(await retryJob(pool, seeded.jobId, config), false, '世代削除後のretryが成功した');
     assert.equal((await readJob(pool, seeded.jobId)).status, 'failed');
   });
+  it('project UUIDの大文字小文字が違っても同じadvisory lockで直列化し二重reindexしない', { timeout: 30_000 }, async () => {
+    assert.notEqual(workspace.projectId, workspace.projectId.toUpperCase(), 'precondition: UUIDに文字が含まれる');
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    let enterGate!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enterGate = resolve;
+    });
+    let gated = false;
+    const { config, env, voyage } = await startReindexProviders(pool, workspace.companyId, async (request) => {
+      if (request.input_type === 'document' && !gated) {
+        gated = true;
+        enterGate();
+        await gate;
+      }
+      return vectorQueryResponder(basisVector(0, 1))(request);
+    });
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-case',
+      text: 'M8-CASE',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    const generationsBefore = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM embedding_generations WHERE company_id = $1', [
+        workspace.companyId,
+      ])).rows[0]?.count,
+    );
+    const runsBefore = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM reindex_runs WHERE project_id = $1', [
+        workspace.projectId,
+      ])).rows[0]?.count,
+    );
+
+    const lower = runCli(['reindex', workspace.projectId], env);
+    const observed = await Promise.race([
+      entered.then(() => 'entered' as const),
+      sleep(5_000).then(() => 'timeout' as const),
+    ]);
+    assert.equal(observed, 'entered', '1本目のreindexがdocument埋め込みを開始しなかった');
+    const requestsBeforeSecond = voyage.requests.length;
+
+    assert.notEqual(
+      await runCli(['reindex', workspace.projectId.toUpperCase()], env),
+      0,
+      '大文字UUIDの並行reindexが拒否されなかった',
+    );
+    assert.equal(voyage.requests.length, requestsBeforeSecond, '2本目がproviderへ送信した');
+
+    releaseGate();
+    assert.equal(await lower, 0, '1本目のreindexが成功終了しなかった');
+    const targetId = await readActiveGeneration(pool, workspace.projectId);
+    assert.ok(targetId !== null && targetId !== source.id, 'active generationが切り替わっていない');
+    const run = await latestReindexRun(pool, workspace.projectId);
+    assert.equal(run?.status, 'completed', '1本目のrunがcompletedでない');
+    assert.equal(run?.target_generation_id, targetId);
+    const generationsAfter = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM embedding_generations WHERE company_id = $1', [
+        workspace.companyId,
+      ])).rows[0]?.count,
+    );
+    const runsAfter = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM reindex_runs WHERE project_id = $1', [
+        workspace.projectId,
+      ])).rows[0]?.count,
+    );
+    assert.equal(generationsAfter, generationsBefore + 1, 'generationが1件だけ増えていない');
+    assert.equal(runsAfter, runsBefore + 1, 'reindex runが1件だけ増えていない');
+  });
+
+  it('未完了runの恒久失敗処理はactive targetをfailedへ降格しない', { timeout: 30_000 }, async () => {
+    await assertM8Structures(pool);
+    const { config, env } = await startReindexProviders(pool, workspace.companyId, (request) => {
+      if (request.input_type === 'document') {
+        return { status: 503, body: {} };
+      }
+      return vectorQueryResponder(basisVector(0, 1))(request);
+    });
+    const source = await ensureActiveGeneration(
+      pool,
+      { companyId: workspace.companyId, projectId: workspace.projectId },
+      config,
+    );
+    const sessionId = await seedSession(pool, workspace);
+    await seedDocument(pool, {
+      workspace,
+      sessionId,
+      sequenceNo: 1,
+      key: 'm8-guard',
+      text: 'M8-GUARD',
+      generationId: source.id,
+      embedding: basisVector(0, 1),
+    });
+    // source不一致の未完了runをsource=別世代・target=現在activeにして、恒久失敗処理を通す。
+    const other = await insertGeneration(pool, { companyId: workspace.companyId, endpoint: config.voyageApiUrl, status: 'retired' });
+    const staleRunId = uuidv7();
+    await pool.query(
+      `INSERT INTO reindex_runs (id, company_id, project_id, source_generation_id, target_generation_id, status)
+       VALUES ($1, $2, $3, $4, $5, 'running')`,
+      [staleRunId, workspace.companyId, workspace.projectId, other, source.id],
+    );
+
+    assert.notEqual(await runCli(['reindex', workspace.projectId], env), 0, 'provider障害のreindexが成功扱いになった');
+    assert.equal(await readActiveGeneration(pool, workspace.projectId), source.id, 'active世代が変わった');
+    const sourceStatus = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [source.id]);
+    assert.equal(sourceStatus.rows[0]?.status, 'active', '恒久失敗処理がactive targetをfailedへ降格した');
+    const staleRun = await pool.query<{ status: string; error_code: string | null }>(
+      'SELECT status, error_code FROM reindex_runs WHERE id = $1',
+      [staleRunId],
+    );
+    assert.equal(staleRun.rows[0]?.status, 'failed', 'source不一致の未完了runがfailedになっていない');
+    assert.equal(staleRun.rows[0]?.error_code, 'spec_changed');
+    const newRun = await latestReindexRun(pool, workspace.projectId);
+    assert.ok(newRun && newRun.id !== staleRunId, '新しいreindex runが作成されていない');
+    assert.notEqual(newRun.target_generation_id, source.id, 'active世代を新runのtargetにした');
+    assert.equal(newRun.status, 'pending', 'provider障害の新runがpendingでない');
+    const newTargetStatus = await pool.query<{ status: string }>('SELECT status FROM embedding_generations WHERE id = $1', [
+      newRun.target_generation_id,
+    ]);
+    assert.notEqual(newTargetStatus.rows[0]?.status, 'failed', 'retry可能な失敗で新targetをfailedにした');
+  });
 });
 
 describe('M8 運用metrics', () => {
