@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, type EventSource } from '../api/contract.js';
+import { redactConversationText } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
 import { SUPPORTED_CODEX_CLI_VERSION, parseCodexTranscriptLine } from './adapters/codex.js';
 import { resolveRepositoryFromCwd } from './remote.js';
@@ -247,7 +248,9 @@ interface IngestContext {
 
 // 1件の発言を検証し、同一message IDは本文一致を無視・本文変更をrevision+1としてoutboxへ積む。
 function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byteOffset: number): void {
-  if (!isStorableText(record.text)) {
+  // 保存・送信の前に秘匿値を置換する。hashとrevision判定も置換後の本文で行い、再読込で増殖させない。
+  const text = redactConversationText(record.text);
+  if (!isStorableText(text)) {
     recordDiagnostic(ctx.state, ctx.namespace, 'message_invalid_text', byteOffset);
     return;
   }
@@ -260,7 +263,7 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     return;
   }
   const occurredAt = new Date(record.occurred_at).toISOString();
-  const contentHash = sha256Hex(record.text);
+  const contentHash = sha256Hex(text);
   const stored = getStoredMessage(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id);
 
   let sequenceNo: number;
@@ -306,6 +309,10 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
   const idempotencyKey = sha256Hex(
     JSON.stringify([ctx.namespace, ctx.source, ctx.repository, ctx.hook.session_id, record.source_message_id, String(revision)]),
   );
+  // 診断は固定codeと参照offsetだけを残し、置換した値も種類も保存しない。
+  if (text !== record.text) {
+    recordDiagnostic(ctx.state, ctx.namespace, 'message_redacted', byteOffset);
+  }
   enqueueOutbox(ctx.state, {
     namespace: ctx.namespace,
     idempotency_key: idempotencyKey,
@@ -318,7 +325,7 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     revision,
     role: record.role,
     occurred_at: occurredAt,
-    text: record.text,
+    text,
   });
 }
 
