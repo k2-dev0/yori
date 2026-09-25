@@ -133,7 +133,7 @@ const VECTOR_CANDIDATES_SQL = `
     JOIN document_publications p
       ON p.document_id = e.document_id AND p.generation_id = $4 AND p.revision = e.revision
     JOIN search_document_revisions r
-      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status = 'ready'
+      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
    WHERE d.company_id = $1
      AND d.project_id = $2
      AND d.is_searchable
@@ -158,7 +158,7 @@ const ENTITY_CANDIDATES_SQL = `
     JOIN document_publications p
       ON p.document_id = e.document_id AND p.generation_id = $3 AND p.revision = e.revision
     JOIN search_document_revisions r
-      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status = 'ready'
+      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
    WHERE d.company_id = $1
      AND d.project_id = $2
      AND d.is_searchable
@@ -611,7 +611,7 @@ async function loadValidCandidate(
        JOIN document_publications p
          ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = $3
        JOIN search_document_revisions r
-         ON r.document_id = d.id AND r.revision = $3 AND r.status = 'ready'
+         ON r.document_id = d.id AND r.revision = $3 AND r.status IN ('ready', 'superseded')
       WHERE d.id = $1 AND d.company_id = $4 AND d.project_id = $5 AND d.is_searchable
       FOR UPDATE OF d, p, r`,
     [candidate.documentId, generation.id, candidate.revision, target.companyId, target.projectId],
