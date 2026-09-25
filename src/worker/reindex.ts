@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import { v7 as uuidv7 } from 'uuid';
+import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
 import type { WorkerConfig } from './config.js';
 import { PolicyBlockedError } from './errors.js';
 import {
@@ -74,21 +74,27 @@ function vectorLiteral(vector: readonly number[]): string {
 }
 
 // 同じprojectの同時reindexを直列化する。取得できない場合は何も変更せず拒否する。
+// UUIDは大文字小文字表記が違っても同一案件のため、入口でcanonical lowercaseへ正規化した同じ文字列を
+// advisory lockとDB queryの両方へ使う（hashtextの表記差でlockが分かれないようにする）。
 export async function reindexProject(pool: Pool, projectId: string, config: WorkerConfig): Promise<ReindexResult> {
+  if (!validateUuid(projectId)) {
+    return { ok: false, code: 'invalid_project_id', runId: null, targetGenerationId: null };
+  }
+  const canonicalProjectId = projectId.toLowerCase();
   const lockClient = await pool.connect();
   const lock = await lockClient.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1::int, hashtext($2)) AS locked', [
     REINDEX_LOCK_NAMESPACE,
-    projectId,
+    canonicalProjectId,
   ]);
   if (lock.rows[0]?.locked !== true) {
     lockClient.release();
     return { ok: false, code: 'reindex_in_progress', runId: null, targetGenerationId: null };
   }
   try {
-    return await runProjectReindex(pool, projectId, config);
+    return await runProjectReindex(pool, canonicalProjectId, config);
   } finally {
     await lockClient
-      .query('SELECT pg_advisory_unlock($1::int, hashtext($2))', [REINDEX_LOCK_NAMESPACE, projectId])
+      .query('SELECT pg_advisory_unlock($1::int, hashtext($2))', [REINDEX_LOCK_NAMESPACE, canonicalProjectId])
       .catch(() => undefined);
     lockClient.release();
   }
@@ -198,8 +204,8 @@ async function findCompletedNoop(pool: Pool, project: ProjectRow, config: Worker
   return { runId: run.id, target };
 }
 
-// 同project・同source・current specの未完了runだけをresumeする。それ以外の未完了runは
-// targetともどもfailedにし、新しいcandidateを作れるようにする。
+// 同project・同source・current specの未完了runだけをresumeする。それ以外の未完了runはfailedにし、
+// active参照のないcandidate targetだけfailedにして、新しいcandidateを作れるようにする。
 async function findResumableRun(pool: Pool, project: ProjectRow, config: WorkerConfig): Promise<ResumableRun | null> {
   const result = await pool.query<RunRow>(
     `SELECT id, source_generation_id, target_generation_id
@@ -279,13 +285,25 @@ async function markRunPermanentlyFailed(pool: Pool, runId: string, targetGenerat
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
-      `UPDATE reindex_runs SET status = 'failed', error_code = $2, completed_at = now(), updated_at = now() WHERE id = $1`,
+    // 未完了runだけをfailedへ。completed runは変更しない。
+    const failed = await client.query(
+      `UPDATE reindex_runs
+          SET status = 'failed', error_code = $2, completed_at = now(), updated_at = now()
+        WHERE id = $1 AND status IN ('pending', 'running', 'blocked_policy')
+        RETURNING id`,
       [runId, errorCode],
     );
-    await client.query(`UPDATE embedding_generations SET status = 'failed', updated_at = now() WHERE id = $1 AND status <> 'failed'`, [
-      targetGenerationId,
-    ]);
+    if (failed.rows.length > 0) {
+      // 実際にrunをfailedへ遷移できた時だけ、active参照のないcandidate targetをfailedにする。
+      // 現在activeまたはcompleted targetをfailedへ降格しない。
+      await client.query(
+        `UPDATE embedding_generations g
+            SET status = 'failed', updated_at = now()
+          WHERE g.id = $1 AND g.status = 'candidate'
+            AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.active_generation_id = g.id)`,
+        [targetGenerationId],
+      );
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
