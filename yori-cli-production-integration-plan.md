@@ -26,7 +26,7 @@
 
 ### 3.1 エージェントが実装するもの
 
-1. `YORI_ADMIN_DATABASE_URL`を必須化し、固定fallbackを削除する。
+1. 固定`YORI_ADMIN_DATABASE_URL` fallbackを削除し、yori本体と同じ`YORI_POSTGRES_*`を必須化する。
 2. 空値・未設定でCompose configまたはCLI実行を失敗させる。
 3. yori本体の`/etc/yori/yori.env`を使う実行契約。
 4. external network名を明示し、存在しないnetworkで安全に失敗する手順。
@@ -53,17 +53,19 @@ CLI containerは次を必須とする。
 
 | 変数 | 値 |
 |---|---|
-| `YORI_ADMIN_DATABASE_URL` | yori本体と同じuser、password、database、host=`db`、port=`5432` |
+| `YORI_POSTGRES_USER` | yori本体と同じPostgreSQL role |
+| `YORI_POSTGRES_PASSWORD` | yori本体と同じPostgreSQL password |
+| `YORI_POSTGRES_DB` | yori本体と同じdatabase名 |
 | `YORI_ADMIN_NETWORK` | 既定`yori_default`。別project名なら明示 |
 
 固定URLのdefaultを置かない。
 
 ```yaml
 environment:
-  DATABASE_URL: ${YORI_ADMIN_DATABASE_URL:?required}
+  DATABASE_URL: postgres://${YORI_POSTGRES_USER:?required}:${YORI_POSTGRES_PASSWORD:?required}@db:5432/${YORI_POSTGRES_DB:?required}
 ```
 
-`YORI_ADMIN_DATABASE_URL`は`/etc/yori/yori.env`に記録し、yori本体がCompose内で使う値と同じ資格情報から作る。hostだけはCLI containerから到達するCompose service名`db`に固定する。
+3値はyori本体と同じ`/etc/yori/yori.env`から読み、URL文字列を二重管理しない。hostはCLI containerから到達するCompose service名`db`に固定する。repository外から`yori-admin` binaryを直接実行する場合だけ、既存契約どおり完成済みの`DATABASE_URL`を環境変数で渡す。
 
 CLIはDB portをhostへ公開せず、external Docker networkからのみ接続する。
 
@@ -124,9 +126,9 @@ npmやprivate registryへ配布する場合は別判断とする。
 
 ## 8. 必須テスト
 
-- `YORI_ADMIN_DATABASE_URL`未設定でCompose configまたはrunが失敗する。
+- いずれかの`YORI_POSTGRES_*`未設定でCompose configまたはrunが失敗する。
 - 空値で固定defaultへfallbackしない。
-- 合成URLでDATABASE_URLがadmin containerへ渡る。
+- 合成した3値から期待するDATABASE_URLがadmin containerへ渡る。
 - DB portをhostへ公開しない。
 - `yori_default`へだけ参加する。
 - yori本体のmigration済みschemaへbootstrapできる。
