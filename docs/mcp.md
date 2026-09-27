@@ -74,3 +74,11 @@ M7のmatched結果は代表根拠に加え、前後発言、後続の訂正・�
 - `not_received`は中央APIが現在入力をまだ受け付けていない状態であり、該当履歴なしではない。
 - `provider_policy_unverified`等の検索失敗は中央の検索受付に残る。MCP側で別プロバイダーへ迂回しない。
 - token、SQL、外部error bodyはtool結果へ返さない。
+
+## 出力契約とSDK制約
+
+toolの入力schemaはHTTPと同じ共有primitiveを`src/mcp/schema.ts`で共有する。UUIDは小文字の正規形へ揃え、取り込み元identifierはUTF-8で1024バイト、本文はUnicodeコードポイント上限、`wait_ms`は0〜5000ms、`get_search_result`はrequest_id／内部input_id／外部identityの排他的branchをHTTPと同じ規則で検証する。
+
+中央APIの応答はtoolへ返す前に`src/mcp/schema.ts`の出力Zod schemaで検証する。成功時は検証後の値を`structuredContent`とtext JSONへ同じ値として返し、consumerの後方互換のためloose validationで追加fieldを保持する。HTTP 4xx/5xx、timeout、応答形式不正はtool errorにし、空結果や`no_match`へ変換しない。
+
+MCP SDK `@modelcontextprotocol/server` 2.1.0の`outputSchema`登録機能はこの実装の前提にしない（使用しない）。tool listへ出力schemaを登録せず、上記の実行時検証、本文書、`src/mcp/tests/contract.test.ts`のsnapshotで出力契約を固定する。SDK更新だけを目的に依存を上げない。
