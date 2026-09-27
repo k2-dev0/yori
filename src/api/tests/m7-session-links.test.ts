@@ -565,13 +565,13 @@ describe('M7 POST /v1/session-links', () => {
     const fromSession = await pool.query<{ id: string }>(
       `SELECT id FROM sessions
         WHERE source = 'codex' AND source_session_id = 'integration-from-session'
-          AND source_scope = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
+          AND source_namespace = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
       [workspace.companyId, fromEmployee, SCOPE],
     );
     const toSession = await pool.query<{ id: string }>(
       `SELECT id FROM sessions
         WHERE source = 'claude_code' AND source_session_id = 'integration-to-session'
-          AND source_scope = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
+          AND source_namespace = 'v1|' || $1::text || '|' || $2::text || '|' || $3::text`,
       [workspace.companyId, workspace.employeeId, SCOPE],
     );
     assert.ok(fromSession.rows[0], '標準経路のfrom sessionがない');
