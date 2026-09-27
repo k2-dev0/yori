@@ -265,7 +265,7 @@ describe('一意制約', () => {
     await expectDbError(insert('job-key-1'), '23505', 'job冪等キー重複');
   });
 
-  it('search_requestsの自動受付だけが(input_id, input_revision, policy_version)で一意', async () => {
+  it('search_requestsの自動受付だけが(input_message_id, input_message_revision, policy_version)で一意', async () => {
     const sessionId = await insertSession(pool, { projectId: workspace.projectId, employeeId: workspace.employeeId });
     const { messageId } = await insertMessage(pool, { sessionId, sourceMessageId: 'msg-request', sequenceNo: 1 });
 
@@ -503,7 +503,7 @@ describe('M4 schema契約', () => {
   it('search_document_sourcesはmessage_id/message_revision/UTF-16 offset/display_orderを保持する', async () => {
     const found = await requireM4Columns('search_document_sources', [
       'document_id',
-      'revision',
+      'document_revision',
       'message_id',
       'message_revision',
       'display_order',
