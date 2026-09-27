@@ -5,6 +5,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contract.js';
 import type { AuthContext } from './events.js';
 import { redactConversationText } from './redaction.js';
+import type { EvidenceView, NotReceivedView, SearchLookupView, SearchView } from './response-schema.js';
 import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
 import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import { WORKER_POLICY_VERSION } from '../worker/contract.js';
@@ -50,43 +51,6 @@ interface SearchRequestRow {
   original_request_id: string | null;
   result: unknown;
   error_code: string | null;
-}
-
-export interface SearchView {
-  request_id: string;
-  input_id: string;
-  input_revision: number;
-  trigger: string;
-  search_action: string | null;
-  reused_from_request_id: string | null;
-  status: string;
-  outcome: string | null;
-  error_code: string | null;
-  project_id: string;
-  matches: unknown[];
-  warnings: unknown[];
-  index_status?: unknown;
-}
-
-export interface NotReceivedView {
-  lookup_status: 'not_received';
-  request_id: null;
-  input_id: null;
-  input_revision: null;
-  trigger: null;
-  status: null;
-  outcome: null;
-}
-
-export type SearchLookupView = NotReceivedView | ({ lookup_status: 'found' } & SearchView);
-
-export interface EvidenceView {
-  message_id: string;
-  revision: number;
-  employee_id: string;
-  role: string;
-  occurred_at: string;
-  text: string;
 }
 
 // 明示受付の条件hash。同じ冪等キーで質問・入力・force_refreshが変わった再送をconflictにする。
@@ -267,7 +231,12 @@ function resultWarnings(result: unknown): unknown[] {
 }
 
 // completed結果がobjectならoutcomeにかかわらずindex_status/warningsを返し、matchesはmatchedだけ返す。
-function completedResultParts(row: SearchRequestRow): { matches: unknown[]; warnings: unknown[]; index_status?: unknown } {
+// 保存JSONは公開前にrevalidateMatchesで組み直すため、公開response schemaの型へ寄せる。
+function completedResultParts(row: SearchRequestRow): {
+  matches: SearchView['matches'];
+  warnings: SearchView['warnings'];
+  index_status?: SearchView['index_status'];
+} {
   if (row.status !== 'completed') {
     return { matches: [], warnings: [] };
   }
@@ -276,9 +245,9 @@ function completedResultParts(row: SearchRequestRow): { matches: unknown[]; warn
     return { matches: [], warnings: [] };
   }
   return {
-    matches: row.outcome === 'matched' ? resultMatches(row.result) : [],
-    warnings: resultWarnings(row.result),
-    index_status: object.index_status,
+    matches: (row.outcome === 'matched' ? resultMatches(row.result) : []) as SearchView['matches'],
+    warnings: resultWarnings(row.result) as SearchView['warnings'],
+    index_status: object.index_status as SearchView['index_status'],
   };
 }
 
@@ -528,14 +497,14 @@ async function currentCorrectionsFor(
   }));
 }
 
-async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: unknown): Promise<unknown[]> {
+async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: unknown): Promise<SearchView['matches']> {
   const context: MatchValidationContext = {
     projectId: request.project_id,
     companyId: request.company_id,
     sessionId: request.session_id,
     inputSequenceNo: request.input_sequence_no,
   };
-  const kept: unknown[] = [];
+  const kept: SearchView['matches'] = [];
   for (const match of resultMatches(result)) {
     const matchObject = asObject(match);
     if (matchObject === null) {
@@ -662,7 +631,7 @@ async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: 
         ),
       ];
     }
-    kept.push(output);
+    kept.push(output as SearchView['matches'][number]);
   }
   return kept;
 }
@@ -672,11 +641,12 @@ function baseView(row: SearchRequestRow): SearchView {
     request_id: row.id,
     input_id: row.input_id,
     input_revision: row.input_revision,
-    trigger: row.trigger,
+    // trigger/status/outcomeはDBのCHECK制約で公開enumに限定されている。
+    trigger: row.trigger as SearchView['trigger'],
     search_action: row.search_action,
     reused_from_request_id: row.reused_from_request_id,
-    status: row.status,
-    outcome: row.outcome,
+    status: row.status as SearchView['status'],
+    outcome: row.outcome as SearchView['outcome'],
     error_code: row.error_code,
     project_id: row.project_id,
     matches: [],
@@ -711,8 +681,8 @@ async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView>
   const tracking: SearchView = {
     ...baseView(row),
     reused_from_request_id: origin.id,
-    status: origin.status,
-    outcome: origin.outcome,
+    status: origin.status as SearchView['status'],
+    outcome: origin.outcome as SearchView['outcome'],
     error_code: origin.error_code,
   };
   const parts = completedResultParts(origin);
