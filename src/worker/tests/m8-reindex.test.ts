@@ -211,7 +211,7 @@ async function appendDesiredRevision(
   );
   await pool.query(
     `INSERT INTO search_document_sources
-       (id, document_id, revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
+       (id, document_id, document_revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
      VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 'original')`,
     [uuidv7(), input.documentId, input.nextRevision, input.messageId, input.content.length],
   );
@@ -391,12 +391,12 @@ async function waitForBackendWaiting(pool: Pool, queryFragment: string, timeoutM
 async function upsertAnalysis(pool: Pool, input: { messageId: string; revision: number }): Promise<void> {
   await pool.query(
     `INSERT INTO message_analysis
-       (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
-        continuity, statement_status, is_searchable, model_version, state_hash, parts)
+       (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+        continuity, statement_status, is_searchable, response_models, state_hash, parts)
      VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', true,
-             'test-model', $5, '[]'::jsonb)
+             '["test-model"]'::jsonb, $5, '[]'::jsonb)
      ON CONFLICT (message_id, revision, policy_version) DO UPDATE
-       SET retention = EXCLUDED.retention, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
+       SET retention_category = EXCLUDED.retention_category, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
     [uuidv7(), input.messageId, input.revision, WORKER_POLICY_VERSION, sha256Bytes(`${input.messageId}:${input.revision}`)],
   );
 }
@@ -786,7 +786,7 @@ describe('M8 再索引と世代切替', () => {
        VALUES ($1, 1, $2, $3::vector, $4)`,
       [docA.documentId, target, toVectorLiteral(basisVector(0, 1)), sha256Bytes(docA.text)],
     );
-    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, stale) VALUES ($1, $2, 1, false)', [
+    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, is_stale) VALUES ($1, $2, 1, false)', [
       docA.documentId,
       target,
     ]);
@@ -1455,7 +1455,7 @@ describe('M8 再索引と世代切替', () => {
       `SELECT count(*)::text AS count
          FROM document_publications p
          JOIN search_documents d ON d.id = p.document_id
-         JOIN search_document_sources s ON s.document_id = d.id AND s.revision = p.revision
+         JOIN search_document_sources s ON s.document_id = d.id AND s.document_revision = p.revision
         WHERE d.project_id = $1 AND p.generation_id = $2 AND s.message_id = $3`,
       [workspace.projectId, source.id, first.messageId],
     );
@@ -1932,7 +1932,7 @@ describe('M8 運用metrics', () => {
        VALUES ($1, 1, $2, $3::vector, $4)`,
       [docOne.documentId, runTarget, toVectorLiteral(basisVector(4, 1)), sha256Bytes(docOne.text)],
     );
-    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, stale) VALUES ($1, $2, 1, false)', [
+    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, is_stale) VALUES ($1, $2, 1, false)', [
       docOne.documentId,
       runTarget,
     ]);
@@ -2092,7 +2092,7 @@ describe('M8 運用metrics', () => {
        VALUES ($1, 1, $2, $3::vector, $4)`,
       [document.documentId, target, toVectorLiteral(basisVector(4, 1)), sha256Bytes(document.text)],
     );
-    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, stale) VALUES ($1, $2, 1, false)', [
+    await pool.query('INSERT INTO document_publications (document_id, generation_id, revision, is_stale) VALUES ($1, $2, 1, false)', [
       document.documentId,
       target,
     ]);
@@ -2111,7 +2111,7 @@ describe('M8 運用metrics', () => {
          LEFT JOIN document_publications p
            ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
         WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
-          AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale)`,
+          AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.is_stale)`,
       [workspace.projectId, target],
     );
     assert.equal(Number(incompleteBefore.rows[0]?.count), 0, 'embedding/publication/hashが完成していない');
