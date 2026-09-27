@@ -205,8 +205,8 @@ async function seedPersistencePair(viaChain: boolean) {
         current: chain.current,
       }
     : await seedPair();
-  const origin = await pool.query<{ input_id: string }>('SELECT input_id FROM search_requests WHERE id = $1', [pair.priorRequestId]);
-  return { pair, changedInputId: origin.rows[0].input_id };
+  const origin = await pool.query<{ input_message_id: string }>('SELECT input_message_id FROM search_requests WHERE id = $1', [pair.priorRequestId]);
+  return { pair, changedInputId: origin.rows[0].input_message_id };
 }
 
 describe('再利用の制限', () => {
@@ -329,10 +329,10 @@ describe('再利用の制限', () => {
 
   it('manual追加検索は自動routeのprior_searchに混ぜず、autoの先行検索だけを再利用する', async () => {
     const pair = await seedPair();
-    const priorInput = await pool.query<{ input_id: string }>('SELECT input_id FROM search_requests WHERE id = $1', [
+    const priorInput = await pool.query<{ input_message_id: string }>('SELECT input_message_id FROM search_requests WHERE id = $1', [
       pair.priorRequestId,
     ]);
-    const priorInputId = priorInput.rows[0]?.input_id;
+    const priorInputId = priorInput.rows[0]?.input_message_id;
     assert.ok(priorInputId, '先行入力IDがない');
     // 同じsequenceへ、より新しいcreated_atのmanual追加検索を置く。auto限定が無いとこちらが直近として選ばれる。
     const manualId = await seedSearchRequest(pool, {
@@ -378,11 +378,11 @@ describe('再利用の制限', () => {
     const pair = await seedPair();
     const server = await startFakeJev(async (request) => {
       // stateを送信済みの時点で改訂し、評価開始時のsnapshotでは判定できない失効を再現する。
-      const priorInput = await pool.query<{ input_id: string }>(
-        'SELECT input_id FROM search_requests WHERE id = $1',
+      const priorInput = await pool.query<{ input_message_id: string }>(
+        'SELECT input_message_id FROM search_requests WHERE id = $1',
         [pair.priorRequestId],
       );
-      await advanceRevision(pool, priorInput.rows[0].input_id, '条件を変更した質問');
+      await advanceRevision(pool, priorInput.rows[0].input_message_id, '条件を変更した質問');
       return reuseReply()(request);
     });
     try {
