@@ -329,6 +329,11 @@ describe('M9 カラム命名移行のschema契約', () => {
       '23502',
       'response_models NOT NULL',
     );
+    await expectDbError(
+      pool.query(`UPDATE message_analysis SET response_models = '{"model":"a"}'::jsonb WHERE message_id = $1`, [messageId]),
+      '23514',
+      'response_models配列CHECK',
+    );
 
     const insertApproval = (active: boolean) =>
       pool.query(
