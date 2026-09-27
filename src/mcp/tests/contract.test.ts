@@ -308,6 +308,19 @@ describe('MCP 5 toolの入力契約', () => {
       { project_id: uuidv7(), input_id: uuidv7() },
       { project_id: uuidv7(), source: 'codex' },
       { project_id: uuidv7(), source: 'codex', source_scope: 'scope-a', source_session_id: 'session-a', source_message_id: 'message-a' },
+      // 他branchの既知fieldを1つでも併記した入力を拒否する。
+      { ...validRequestIdArgs(uuidv7()), source_scope: 'scope-a' },
+      { ...validRequestIdArgs(uuidv7()), revision: 1 },
+      { project_id: uuidv7(), input_id: uuidv7(), input_revision: 1, revision: 1 },
+      {
+        project_id: uuidv7(),
+        source: 'codex',
+        source_scope: 'scope-a',
+        source_session_id: 'session-a',
+        source_message_id: 'message-a',
+        revision: 1,
+        input_revision: 1,
+      },
     ];
     for (const args of invalidCalls) {
       const result = await session.callTool('get_search_result', args);
@@ -438,8 +451,32 @@ describe('MCP中央API応答の出力契約', () => {
               text: '根拠の原文',
             },
           ],
+          related_evidence: [
+            {
+              message_id: uuidv7(),
+              revision: 1,
+              employee_id: uuidv7(),
+              role: 'assistant',
+              occurred_at: '2026-09-21T01:00:00.000Z',
+              text: '関連する根拠の原文',
+              source_kind: 'correction',
+              relation: 'change',
+              related_to_message_id: uuidv7(),
+              related_to_revision: 1,
+              relations: [
+                {
+                  relation: 'change',
+                  related_to_message_id: uuidv7(),
+                  related_to_revision: 1,
+                  future_relation_field: 'kept',
+                },
+              ],
+              future_related_field: 'kept',
+            },
+          ],
           related_evidence_ids: [],
           truncated: false,
+          future_match_field: 'kept',
         },
       ],
     });
@@ -488,6 +525,68 @@ describe('MCP中央API応答の出力契約', () => {
     const brokenNotReceived = await session.callTool('get_search_result', validByInputArgs(uuidv7()));
     assertToolError(brokenNotReceived, 'not_receivedとsearch viewの混在');
     assert.ok(!JSON.stringify(brokenNotReceived).includes(mixedProjectId), '検索view fieldをnot_received応答として誤受理している');
+  });
+
+  it('related_evidenceの型不正・必須field欠落をtool errorにする', async () => {
+    central.requests.length = 0;
+    const projectId = uuidv7();
+    const matchedView = (relatedEvidence: unknown): Record<string, unknown> => ({
+      ...searchViewBody({ project_id: projectId }),
+      status: 'completed',
+      outcome: 'matched',
+      matches: [
+        {
+          case_or_document_id: uuidv7(),
+          relevance_kind: ['similar_symptom'],
+          claim_status: 'agent_reported',
+          evidence: [
+            {
+              message_id: uuidv7(),
+              revision: 1,
+              employee_id: uuidv7(),
+              role: 'user',
+              occurred_at: '2026-09-21T01:00:00.000Z',
+              text: '代表根拠の原文',
+            },
+          ],
+          related_evidence: relatedEvidence,
+          related_evidence_ids: [],
+          truncated: false,
+        },
+      ],
+    });
+
+    central.setResponder(() => ({ status: 200, body: matchedView('not-an-array') }));
+    assertToolError(
+      await session.callTool('get_search_result', validRequestIdArgs(projectId)),
+      'related_evidenceの文字列',
+    );
+
+    central.setResponder(() => ({
+      status: 200,
+      body: matchedView([{ message_id: uuidv7(), revision: 1, source_kind: 'neighbor' }]),
+    }));
+    assertToolError(
+      await session.callTool('get_search_result', validRequestIdArgs(projectId)),
+      'related_evidenceのidentity・原文欠落',
+    );
+
+    central.setResponder(() => ({
+      status: 200,
+      body: matchedView([
+        {
+          message_id: uuidv7(),
+          revision: 1,
+          employee_id: uuidv7(),
+          role: 'user',
+          occurred_at: '2026-09-21T01:00:00.000Z',
+          text: '関連根拠',
+          source_kind: 'neighbor',
+          relation: 1,
+        },
+      ]),
+    }));
+    assertToolError(await session.callTool('get_search_result', validRequestIdArgs(projectId)), 'relationの型不正');
   });
 
   it('中央APIのevidence不正応答をtool errorにし、no_matchへ変換しない', async () => {
