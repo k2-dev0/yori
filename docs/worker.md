@@ -97,7 +97,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 入力が8,000バイト予算を超える場合は、Unicodeを壊さない連続UTF-16範囲のpartへ分割し、1request 1partで送る。原文範囲（offset/length）は判定と一緒に保存し、原文は切り捨てない。
 - retentionは`substantive`→`decision_signal`→`unknown`→`progress_only`の順に保守的に統合する。全partが高信頼`progress_only`の時だけ`is_searchable=false`。
 - retention以外の単一分類は全part一致時だけ採用し、不一致はunknownにする。technical_labelsは採用ラベルの和集合。低信頼は採用しない。
-- `message_analysis.model_version`は全partの実応答modelが同一ならその値、混在なら重複除去した応答modelのJSON配列文字列（出現順）にする。partごとの応答modelも`parts[].model_version`へ保存する。
+- `message_analysis.response_models`は全partの実応答modelを重複除去した出現順のjsonb文字列配列にする。`parts[].response_model`へpartごとの応答modelを保存し、旧`parts[].model_version`からの移行時も他のkeyを維持する。
 - relation_targetはstateへ実際に入れた候補発言ID・none・unknownだけを許可する。decision_actionがaccept/reject/revoke/changeで、対象と明示/推定が高信頼の時だけ`message_relations`へ保存する。低信頼・unknown・候補外は保存しない。
 - 適用時はjob lease・対象revisionを同一TXで再確認し、`message_analysis`・関係・`build_documents` job・job完了をまとめて反映する。leaseを失った場合は適用しない。古いrevisionは現在状態へ適用しない。
 
@@ -106,7 +106,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 分類の完了を待たず、routeとclassifyは同じstate/questionsから独立に判定する。検索振り分けは保存分類と独立して決まる。
 
 - `new_search`: 条件hashと段階`awaiting_search`を保存し、受付はpendingのまま`execute_search`をenqueueする。
-- `reuse`: 高信頼`reuse`＋`same_topic`＋条件同一、同一会社・案件・社員・session・policy、先行入力のcurrent revision一致、権限・根拠が有効な場合だけ。直近の先行検索だけを判定し、不適格でも古い候補へ飛ばない。参照は循環・過長chainを拒否して直接の`new_search`元へ解決するが、chain上の各受付でもscope・対象sequenceより前・原文revisionの存在とcurrent一致・status適格性・期限・根拠を検証し、1つでも不適格なら`new_search`へ戻す。既存結果はコピーせず、段階`awaiting_reused_search`と`reused_from_request_id`/`original_request_id`を保存する。
+- `reuse`: 高信頼`reuse`＋`same_topic`＋条件同一、同一会社・案件・社員・session・policy、先行入力のcurrent revision一致、権限・根拠が有効な場合だけ。直近の先行検索だけを判定し、不適格でも古い候補へ飛ばない。参照は循環・過長chainを拒否して直接の`new_search`元へ解決するが、chain上の各受付でもscope・対象sequenceより前・原文revisionの存在とcurrent一致・status適格性・期限・根拠を検証し、1つでも不適格なら`new_search`へ戻す。既存結果はコピーせず、段階`awaiting_reused_search`と`reused_from_request_id`（旧`original_request_id`はCOALESCE(original, reused)で統合）を保存する。
 - `skip`: 全part高信頼`skip`の時だけ`completed`/`skipped`にする（`no_match`とは表現しない）。
 - `pending`/`running`の先行検索は共有できる。`completed`は`matched`かつ10分以内の時だけ。`failed`/`expired`/`skipped`/`no_match`・対象不明・失効・条件変更・不確実・低信頼は`new_search`。
 - matchedの根拠はevidenceのmessage_id/revisionが現行revision・同案件であること、最新分析がprogress_onlyでないこと、revoke/change関係で無効化されていないことを検証する。不明な形式・根拠なしは再利用しない。
@@ -118,10 +118,10 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - projectの初回だけactive generationを作成/再利用して紐付ける。既存世代がconfigと不一致なら`embedding_generation_mismatch`の恒久失敗。
 - 文書構築TXの後、承認済みVoyageへ`voyage-4-lite`/input_type=document/1024/float/truncation=falseで送信する。応答index・件数・model・次元・finite・非ゼロを検証し、不正は`provider_contract_invalid`、他の4xxは`provider_rejected`でfailedにする。恒久エラー時はそのjobが保持するpending/embedding revisionだけをfailedにし、明示retryで同じrevisionをpendingへ戻して再埋め込みする。
 - 文書revisionの明示識別子は本文から毎回決定的に同期する。本文不変のready文書も対象にし、M5 migration前から存在する文書を通常のbuild再処理でbackfillするが、revision・publication・embeddingは作り直さない。
-- 旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭に残る通常の末尾追加だけ、旧公開revisionをstale=true（旧版利用可・警告付き）で残す。source消失・message revision変更・range変更を含む制限的変更や計画から消えた文書は、外部HTTP前の文書構築TXでpublication行を削除して即時検索不能にし、成功時に作り直す。is_searchableは新desired revisionの埋め込み用にtrueを維持する。
+- 旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭に残る通常の末尾追加だけ、旧公開revisionをis_stale=true（旧版利用可・警告付き）で残す。source消失・message revision変更・range変更を含む制限的変更や計画から消えた文書は、外部HTTP前の文書構築TXでpublication行を削除して即時検索不能にし、成功時に作り直す。is_searchableは新desired revisionの埋め込み用にtrueを維持する。
 - processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession fingerprint（全messageのcurrent_revision、現行policyのanalysis状態、有効revoke/change relation状態）をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionとfingerprintをDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
 - 文書計画はactive generationのspec検証より先に適用する。pending revisionがある場合だけ世代を作成/検証し、spec不一致・retired/failedは`embedding_generation_mismatch`でfailedにする（自動切替しない）。pendingが無ければ世代の作成/検証は不要として完了する。世代不一致でもprogress_only・有効revoke/change relationなどによる除外とpublication削除は外部HTTP前に反映する。
-- 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にstale=falseへ戻し、以前のready revisionはsupersededにする。
+- 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にis_stale=falseへ戻し、以前のready revisionはsupersededにする。
 - `embedding_cache`（company+generation+operation+input hash）はvector結果だけを再利用し、document/sourceのidentityを統合しない。cache hitでも承認を再確認し、未承認はblocked_policyにする。
 
 ### execute_search
