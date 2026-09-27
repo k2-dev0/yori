@@ -82,7 +82,7 @@ interface SessionStateRow {
   policy_version: string | null;
   state_hash: Buffer | null;
   is_searchable: boolean | null;
-  retention: string | null;
+  retention_category: string | null;
   invalidating_relations: [string, string, number, number][];
 }
 
@@ -91,19 +91,19 @@ interface SessionStateRow {
 // searchableな発言の抽出とsnapshot作成を同じ結果から行う。
 const SESSION_STATE_SQL = `
   SELECT m.id AS message_id, m.current_revision, r.text,
-         a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention,
+         a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention_category,
          COALESCE((
-           SELECT jsonb_agg(jsonb_build_array(mr.relation, mr.source_message_id, mr.source_revision, mr.target_revision)
-                            ORDER BY mr.source_message_id, mr.source_revision, mr.relation, mr.target_revision)
+           SELECT jsonb_agg(jsonb_build_array(mr.relation, mr.from_message_id, mr.from_message_revision, mr.to_message_revision)
+                            ORDER BY mr.from_message_id, mr.from_message_revision, mr.relation, mr.to_message_revision)
              FROM message_relations mr
-             JOIN messages sm ON sm.id = mr.source_message_id
+             JOIN messages sm ON sm.id = mr.from_message_id
              JOIN sessions ss ON ss.id = sm.session_id
              JOIN sessions ts ON ts.id = m.session_id
-            WHERE mr.target_message_id = m.id
-              AND mr.target_revision = m.current_revision
+            WHERE mr.to_message_id = m.id
+              AND mr.to_message_revision = m.current_revision
               AND mr.policy_version = $2
               AND mr.relation IN ('revoke', 'change')
-              AND sm.current_revision = mr.source_revision
+              AND sm.current_revision = mr.from_message_revision
               AND ss.project_id = ts.project_id
          ), '[]'::jsonb) AS invalidating_relations
     FROM messages m
@@ -128,7 +128,7 @@ function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
     policy_version: row.policy_version,
     state_hash: row.state_hash === null ? null : row.state_hash.toString('hex'),
     is_searchable: row.is_searchable,
-    retention: row.retention,
+    retention_category: row.retention_category,
     invalidating_relations: row.invalidating_relations,
   }));
   return createHash('sha256').update(JSON.stringify(state), 'utf8').digest();
@@ -146,7 +146,7 @@ export async function loadSessionMessages(pool: Pool, sessionId: string): Promis
         row.text !== null &&
         row.text.length > 0 &&
         row.is_searchable === true &&
-        row.retention !== 'progress_only' &&
+        row.retention_category !== 'progress_only' &&
         row.invalidating_relations.length === 0
       ) {
         messages.push({ messageId: row.message_id, revision: row.current_revision, text: row.text });
@@ -536,7 +536,7 @@ async function loadSources(client: PoolClient, documentId: string, revision: num
   const result = await client.query<SourceRow>(
     `SELECT message_id, message_revision, start_offset, end_offset, source_kind
        FROM search_document_sources
-      WHERE document_id = $1 AND revision = $2
+      WHERE document_id = $1 AND document_revision = $2
       ORDER BY display_order`,
     [documentId, revision],
   );
@@ -546,8 +546,8 @@ async function loadSources(client: PoolClient, documentId: string, revision: num
 // 新しいdesired revisionが未公開の間、末尾追加で内容が保持される既存公開revisionをstale=trueで警告付き利用にする。
 async function markPublicationStale(client: PoolClient, documentId: string): Promise<void> {
   await client.query(
-    `UPDATE document_publications SET stale = true, updated_at = now()
-      WHERE document_id = $1 AND stale = false`,
+    `UPDATE document_publications SET is_stale = true, updated_at = now()
+      WHERE document_id = $1 AND is_stale = false`,
     [documentId],
   );
 }
@@ -590,12 +590,12 @@ async function reconcilePublications(
 }
 
 async function replaceSources(client: PoolClient, documentId: string, revision: number, sources: readonly PlannedSource[]): Promise<void> {
-  await client.query('DELETE FROM search_document_sources WHERE document_id = $1 AND revision = $2', [documentId, revision]);
+  await client.query('DELETE FROM search_document_sources WHERE document_id = $1 AND document_revision = $2', [documentId, revision]);
   let displayOrder = 0;
   for (const source of sources) {
     await client.query(
       `INSERT INTO search_document_sources
-         (id, document_id, revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
+         (id, document_id, document_revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         uuidv7(),
@@ -973,7 +973,7 @@ export async function applyDocumentEmbeddings(
       const sources = await client.query<{ message_id: string; message_revision: number }>(
         `SELECT message_id, message_revision
            FROM search_document_sources
-          WHERE document_id = $1 AND revision = $2
+          WHERE document_id = $1 AND document_revision = $2
           ORDER BY display_order`,
         [item.documentId, item.revision],
       );
@@ -1008,10 +1008,10 @@ export async function applyDocumentEmbeddings(
         [item.documentId, item.revision],
       );
       await client.query(
-        `INSERT INTO document_publications (document_id, generation_id, revision, stale)
+        `INSERT INTO document_publications (document_id, generation_id, revision, is_stale)
          VALUES ($1, $2, $3, false)
          ON CONFLICT (document_id, generation_id)
-         DO UPDATE SET revision = EXCLUDED.revision, stale = false, updated_at = now()`,
+         DO UPDATE SET revision = EXCLUDED.revision, is_stale = false, updated_at = now()`,
         [item.documentId, generation.id, item.revision],
       );
     }
