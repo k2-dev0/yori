@@ -111,14 +111,15 @@ async function runApprove(env: NodeJS.ProcessEnv, filePath: string | undefined):
     await client.query('BEGIN');
     await client.query(
       `UPDATE provider_policy_approvals
-          SET active = false, updated_at = now()
-        WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4 AND active`,
+          SET is_active = false, updated_at = now()
+        WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4 AND is_active`,
       [approval.company_id, approval.provider, approval.account_ref, approval.endpoint],
     );
+    // 公開CLI fieldのlearning_disabledは値true固定であり、DBのtraining_disabled列へ写す。
     await client.query(
       `INSERT INTO provider_policy_approvals
-         (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, learning_disabled, retention_terms,
-          confirmed_by, confirmed_at, active)
+         (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, training_disabled, retention_terms,
+          confirmed_by, confirmed_at, is_active)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)`,
       [
         id,
@@ -156,7 +157,7 @@ async function runRevoke(env: NodeJS.ProcessEnv, approvalId: string | undefined)
   }
   const pool = createPool(databaseUrl);
   try {
-    const result = await pool.query('UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE id = $1 AND active', [
+    const result = await pool.query('UPDATE provider_policy_approvals SET is_active = false, updated_at = now() WHERE id = $1 AND is_active', [
       approvalId,
     ]);
     const revoked = result.rowCount === 1;
