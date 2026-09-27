@@ -71,13 +71,13 @@ describe('取り込み元識別子のUTF-8バイト上限', () => {
       assert.deepEqual(second.json<EventsResponse>(), first.json<EventsResponse>());
 
       const stored = await pool.query<{
-        source_scope: string;
+        source_namespace: string;
         source_session_id: string;
         source_message_id: string;
-      }>(`SELECT s.source_scope, s.source_session_id, m.source_message_id
+      }>(`SELECT s.source_namespace, s.source_session_id, m.source_message_id
             FROM messages m JOIN sessions s ON s.id = m.session_id`);
       assert.equal(stored.rows.length, 1);
-      assert.equal(stored.rows[0].source_scope, `v1|${workspace.companyId}|${workspace.employeeId}|${identifier}`);
+      assert.equal(stored.rows[0].source_namespace, `v1|${workspace.companyId}|${workspace.employeeId}|${identifier}`);
       assert.equal(stored.rows[0].source_session_id, identifier);
       assert.equal(stored.rows[0].source_message_id, identifier);
     });
