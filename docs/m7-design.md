@@ -82,7 +82,7 @@ MCP toolはHTTP APIと同じstrict入力を受け、中央APIの成功応答をs
 
 1. 代表文書の一意なsource messageをprimary evidenceとして固定する。
 2. primary evidenceごとに同一sessionのsequence前後2発言をcurrent revisionで読む。
-3. `message_relations.target -> source`方向へ`revoke`・`change`を最大3ホップ探索する。訂正・撤回自身に後続関係があれば同じ上限内で追う。
+3. `message_relations.to -> from`方向（旧target -> source）へ`revoke`・`change`を最大3ホップ探索する。訂正・撤回自身に後続関係があれば同じ上限内で追う。
 4. primary sessionからactiveな明示session linkを両方向へ幅優先探索する。link先に根拠messageが属すればその前後2発言、属さなければ順方向の継続先は先頭5発言、逆方向の引き継ぎ元は末尾5発言を候補文脈にする。
 5. 明示linkを処理した後、同社員・同案件のstarted_at前後各3sessionと、共通Issue／PR entityを持つ同案件sessionを推定候補にする。
 6. 推定候補ごとに、現在質問、代表根拠、継続元文脈、候補文脈をJevへ渡す。現在質問への関連性と継続元との連続性を独立Choiceで判定し、両方が`useful`または`direct`の場合だけ採用する。
