@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import type { AuthContext } from './events.js';
+import type { SessionLinkResponse } from './response-schema.js';
 import type { ParsedSessionLinkRequest } from './schema.js';
 
 // M7の明示session引き継ぎ登録。外部identityは値parameterで内部IDへ解決し、
@@ -10,16 +11,6 @@ import type { ParsedSessionLinkRequest } from './schema.js';
 export class SessionLinkNotFoundError extends Error {}
 export class SessionLinkConflictError extends Error {}
 export class SessionLinkInvalidError extends Error {}
-
-export interface SessionLinkResponse {
-  link_id: string;
-  project_id: string;
-  from_session_id: string;
-  to_session_id: string;
-  evidence_message_id: string;
-  evidence_revision: number;
-  status: string;
-}
 
 export interface CreatedSessionLink {
   statusCode: 200 | 201;
@@ -93,7 +84,8 @@ function toResponse(row: {
     to_session_id: row.to_session_id,
     evidence_message_id: row.evidence_message_id,
     evidence_revision: row.evidence_revision,
-    status: row.status,
+    // 公開するlinkはactiveだけで、revokedはAPIへ出さない。
+    status: row.status as SessionLinkResponse['status'],
   };
 }
 
