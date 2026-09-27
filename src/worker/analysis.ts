@@ -30,7 +30,7 @@ export interface StoredPartResult {
   continuity: string;
   statement_status: string;
   search_action: string;
-  model_version: string;
+  response_model: string;
 }
 
 export interface RelationLink {
@@ -51,7 +51,7 @@ export interface AggregatedEvaluation {
   searchAction: string;
   isSearchable: boolean;
   sameConditions: boolean;
-  modelVersion: string;
+  responseModels: string[];
   parts: StoredPartResult[];
   relations: RelationLink[];
 }
@@ -116,14 +116,9 @@ function adoptedRelations(parts: readonly PartEvaluation[], threshold: number): 
   return [...relations.values()];
 }
 
-// 全partの応答modelが同一ならその値、混在は重複除去した出現順の配列をJSON文字列にする。
-function aggregateModelVersion(parts: readonly PartEvaluation[]): string {
-  const models = [...new Set(parts.map((part) => part.responseModel))];
-  const first = models[0];
-  if (first === undefined) {
-    return '';
-  }
-  return models.length === 1 ? first : JSON.stringify(models);
+// 全partの応答modelを重複除去した出現順の配列にする。partが無ければ空配列。
+function aggregateResponseModels(parts: readonly PartEvaluation[]): string[] {
+  return [...new Set(parts.map((part) => part.responseModel))];
 }
 
 // partごとの高信頼回答を設計の優先順位で統合し、analysis/relation/search_actionを決める。
@@ -158,7 +153,7 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
     searchAction: searchAction === 'reuse' || searchAction === 'skip' ? searchAction : 'new_search',
     isSearchable: retention !== 'progress_only',
     sameConditions,
-    modelVersion: aggregateModelVersion(parts),
+    responseModels: aggregateResponseModels(parts),
     parts: parts.map((part) => ({
       offset: part.part.offset,
       length: part.part.length,
@@ -171,7 +166,7 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
       continuity: adoptedOrUnknown([part], jevQuestionId('continuity', 0), threshold),
       statement_status: adoptedOrUnknown([part], jevQuestionId('statement_status', 0), threshold),
       search_action: highChoice(part, jevQuestionId('search_action', 0), threshold) ?? 'unknown',
-      model_version: part.responseModel,
+      response_model: part.responseModel,
     })),
     relations: adoptedRelations(parts, threshold),
   };
