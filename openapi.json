@@ -398,6 +398,7 @@
       "get": {
         "operationId": "lookupSearchByInput",
         "summary": "現在入力identityの自動検索受付を照合する",
+        "description": "project_idに加え、internal（project_id + input_id + input_revision）またはexternal（project_id + source + source_scope + source_session_id + source_message_id + revision）のどちらか一方だけを指定する。wait_msは任意。",
         "security": [
           {
             "bearerAuth": []
@@ -431,7 +432,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 2147483647
+              "maximum": 2147483647,
+              "description": "1〜2147483647の整数をquery文字列として送る"
             }
           },
           {
@@ -439,8 +441,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)$"
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5000,
+              "description": "0〜5000の整数をquery文字列として送る"
             }
           },
           {
@@ -461,7 +465,9 @@
             "required": false,
             "schema": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "description": "取り込み元identifierはUTF-8で1024バイト以内",
+              "x-yori-max-utf8-bytes": 1024
             }
           },
           {
@@ -470,7 +476,9 @@
             "required": false,
             "schema": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "description": "取り込み元identifierはUTF-8で1024バイト以内",
+              "x-yori-max-utf8-bytes": 1024
             }
           },
           {
@@ -479,7 +487,9 @@
             "required": false,
             "schema": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "description": "取り込み元identifierはUTF-8で1024バイト以内",
+              "x-yori-max-utf8-bytes": 1024
             }
           },
           {
@@ -489,8 +499,36 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 2147483647
+              "maximum": 2147483647,
+              "description": "1〜2147483647の整数をquery文字列として送る"
             }
+          }
+        ],
+        "x-yori-input-branches": [
+          {
+            "name": "internal",
+            "required": [
+              "project_id",
+              "input_id",
+              "input_revision"
+            ],
+            "optional": [
+              "wait_ms"
+            ]
+          },
+          {
+            "name": "external",
+            "required": [
+              "project_id",
+              "source",
+              "source_scope",
+              "source_session_id",
+              "source_message_id",
+              "revision"
+            ],
+            "optional": [
+              "wait_ms"
+            ]
           }
         ],
         "responses": {
@@ -572,8 +610,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)$"
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5000,
+              "description": "0〜5000の整数をquery文字列として送る"
             }
           }
         ],
@@ -668,7 +708,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 2147483647
+              "maximum": 2147483647,
+              "description": "1〜2147483647の整数をquery文字列として送る"
             }
           }
         ],
@@ -775,15 +816,21 @@
                 },
                 "source_scope": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                  "x-yori-max-utf8-bytes": 1024
                 },
                 "source_session_id": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                  "x-yori-max-utf8-bytes": 1024
                 },
                 "source_message_id": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                  "x-yori-max-utf8-bytes": 1024
                 },
                 "sequence_no": {
                   "type": "integer",
@@ -810,7 +857,10 @@
                 },
                 "text": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "maxLength": 65536,
+                  "description": "本文はUnicodeコードポイントで65536以内",
+                  "x-yori-max-code-points": 65536
                 }
               },
               "required": [
@@ -855,7 +905,10 @@
           },
           "query": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 65536,
+            "description": "本文はUnicodeコードポイントで65536以内",
+            "x-yori-max-code-points": 65536
           },
           "idempotency_key": {
             "type": "string",
@@ -901,11 +954,15 @@
               },
               "source_scope": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               },
               "source_session_id": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               }
             },
             "required": [
@@ -927,11 +984,15 @@
               },
               "source_scope": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               },
               "source_session_id": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               }
             },
             "required": [
@@ -953,15 +1014,21 @@
               },
               "source_scope": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               },
               "source_session_id": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               },
               "source_message_id": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "取り込み元identifierはUTF-8で1024バイト以内",
+                "x-yori-max-utf8-bytes": 1024
               },
               "revision": {
                 "type": "integer",
