@@ -96,15 +96,15 @@ describe('POST /v1/events 正常保存', () => {
       project_id: string;
       employee_id: string;
       source: string;
-      source_scope: string;
+      source_namespace: string;
       source_session_id: string;
-    }>('SELECT id, project_id, employee_id, source, source_scope, source_session_id FROM sessions');
+    }>('SELECT id, project_id, employee_id, source, source_namespace, source_session_id FROM sessions');
     assert.equal(sessionRow.rows.length, 1);
     assert.equal(sessionRow.rows[0].project_id, workspace.projectId);
     assert.equal(sessionRow.rows[0].employee_id, workspace.employeeId);
     assert.equal(sessionRow.rows[0].source, 'codex');
     assert.equal(sessionRow.rows[0].source_session_id, 'session-a');
-    assert.ok(sessionRow.rows[0].source_scope.length > 0);
+    assert.ok(sessionRow.rows[0].source_namespace.length > 0);
 
     // revisionはmessage単位で照合する。同一revision数のSQL行順は定義されないため、message_idで引く。
     const userRevision = await pool.query<{ revision: number; text: string; content_hash: Buffer }>(
@@ -150,14 +150,14 @@ describe('POST /v1/events 正常保存', () => {
       project_id: string;
       employee_id: string;
       session_id: string;
-      input_id: string;
-      input_revision: number;
+      input_message_id: string;
+      input_message_revision: number;
       input_sequence_no: number;
       trigger: string;
       status: string;
       policy_version: string;
     }>(
-      'SELECT id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger, status, policy_version FROM search_requests',
+      'SELECT id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no, trigger, status, policy_version FROM search_requests',
     );
     assert.equal(requests.rows.length, 1);
     const searchRequest = requests.rows[0];
@@ -165,8 +165,8 @@ describe('POST /v1/events 正常保存', () => {
     assert.equal(searchRequest.project_id, workspace.projectId);
     assert.equal(searchRequest.employee_id, workspace.employeeId);
     assert.equal(searchRequest.session_id, sessionRow.rows[0].id);
-    assert.equal(searchRequest.input_id, userMessageId);
-    assert.equal(searchRequest.input_revision, 1);
+    assert.equal(searchRequest.input_message_id, userMessageId);
+    assert.equal(searchRequest.input_message_revision, 1);
     assert.equal(searchRequest.input_sequence_no, 1);
     assert.equal(searchRequest.trigger, 'auto');
     assert.equal(searchRequest.status, 'pending');
@@ -178,14 +178,14 @@ describe('POST /v1/events 正常保存', () => {
       idempotency_key: string;
       request_hash: Buffer;
       message_id: string;
-      revision: number;
-      request_id: string | null;
-    }>('SELECT idempotency_key, request_hash, message_id, revision, request_id FROM event_receipts');
+      message_revision: number;
+      search_request_id: string | null;
+    }>('SELECT idempotency_key, request_hash, message_id, message_revision, search_request_id FROM event_receipts');
     assert.equal(receipts.rows.length, 2);
     const userReceipt = receipts.rows.find((row) => row.idempotency_key === 'idem-user-1');
     assert.equal(userReceipt?.message_id, userMessageId);
-    assert.equal(userReceipt?.revision, 1);
-    assert.equal(userReceipt?.request_id, searchRequest.id);
+    assert.equal(userReceipt?.message_revision, 1);
+    assert.equal(userReceipt?.search_request_id, searchRequest.id);
     assert.deepEqual(
       userReceipt?.request_hash,
       canonicalReceiptHash({
