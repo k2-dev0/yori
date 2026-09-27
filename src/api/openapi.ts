@@ -1,13 +1,14 @@
 import { z } from 'zod';
-import { EVENT_SOURCES } from './contract.js';
 import {
+  MAX_REVISION,
+  MAX_WAIT_MS,
   eventsRequestSchema,
   normalizedUuid,
-  revisionQueryParamSchema,
+  revisionSchema,
+  searchByInputBranchSchemas,
   searchRequestSchema,
   sessionLinkRequestSchema,
-  sourceIdentifier,
-  waitMsParam,
+  waitMsValueSchema,
 } from './schema.js';
 import {
   errorResponseSchema,
@@ -43,7 +44,9 @@ function componentRef(name: string): JsonObject {
 interface OperationInput {
   operationId: string;
   summary: string;
+  description?: string;
   secured: boolean;
+  extensions?: JsonObject;
   parameters?: JsonObject[];
   requestComponent?: string;
   responses: Array<{ status: string; component: string }>;
@@ -61,8 +64,10 @@ function buildOperation(input: OperationInput): JsonObject {
   return {
     operationId: input.operationId,
     summary: input.summary,
+    ...(input.description === undefined ? {} : { description: input.description }),
     security: input.secured ? [{ bearerAuth: [] }] : [],
     parameters: input.parameters ?? [],
+    ...(input.extensions ?? {}),
     ...(input.requestComponent === undefined
       ? {}
       : {
@@ -79,13 +84,52 @@ function parameter(name: string, location: 'path' | 'query', required: boolean, 
   return { name, in: location, required, schema };
 }
 
+function requiredNamesOf(schema: JsonObject): string[] {
+  const required = schema.required;
+  return Array.isArray(required) ? required.filter((value): value is string => typeof value === 'string') : [];
+}
+
+function propertySchemasOf(schema: JsonObject): Record<string, JsonObject> {
+  const properties = schema.properties;
+  return typeof properties === 'object' && properties !== null ? (properties as Record<string, JsonObject>) : {};
+}
+
 // 8 routeを計画4節のmethod・path・statusで固定する。実装が返さないstatusは追加しない。
 function buildPaths(): JsonObject {
   const uuid = toOpenApiSchema(normalizedUuid, 'input');
-  const revision = toOpenApiSchema(revisionQueryParamSchema, 'input');
-  const waitMs = toOpenApiSchema(waitMsParam, 'input');
-  const source = toOpenApiSchema(z.enum(EVENT_SOURCES), 'input');
-  const identifier = toOpenApiSchema(sourceIdentifier, 'input');
+  // query parameterはwireが文字列でも、意味上のschemaは整数の範囲として表す。
+  const revision = toOpenApiSchema(
+    revisionSchema.meta({ description: `1〜${MAX_REVISION}の整数をquery文字列として送る` }),
+    'input',
+  );
+  const waitMs = toOpenApiSchema(
+    waitMsValueSchema.meta({ description: `0〜${MAX_WAIT_MS}の整数をquery文字列として送る` }),
+    'input',
+  );
+
+  // by-inputのparameter一覧と排他branchはZod schemaから生成し、flatなparameterとx-yori拡張を同じ定義から作る。
+  const byInputBranches = Object.entries(searchByInputBranchSchemas).map(([name, schema]) => {
+    const converted = toOpenApiSchema(schema, 'input');
+    const properties = propertySchemasOf(converted);
+    const required = requiredNamesOf(converted);
+    return {
+      name,
+      required,
+      optional: Object.keys(properties).filter((property) => !required.includes(property)),
+      properties,
+    };
+  });
+  const byInputParameters = new Map<string, JsonObject>();
+  for (const branch of byInputBranches) {
+    for (const [name, schema] of Object.entries(branch.properties)) {
+      if (!byInputParameters.has(name)) {
+        byInputParameters.set(name, schema);
+      }
+    }
+  }
+  byInputParameters.set('wait_ms', waitMs);
+  byInputParameters.set('input_revision', revision);
+  byInputParameters.set('revision', revision);
   const errorResponses = (statuses: string[]): Array<{ status: string; component: string }> =>
     statuses.map((status) => ({ status, component: 'ErrorResponse' }));
   const success = (status: string, component: string) => ({ status, component });
@@ -138,18 +182,16 @@ function buildPaths(): JsonObject {
       get: buildOperation({
         operationId: 'lookupSearchByInput',
         summary: '現在入力identityの自動検索受付を照合する',
+        description: `project_idに加え、${byInputBranches
+          .map((branch) => `${branch.name}（${branch.required.join(' + ')}）`)
+          .join('または')}のどちらか一方だけを指定する。wait_msは任意。`,
         secured: true,
-        parameters: [
-          parameter('project_id', 'query', true, uuid),
-          parameter('input_id', 'query', false, uuid),
-          parameter('input_revision', 'query', false, revision),
-          parameter('wait_ms', 'query', false, waitMs),
-          parameter('source', 'query', false, source),
-          parameter('source_scope', 'query', false, identifier),
-          parameter('source_session_id', 'query', false, identifier),
-          parameter('source_message_id', 'query', false, identifier),
-          parameter('revision', 'query', false, revision),
-        ],
+        extensions: {
+          'x-yori-input-branches': byInputBranches.map(({ name, required, optional }) => ({ name, required, optional })),
+        },
+        parameters: [...byInputParameters.entries()].map(([name, schema]) =>
+          parameter(name, 'query', name === 'project_id', schema),
+        ),
         responses: [success('200', 'SearchLookupResponse'), ...errorResponses(['400', '401', '403', '500'])],
       }),
     },
