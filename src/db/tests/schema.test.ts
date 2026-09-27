@@ -78,7 +78,7 @@ async function expectDbError(operation: Promise<unknown>, code: string, label: s
 
 async function insertReceipt(input: { companyId: string; employeeId: string; projectId: string; messageId: string; idempotencyKey: string }): Promise<void> {
   await pool.query(
-    `INSERT INTO event_receipts (id, company_id, employee_id, project_id, idempotency_key, request_hash, message_id, revision)
+    `INSERT INTO event_receipts (id, company_id, employee_id, project_id, idempotency_key, request_hash, message_id, message_revision)
      VALUES ($1, $2, $3, $4, $5, $6, $7, 1)`,
     [uuidv7(), input.companyId, input.employeeId, input.projectId, input.idempotencyKey, sha256Bytes('receipt'), input.messageId],
   );
@@ -86,7 +86,7 @@ async function insertReceipt(input: { companyId: string; employeeId: string; pro
 
 async function insertSearchRequest(input: { trigger: 'auto' | 'manual'; inputId: string; sessionId: string; policyVersion?: string }): Promise<void> {
   await pool.query(
-    `INSERT INTO search_requests (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger, policy_version)
+    `INSERT INTO search_requests (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no, trigger, policy_version)
      VALUES ($1, $2, $3, $4, $5, $6, 1, 1, $7, $8)`,
     [
       uuidv7(),
@@ -121,6 +121,7 @@ describe('migration管理', () => {
       '0006_m6.sql',
       '0007_m7.sql',
       '0008_m8.sql',
+      '0009_column_names.sql',
     ]);
   });
 
@@ -129,7 +130,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '8');
+    assert.equal(versions.rows[0].count, '9');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -142,6 +143,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0006_m6.sql'), '0006_m6.sql がない');
     assert.ok(files.includes('0007_m7.sql'), '0007_m7.sql がない');
     assert.ok(files.includes('0008_m8.sql'), '0008_m8.sql がない');
+    assert.ok(files.includes('0009_column_names.sql'), '0009_column_names.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
@@ -221,7 +223,7 @@ describe('一意制約', () => {
     await expectDbError(insert(), '23505', 'token_hash重複');
   });
 
-  it('sessionsは(source, source_scope, source_session_id)が一意', async () => {
+  it('sessionsは(source, source_namespace, source_session_id)が一意', async () => {
     await insertSession(pool, { projectId: workspace.projectId, employeeId: workspace.employeeId, sourceSessionId: 'dup-session' });
     await expectDbError(
       insertSession(pool, { projectId: workspace.projectId, employeeId: workspace.employeeId, sourceSessionId: 'dup-session' }),
@@ -285,7 +287,7 @@ describe('CHECK制約', () => {
   it('source・role・sequence_no・revision・status・kind・triggerの値を制限する', async () => {
     await expectDbError(
       pool.query(
-        `INSERT INTO sessions (id, project_id, employee_id, source, source_scope, source_session_id, started_at)
+        `INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
          VALUES ($1, $2, $3, 'other', 'scope', 's', now())`,
         [uuidv7(), workspace.projectId, workspace.employeeId],
       ),
@@ -325,7 +327,7 @@ describe('CHECK制約', () => {
     const { messageId } = await insertMessage(pool, { sessionId, sourceMessageId: 'msg-trigger', sequenceNo: 2 });
     await expectDbError(
       pool.query(
-        `INSERT INTO search_requests (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger, policy_version)
+        `INSERT INTO search_requests (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no, trigger, policy_version)
          VALUES ($1, $2, $3, $4, $5, $6, 1, 1, 'other', 'initial-v1')`,
         [uuidv7(), workspace.companyId, workspace.projectId, workspace.employeeId, sessionId, messageId],
       ),
@@ -639,8 +641,8 @@ describe('M4 schema契約', () => {
     const publications = await requireM4Columns('document_publications', ['document_id', 'generation_id', 'revision']);
     expectColumnType(publications, 'document_publications', 'revision', ['smallint', 'integer', 'bigint']);
     assert.ok(
-      [...publications.entries()].some(([name, info]) => /stale/.test(name) && info.dataType === 'boolean'),
-      'document_publicationsのstale boolean列がない',
+      [...publications.entries()].some(([name, info]) => name === 'is_stale' && info.dataType === 'boolean'),
+      'document_publicationsのis_stale boolean列がない',
     );
   });
 });
