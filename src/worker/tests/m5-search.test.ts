@@ -498,7 +498,7 @@ async function seedReadyDocument(pool: Pool, input: SeedDocumentInput): Promise<
   for (const [index, source] of input.sources.entries()) {
     await pool.query(
       `INSERT INTO search_document_sources
-         (id, document_id, revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
+         (id, document_id, document_revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'original')`,
       [uuidv7(), id, revision, source.messageId, source.messageRevision, source.startOffset, source.endOffset, index],
     );
@@ -513,7 +513,7 @@ async function seedReadyDocument(pool: Pool, input: SeedDocumentInput): Promise<
   if (input.publication ?? (input.generationId !== undefined && input.embedding !== undefined)) {
     assert.ok(input.generationId !== undefined, 'publicationにはgenerationIdが必要');
     await pool.query(
-      `INSERT INTO document_publications (document_id, generation_id, revision, stale)
+      `INSERT INTO document_publications (document_id, generation_id, revision, is_stale)
        VALUES ($1, $2, $3, $4)`,
       [id, input.generationId, revision, input.stale ?? false],
     );
@@ -548,7 +548,7 @@ async function findReadyDocumentByMessage(pool: Pool, projectId: string, message
     `SELECT d.id, r.revision, r.content
        FROM search_documents d
        JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
-       JOIN search_document_sources s ON s.document_id = d.id AND s.revision = r.revision
+       JOIN search_document_sources s ON s.document_id = d.id AND s.document_revision = r.revision
       WHERE d.project_id = $1 AND s.message_id = $2
       ORDER BY d.created_at, d.id
       LIMIT 1`,
@@ -720,9 +720,9 @@ async function seedSearchableMessage(
   const message = await seedMessage(pool, { sessionId: input.sessionId, sequenceNo: input.sequenceNo, role: 'user', text: input.text });
   await pool.query(
     `INSERT INTO message_analysis
-       (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
-        continuity, statement_status, is_searchable, model_version, state_hash, parts)
-     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', true, 'test-model', $5, '[]'::jsonb)
+       (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+        continuity, statement_status, is_searchable, response_models, state_hash, parts)
+     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', true, '["test-model"]'::jsonb, $5, '[]'::jsonb)
      ON CONFLICT (message_id, revision, policy_version) DO NOTHING`,
     [uuidv7(), message.messageId, message.revision, WORKER_POLICY_VERSION, sha256Bytes(`${message.messageId}:${message.revision}`)],
   );
@@ -2376,11 +2376,11 @@ describe('M5 実行状態と障害対象', () => {
       seeded.messageId,
     ]);
     assert.equal(message.rows[0]?.current_revision, 2, '改訂後の新revisionを失った');
-    const stored = await pool.query<{ input_revision: number; result: unknown }>(
-      'SELECT input_revision, result FROM search_requests WHERE id = $1',
+    const stored = await pool.query<{ input_message_revision: number; result: unknown }>(
+      'SELECT input_message_revision, result FROM search_requests WHERE id = $1',
       [seeded.requestId],
     );
-    assert.equal(stored.rows[0]?.input_revision, 1, 'old input revisionの受付を新revisionへ流用した');
+    assert.equal(stored.rows[0]?.input_message_revision, 1, 'old input revisionの受付を新revisionへ流用した');
     assert.equal(stored.rows[0]?.result, null);
   });
 
@@ -2427,11 +2427,11 @@ describe('M5 実行状態と障害対象', () => {
     assert.equal(request.error_code, 'input_revision_stale');
     assert.equal(request.outcome, null);
     assert.equal(request.result, null, 'old input revisionの候補evidenceを保存した');
-    const stored = await pool.query<{ input_revision: number; result: unknown }>(
-      'SELECT input_revision, result FROM search_requests WHERE id = $1',
+    const stored = await pool.query<{ input_message_revision: number; result: unknown }>(
+      'SELECT input_message_revision, result FROM search_requests WHERE id = $1',
       [seeded.requestId],
     );
-    assert.equal(stored.rows[0]?.input_revision, 1, 'old input revisionの受付を新revisionへ流用した');
+    assert.equal(stored.rows[0]?.input_message_revision, 1, 'old input revisionの受付を新revisionへ流用した');
     assert.equal(stored.rows[0]?.result, null);
   });
 });
