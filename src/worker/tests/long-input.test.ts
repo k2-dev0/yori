@@ -167,7 +167,7 @@ describe('長文と応答検証', () => {
         assert.equal(part.offset, sentParts[index].offset);
         assert.equal(part.length, sentParts[index].length);
       }
-      assert.equal(analysis.retention, 'substantive');
+      assert.equal(analysis.retention_category, 'substantive');
       assert.equal(analysis.is_searchable, true);
     } finally {
       await server.close();
@@ -209,13 +209,13 @@ describe('長文と応答検証', () => {
       await processClassify(allProgress.messageId, server.baseUrl);
       const mixedAnalysis = await readAnalysis(pool, mixed.messageId, 1);
       assert.ok(mixedAnalysis, 'message_analysisが保存されていない');
-      assert.equal(mixedAnalysis.retention, 'substantive', 'retentionのpart混在を優先順位どおりsubstantiveにしていない');
+      assert.equal(mixedAnalysis.retention_category, 'substantive', 'retentionのpart混在を優先順位どおりsubstantiveにしていない');
       assert.equal(mixedAnalysis.is_searchable, true, 'retention混在で除外している');
       assert.equal(mixedAnalysis.primary_intent, 'unknown', 'retention以外のpart不一致をunknownにしていない');
 
       const allProgressAnalysis = await readAnalysis(pool, allProgress.messageId, 1);
       assert.ok(allProgressAnalysis, 'progress_onlyのmessage_analysisがない');
-      assert.equal(allProgressAnalysis.retention, 'progress_only');
+      assert.equal(allProgressAnalysis.retention_category, 'progress_only');
       assert.equal(allProgressAnalysis.is_searchable, false, '全part高信頼progress_onlyが除外されていない');
       assert.equal((await readRevision(pool, allProgress.messageId, 1))?.text, '😀日本語テキスト'.repeat(700), 'progress_onlyで原文が消えている');
     } finally {
@@ -242,7 +242,7 @@ describe('長文と応答検証', () => {
       await server.close();
     }
   });
-  it('partごとに異なる応答modelは重複除去した出現順の配列でmodel_versionへ保存する', async () => {
+  it('partごとに異なる応答modelは重複除去した出現順の配列でresponse_modelsへ保存する', async () => {
     const sessionId = await seedSession(pool, workspace);
     const original = '😀日本語テキスト'.repeat(700);
     const current = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: original });
@@ -263,9 +263,9 @@ describe('長文と応答検証', () => {
 
       const analysis = await readAnalysis(pool, current.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.model_version, JSON.stringify(['model-a', 'model-b']), '混在modelの重複除去配列になっていない');
+      assert.deepEqual(analysis.response_models, ['model-a', 'model-b'], '混在modelの重複除去配列になっていない');
       assert.deepEqual(
-        analysis.parts.map((part) => part.model_version),
+        analysis.parts.map((part) => part.response_model),
         server.requests.map((_, index) => (index % 2 === 0 ? 'model-a' : 'model-b')),
         'partごとの応答modelが出現順に保存されていない',
       );
