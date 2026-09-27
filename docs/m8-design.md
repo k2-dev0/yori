@@ -33,8 +33,8 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 
 1. 案件のactive世代がrun開始時sourceと一致する。
 2. 現在searchableな全desired revisionにsourceが1件以上あり、全source message revisionが現行である。
-3. targetのembeddingとpublicationがdesired revisionを指し、publicationはstaleでなく、input hashがrevision content hashと一致する。
-4. 除外・改訂済み・staleなtarget publicationが残っていない。
+3. targetのembeddingとpublicationがdesired revisionを指し、publicationはis_staleでなく、input hashがrevision content hashと一致する。
+4. 除外・改訂済み・is_staleなtarget publicationが残っていない。
 
 不足があればpointerを変更せず再走査し、進展がなければrunを`pending`へ戻す。完全な場合だけtargetを`active`にして`projects.active_generation_id`を変更する。sourceをactive参照する他案件がなければ`retired`にし、参照があれば`active`を維持する。文書計画の書込TXは案件行を`FOR SHARE`し、この切替検証と直列化する。
 
