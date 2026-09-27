@@ -40,15 +40,14 @@ interface SearchRequestRow {
   project_id: string;
   employee_id: string;
   session_id: string;
-  input_id: string;
-  input_revision: number;
+  input_message_id: string;
+  input_message_revision: number;
   input_sequence_no: number;
   trigger: string;
   status: string;
   outcome: string | null;
   search_action: string | null;
   reused_from_request_id: string | null;
-  original_request_id: string | null;
   result: unknown;
   error_code: string | null;
 }
@@ -128,7 +127,7 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
       const auto = await client.query<{ id: string }>(
         `SELECT id
            FROM search_requests
-          WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND employee_id = $4`,
+          WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND employee_id = $4`,
         [target.id, target.current_revision, AUTO_SEARCH_POLICY_VERSION, auth.employeeId],
       );
       const reused = auto.rows[0];
@@ -140,7 +139,7 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
     const requestId = uuidv7();
     await client.query(
       `INSERT INTO search_requests
-         (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no,
+         (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no,
           trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $9, $10, $11, $12)`,
       [
@@ -177,9 +176,9 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
   }
 }
 
-const SEARCH_REQUEST_COLUMNS = `sr.id, sr.company_id, sr.project_id, sr.employee_id, sr.session_id, sr.input_id, sr.input_revision,
-       sr.input_sequence_no, sr.trigger, sr.status, sr.outcome, sr.search_action, sr.reused_from_request_id,
-       sr.original_request_id, sr.result, sr.error_code`;
+const SEARCH_REQUEST_COLUMNS = `sr.id, sr.company_id, sr.project_id, sr.employee_id, sr.session_id, sr.input_message_id,
+       sr.input_message_revision, sr.input_sequence_no, sr.trigger, sr.status, sr.outcome, sr.search_action,
+       sr.reused_from_request_id, sr.result, sr.error_code`;
 
 async function loadSearchRow(pool: Pool, auth: AuthContext, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
@@ -266,12 +265,12 @@ async function currentInputValid(pool: Pool, current: SearchRequestRow): Promise
        JOIN sessions s ON s.id = m.session_id
        JOIN projects p ON p.id = s.project_id
       WHERE m.id = $1`,
-    [current.input_id],
+    [current.input_message_id],
   );
   const input = result.rows[0];
   return (
     input !== undefined &&
-    input.current_revision === current.input_revision &&
+    input.current_revision === current.input_message_revision &&
     input.sequence_no === current.input_sequence_no &&
     input.session_id === current.session_id &&
     input.employee_id === current.employee_id &&
@@ -399,8 +398,8 @@ async function revalidateRelatedItem(
       const row = await pool.query(
         `SELECT 1
            FROM message_relations
-          WHERE source_message_id = $1 AND source_revision = $2
-            AND target_message_id = $3 AND target_revision = $4 AND relation = $5`,
+          WHERE from_message_id = $1 AND from_message_revision = $2
+            AND to_message_id = $3 AND to_message_revision = $4 AND relation = $5`,
         [messageId, revision, tuple.relatedToMessageId, tuple.relatedToRevision, tuple.relation],
       );
       if (row.rows.length > 0) {
@@ -475,24 +474,24 @@ async function currentCorrectionsFor(
   revision: number,
 ): Promise<Array<{ sourceMessageId: string; sourceRevision: number; relation: string }>> {
   const result = await pool.query<{
-    source_message_id: string;
-    source_revision: number;
+    from_message_id: string;
+    from_message_revision: number;
     relation: string;
   }>(
-    `SELECT r.source_message_id, r.source_revision, r.relation
+    `SELECT r.from_message_id, r.from_message_revision, r.relation
        FROM message_relations r
-       JOIN messages sm ON sm.id = r.source_message_id
+       JOIN messages sm ON sm.id = r.from_message_id
        JOIN sessions ss ON ss.id = sm.session_id
        JOIN projects sp ON sp.id = ss.project_id
-      WHERE r.target_message_id = $1 AND r.target_revision = $2
+      WHERE r.to_message_id = $1 AND r.to_message_revision = $2
         AND r.relation IN ('change', 'revoke')
-        AND sm.current_revision = r.source_revision
+        AND sm.current_revision = r.from_message_revision
         AND ss.project_id = $3 AND sp.company_id = $4`,
     [messageId, revision, context.projectId, context.companyId],
   );
   return result.rows.map((row) => ({
-    sourceMessageId: row.source_message_id,
-    sourceRevision: row.source_revision,
+    sourceMessageId: row.from_message_id,
+    sourceRevision: row.from_message_revision,
     relation: row.relation,
   }));
 }
@@ -542,14 +541,14 @@ async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: 
         break;
       }
       // 現在policyの分類がprogress_only・非searchableへ再分類された根拠はmatchedとして返さない。
-      const analysis = await pool.query<{ retention: string; is_searchable: boolean }>(
-        `SELECT retention, is_searchable
+      const analysis = await pool.query<{ retention_category: string; is_searchable: boolean }>(
+        `SELECT retention_category, is_searchable
            FROM message_analysis
           WHERE message_id = $1 AND revision = $2 AND policy_version = $3`,
         [messageId, revision, WORKER_POLICY_VERSION],
       );
       const classification = analysis.rows[0];
-      if (classification !== undefined && (classification.retention === 'progress_only' || !classification.is_searchable)) {
+      if (classification !== undefined && (classification.retention_category === 'progress_only' || !classification.is_searchable)) {
         valid = false;
         break;
       }
@@ -639,8 +638,8 @@ async function revalidateMatches(pool: Pool, request: SearchRequestRow, result: 
 function baseView(row: SearchRequestRow): SearchView {
   return {
     request_id: row.id,
-    input_id: row.input_id,
-    input_revision: row.input_revision,
+    input_id: row.input_message_id,
+    input_revision: row.input_message_revision,
     // trigger/status/outcomeはDBのCHECK制約で公開enumに限定されている。
     trigger: row.trigger as SearchView['trigger'],
     search_action: row.search_action,
@@ -655,7 +654,7 @@ function baseView(row: SearchRequestRow): SearchView {
 }
 
 async function buildView(pool: Pool, row: SearchRequestRow): Promise<SearchView> {
-  const originId = row.original_request_id ?? row.reused_from_request_id;
+  const originId = row.reused_from_request_id;
   if (originId === null) {
     const view: SearchView = { ...baseView(row), ...completedResultParts(row) };
     if (row.status !== 'completed') {
@@ -749,28 +748,28 @@ export async function lookupSearchByInput(
   let result;
   if ('input_id' in query) {
     result = await pool.query<LookupRow>(
-      `SELECT sr.id, sr.status, sr.outcome, sr.input_id, sr.input_revision
+      `SELECT sr.id, sr.status, sr.outcome, sr.input_message_id AS input_id, sr.input_message_revision AS input_revision
          FROM search_requests sr
-         JOIN messages m ON m.id = sr.input_id
+         JOIN messages m ON m.id = sr.input_message_id
          JOIN sessions s ON s.id = m.session_id
         WHERE sr.trigger = 'auto'
           AND sr.company_id = $1 AND sr.project_id = $2 AND sr.employee_id = $3
           AND s.employee_id = $3 AND s.project_id = $2
-          AND m.id = $4 AND sr.input_revision = $5`,
+          AND m.id = $4 AND sr.input_message_revision = $5`,
       [auth.companyId, query.project_id, auth.employeeId, query.input_id, query.input_revision],
     );
   } else {
     // 外部IDはイベント受付と同じ会社・社員namespaceへ変換し、接続全体の最新受付を推測しない。
-    const sourceScope = `v1|${auth.companyId}|${auth.employeeId}|${query.source_scope}`;
+    const sourceNamespace = `v1|${auth.companyId}|${auth.employeeId}|${query.source_scope}`;
     result = await pool.query<LookupRow>(
-      `SELECT sr.id, sr.status, sr.outcome, sr.input_id, sr.input_revision
+      `SELECT sr.id, sr.status, sr.outcome, sr.input_message_id AS input_id, sr.input_message_revision AS input_revision
          FROM sessions s
          JOIN messages m ON m.session_id = s.id AND m.source_message_id = $5
-         JOIN search_requests sr ON sr.input_id = m.id AND sr.input_revision = $6 AND sr.trigger = 'auto'
-        WHERE s.source = $1 AND s.source_scope = $2 AND s.source_session_id = $3
+         JOIN search_requests sr ON sr.input_message_id = m.id AND sr.input_message_revision = $6 AND sr.trigger = 'auto'
+        WHERE s.source = $1 AND s.source_namespace = $2 AND s.source_session_id = $3
           AND s.project_id = $4 AND s.employee_id = $7
           AND sr.company_id = $8 AND sr.project_id = $4 AND sr.employee_id = $7`,
-      [query.source, sourceScope, query.source_session_id, query.project_id, query.source_message_id, query.revision, auth.employeeId, auth.companyId],
+      [query.source, sourceNamespace, query.source_session_id, query.project_id, query.source_message_id, query.revision, auth.employeeId, auth.companyId],
     );
   }
   const row = result.rows[0];
