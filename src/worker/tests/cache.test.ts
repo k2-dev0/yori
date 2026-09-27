@@ -74,7 +74,7 @@ describe('Jev評価キャッシュ', () => {
       const classifyJob = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
       await processJob(pool, classifyJob, config);
       assert.equal(server.requests.length, 1);
-      await pool.query('UPDATE provider_policy_approvals SET active = false WHERE company_id = $1 AND endpoint = $2', [
+      await pool.query('UPDATE provider_policy_approvals SET is_active = false WHERE company_id = $1 AND endpoint = $2', [
         workspace.companyId,
         config.apiUrl,
       ]);
@@ -139,14 +139,14 @@ describe('Jev評価キャッシュ', () => {
 
       const evaluations = await readEvaluations(pool, workspace.companyId);
       assert.equal(evaluations.length, 1, 'cache行が増えている');
-      assert.equal(evaluations[0].model, 'jev-latest', '要求modelをcache keyとして保持していない');
+      assert.equal(evaluations[0].requested_model, 'jev-latest', '要求modelをcache keyとして保持していない');
       assert.equal(evaluations[0].response_model, 'jev-actual-3', '実応答modelで旧cacheを更新していない');
     } finally {
       await server.close();
     }
   });
 
-  it('cache-hitでも実応答modelを分類のmodel_versionへ伝搬する', async () => {
+  it('cache-hitでも実応答modelを分類のresponse_modelsへ伝搬する', async () => {
     const sessionId = await seedSession(pool, workspace);
     const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: 'cache経由分類の対象' });
     const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
@@ -163,8 +163,8 @@ describe('Jev評価キャッシュ', () => {
       assert.equal(server.requests.length, 1, 'cacheがあるのにclassifyが再評価している');
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'cache経由の分析が保存されていない');
-      assert.equal(analysis.model_version, 'jev-cached-9', '応答modelがcache経由で伝搬していない');
-      assert.equal(analysis.parts[0]?.model_version, 'jev-cached-9', 'partの応答modelが伝搬していない');
+      assert.deepEqual(analysis.response_models, ['jev-cached-9'], '応答modelがcache経由で伝搬していない');
+      assert.equal(analysis.parts[0]?.response_model, 'jev-cached-9', 'partの応答modelが伝搬していない');
     } finally {
       await server.close();
     }
