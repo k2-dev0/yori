@@ -52,12 +52,33 @@ export const getSearchResultInputSchema = z
         return false;
       }
       if (value.request_id !== undefined) {
-        return value.input_id === undefined && value.input_revision === undefined && value.source === undefined;
+        // request_id branchはrequest_id + project_id + 任意wait_msだけを許可する。
+        return (
+          value.input_id === undefined &&
+          value.input_revision === undefined &&
+          value.source === undefined &&
+          value.source_scope === undefined &&
+          value.source_session_id === undefined &&
+          value.source_message_id === undefined &&
+          value.revision === undefined
+        );
       }
       if (value.input_id !== undefined) {
-        return value.input_revision !== undefined && value.source === undefined;
+        // internal branchはinput_id + input_revision + project_id + 任意wait_msだけを許可する。
+        return (
+          value.input_revision !== undefined &&
+          value.source === undefined &&
+          value.source_scope === undefined &&
+          value.source_session_id === undefined &&
+          value.source_message_id === undefined &&
+          value.revision === undefined
+        );
       }
+      // external branchはsource + scope + session + message + revision + project_id + 任意wait_msだけを許可する。
       return (
+        value.request_id === undefined &&
+        value.input_id === undefined &&
+        value.input_revision === undefined &&
         value.source_scope !== undefined &&
         value.source_session_id !== undefined &&
         value.source_message_id !== undefined &&
@@ -121,11 +142,35 @@ const evidenceOutputSchema = z.looseObject({
   text: z.string(),
 });
 
+// related_evidenceはHTTP公開契約と同じ7 fieldを必須にし、relation系だけを型検証する。将来追加fieldは保持する。
+const relatedEvidenceOutputSchema = z.looseObject({
+  message_id: z.uuid(),
+  revision: revisionSchema,
+  employee_id: z.uuid(),
+  role: z.string(),
+  occurred_at: occurredAtSchema,
+  text: z.string(),
+  source_kind: z.string(),
+  relation: z.string().optional(),
+  related_to_message_id: z.uuid().optional(),
+  related_to_revision: revisionSchema.optional(),
+  relations: z
+    .array(
+      z.looseObject({
+        relation: z.string(),
+        related_to_message_id: z.uuid(),
+        related_to_revision: revisionSchema,
+      }),
+    )
+    .optional(),
+});
+
 const matchOutputSchema = z.looseObject({
   case_or_document_id: z.uuid(),
   relevance_kind: z.array(z.string()),
   claim_status: z.enum(['agent_reported', 'not_reported']),
   evidence: z.array(evidenceOutputSchema).min(1),
+  related_evidence: z.array(relatedEvidenceOutputSchema).optional(),
   related_evidence_ids: z.array(z.uuid()),
   truncated: z.boolean(),
 });
