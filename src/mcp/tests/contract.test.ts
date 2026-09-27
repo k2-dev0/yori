@@ -465,14 +465,29 @@ describe('MCP中央API応答の出力契約', () => {
     assertToolError(brokenView, 'matchedのmatches型不正');
   });
 
-  it('中央APIのnot_received不正応答をtool errorにする', async () => {
+  it('完全なsearch view fieldが混在したnot_receivedをtool errorにする', async () => {
     central.requests.length = 0;
+    const mixedProjectId = uuidv7();
     central.setResponder(() => ({
       status: 200,
-      body: notReceivedBody({ request_id: uuidv7(), input_id: uuidv7(), input_revision: 1, trigger: 'manual', status: 'pending' }),
+      body: notReceivedBody({
+        request_id: uuidv7(),
+        input_id: uuidv7(),
+        input_revision: 1,
+        trigger: 'manual',
+        status: 'pending',
+        outcome: null,
+        project_id: mixedProjectId,
+        search_action: 'new_search',
+        reused_from_request_id: null,
+        error_code: null,
+        matches: [],
+        warnings: [],
+      }),
     }));
     const brokenNotReceived = await session.callTool('get_search_result', validByInputArgs(uuidv7()));
-    assertToolError(brokenNotReceived, 'not_receivedの非null field');
+    assertToolError(brokenNotReceived, 'not_receivedとsearch viewの混在');
+    assert.ok(!JSON.stringify(brokenNotReceived).includes(mixedProjectId), '検索view fieldをnot_received応答として誤受理している');
   });
 
   it('中央APIのevidence不正応答をtool errorにし、no_matchへ変換しない', async () => {
