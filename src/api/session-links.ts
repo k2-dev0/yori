@@ -107,7 +107,7 @@ async function resolveSession(
         AND s.project_id = $2
         AND s.source = $3
         AND s.source_session_id = $5
-        AND s.source_scope = 'v1|' || p.company_id::text || '|' || s.employee_id::text || '|' || $4::text`,
+        AND s.source_namespace = 'v1|' || p.company_id::text || '|' || s.employee_id::text || '|' || $4::text`,
     [auth.companyId, projectId, identity.source, identity.source_scope, identity.source_session_id],
   );
   return result.rows[0] ?? null;
