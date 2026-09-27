@@ -10,7 +10,7 @@ export async function hasActiveProviderApproval(
     `SELECT 1
        FROM provider_policy_approvals
       WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND active AND learning_disabled
+        AND is_active AND training_disabled
         AND confirmed_at <= now()
         AND terms_checked_at IS NOT NULL AND terms_checked_at <= now()
       LIMIT 1`,
