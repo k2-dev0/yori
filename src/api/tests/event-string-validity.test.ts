@@ -100,22 +100,22 @@ describe('POST /v1/events NUL・不正UTF-16', () => {
 
     const stored = await pool.query<{
       text: string;
-      source_scope: string;
+      source_namespace: string;
       source_session_id: string;
       source_message_id: string;
       idempotency_key: string;
     }>(
       `SELECT (SELECT text FROM message_revisions) AS text,
-              (SELECT source_scope FROM sessions) AS source_scope,
+              (SELECT source_namespace FROM sessions) AS source_namespace,
               (SELECT source_session_id FROM sessions) AS source_session_id,
               (SELECT source_message_id FROM messages) AS source_message_id,
               (SELECT idempotency_key FROM event_receipts) AS idempotency_key`,
     );
     assert.equal(stored.rows[0].text, event.text, '原文のサロゲートペアが変化した');
     assert.equal(
-      stored.rows[0].source_scope,
+      stored.rows[0].source_namespace,
       `v1|${workspace.companyId}|${workspace.employeeId}|${event.source_scope}`,
-      'source_scopeのサロゲートペアが変化した、またはscopeの名前空間が変わった',
+      'source_namespaceのサロゲートペアが変化した、またはscopeの名前空間が変わった',
     );
     assert.equal(stored.rows[0].source_session_id, event.source_session_id, 'source_session_idのサロゲートペアが変化した');
     assert.equal(stored.rows[0].source_message_id, event.source_message_id, 'source_message_idのサロゲートペアが変化した');
