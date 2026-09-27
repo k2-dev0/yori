@@ -18,7 +18,7 @@ M6は保存済みの自動検索を現在入力から照合・取得するHTTP A
 - `GET /v1/searches/by-input`は案件、input revisionと、内部`input_id`または取り込み元の`source`・`source_scope`・`source_session_id`・`source_message_id`を照合する。外部IDの`source_scope`はイベント受付と同じ会社・社員namespaceへ変換し、接続全体の最新受付を推測しない。
 - 入力が未受信、revisionが未受信、または対応する自動受付がない場合は`lookup_status=not_received`を返す。これは検索完了の`outcome=no_match`とは別状態である。
 - `wait_ms`は0〜5000の整数。受付が`pending`または`running`なら状態変更または期限まで短い間隔で再読込し、期限では現在状態を返す。HTTP接続の終了後もjobを取消し・失効させない。MCP側の累計待機予算は1回5秒、初期10秒を超えて自動pollしない。
-- `new_search`と`skip`は当該受付のstatus/outcome/resultを返す。`reuse`は現在受付から`original_request_id`を同じ会社・案件・社員・sessionの範囲で解決し、元受付の現在状態を追跡する。返却値の`request_id`・`input_id`・`input_revision`は現在受付、`reused_from_request_id`は元受付とし、新しい検索で得た結果とは表示しない。
+- `new_search`と`skip`は当該受付のstatus/outcome/resultを返す。`reuse`は現在受付の`reused_from_request_id`が指す元受付を同じ会社・案件・社員・sessionの範囲で解決し、元受付の現在状態を追跡する。返却値の`request_id`・`input_id`・`input_revision`は現在受付、`reused_from_request_id`は元受付とし、新しい検索で得た結果とは表示しない。
 - reuseの取得時は現在入力のrevision、案件権限、元受付のscope、matched evidenceの原文revisionと案件所属を再検証する。無効な根拠、失効・failed・skipped・no_matchをmatchedとして返さず、別入力の結果へ流用しない。元resultを現在受付の新規resultとしてDBへ複製しない。
 - provider障害、入力不整合、世代不整合は機械可読なfailed/expired理由を保持し、`no_match`へ変換しない。
 
