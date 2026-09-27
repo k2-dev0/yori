@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MAX_BATCH_SIZE } from '../contract.js';
+import { MAX_BATCH_SIZE, MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH } from '../contract.js';
+import { MAX_REVISION, MAX_WAIT_MS } from '../schema.js';
 
 // API契約実装計画の採用シナリオ1・2・6をHTTP公開境界の外から確認するRedテスト。
 // 実装される契約:
@@ -45,7 +46,9 @@ interface OpenApiPathItem {
 }
 
 interface OpenApiOperation {
+  [key: string]: unknown;
   operationId?: unknown;
+  description?: unknown;
   parameters?: OpenApiParameter[];
   requestBody?: { required?: unknown; content?: Record<string, { schema?: unknown }> };
   responses?: Record<string, { content?: Record<string, { schema?: unknown }> }>;
@@ -346,6 +349,70 @@ describe('OpenAPI 3.1契約の生成', () => {
       'source_scope',
       'source_session_id',
     ]);
+  });
+
+  it('入力上限とby-input排他的branchをZod契約と同じ値でOpenAPIへ表現する', async () => {
+    const { document } = await generatedOpenApi();
+
+    // 本文のUnicodeコードポイント上限とidentifierのUTF-8 byte上限は標準keywordで表せないためx-yori拡張で示す。
+    const eventsSchema = requestBodySchema(document, operationOf(document, ROUTES[2]).operation);
+    const eventItem = resolveSchema(document, eventsSchema?.properties?.events?.items);
+    const textSchema = resolveSchema(document, eventItem?.properties?.text);
+    assert.equal(textSchema?.maxLength, MAX_TEXT_LENGTH, 'events本文のmaxLengthがZod契約と一致しない');
+    assert.equal(textSchema?.['x-yori-max-code-points'], MAX_TEXT_LENGTH, 'events本文上限がZod契約と一致しない');
+    assert.ok(String(textSchema?.description).includes(String(MAX_TEXT_LENGTH)), 'events本文上限の説明がない');
+    for (const field of ['source_scope', 'source_session_id', 'source_message_id']) {
+      const fieldSchema = resolveSchema(document, eventItem?.properties?.[field]);
+      assert.equal(fieldSchema?.['x-yori-max-utf8-bytes'], MAX_SOURCE_IDENTIFIER_BYTES, `${field}のUTF-8 byte上限がない`);
+      assert.ok(String(fieldSchema?.description).includes(String(MAX_SOURCE_IDENTIFIER_BYTES)), `${field}のbyte上限説明がない`);
+    }
+    const searchSchema = requestBodySchema(document, operationOf(document, ROUTES[3]).operation);
+    assert.equal(searchSchema?.properties?.query?.maxLength, MAX_TEXT_LENGTH, '検索queryのmaxLengthがない');
+    assert.equal(searchSchema?.properties?.query?.['x-yori-max-code-points'], MAX_TEXT_LENGTH, '検索queryの本文上限がない');
+
+    // query parameterはwireが文字列でも、意味上のinteger/min/maxを表す。
+    const byInputOperation = operationOf(document, ROUTES[5]).operation;
+    const byInputParams = new Map((byInputOperation.parameters ?? []).map((item) => [item.name, item]));
+    assert.deepEqual(byInputParams.get('wait_ms')?.schema, {
+      type: 'integer',
+      minimum: 0,
+      maximum: MAX_WAIT_MS,
+      description: `0〜${MAX_WAIT_MS}の整数をquery文字列として送る`,
+    });
+    for (const name of ['input_revision', 'revision']) {
+      const schema = byInputParams.get(name)?.schema as OpenApiSchema | undefined;
+      assert.equal(schema?.type, 'integer', `${name}がintegerでない`);
+      assert.equal(schema?.minimum, 1);
+      assert.equal(schema?.maximum, MAX_REVISION);
+    }
+    const detailParams = new Map((operationOf(document, ROUTES[6]).operation.parameters ?? []).map((item) => [item.name, item]));
+    assert.equal((detailParams.get('wait_ms')?.schema as OpenApiSchema | undefined)?.maximum, MAX_WAIT_MS);
+
+    // by-inputの2 branchは標準keywordで表せないため、descriptionとx-yori拡張で排他を機械可読に固定する。
+    const branches = byInputOperation['x-yori-input-branches'];
+    assert.ok(Array.isArray(branches), 'by-inputのx-yori-input-branchesがない');
+    const branchList = branches as Array<{ name?: unknown; required?: unknown; optional?: unknown }>;
+    assert.deepEqual(branchList.map((branch) => branch.name).sort(), ['external', 'internal']);
+    const stringsOf = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+    const internal = branchList.find((branch) => branch.name === 'internal');
+    const external = branchList.find((branch) => branch.name === 'external');
+    assert.deepEqual(stringsOf(internal?.required).sort(), ['input_id', 'input_revision', 'project_id']);
+    assert.deepEqual(stringsOf(internal?.optional), ['wait_ms']);
+    assert.deepEqual(stringsOf(external?.required).sort(), [
+      'project_id',
+      'revision',
+      'source',
+      'source_message_id',
+      'source_scope',
+      'source_session_id',
+    ]);
+    assert.deepEqual(stringsOf(external?.optional), ['wait_ms']);
+    assert.ok(String(byInputOperation.description).includes('どちらか一方'), 'by-input排他の説明がない');
+    assert.ok(
+      String(byInputOperation.description).includes('internal') && String(byInputOperation.description).includes('external'),
+      'branch名の説明がない',
+    );
   });
 
   it('HTTP bearer security schemeを定義し、health以外の全operationが参照する', async () => {
