@@ -305,7 +305,7 @@ export async function seedReadyDocument(pool: Pool, input: M7SeedDocumentInput):
   for (const [index, source] of input.sources.entries()) {
     await pool.query(
       `INSERT INTO search_document_sources
-         (id, document_id, revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
+         (id, document_id, document_revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'original')`,
       [uuidv7(), id, revision, source.messageId, source.messageRevision, source.startOffset, source.endOffset, index],
     );
@@ -320,7 +320,7 @@ export async function seedReadyDocument(pool: Pool, input: M7SeedDocumentInput):
   if (input.publication ?? (input.generationId !== undefined && input.embedding !== undefined)) {
     assert.ok(input.generationId !== undefined, 'publicationにはgenerationIdが必要');
     await pool.query(
-      `INSERT INTO document_publications (document_id, generation_id, revision, stale)
+      `INSERT INTO document_publications (document_id, generation_id, revision, is_stale)
        VALUES ($1, $2, $3, $4)`,
       [id, input.generationId, revision, input.stale ?? false],
     );
