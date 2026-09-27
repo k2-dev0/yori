@@ -17,10 +17,15 @@ export const storableString = z.string().min(1).refine(
 
 // sessionの複合索引にはscopeとsession IDの両方が入る。名前空間の接頭辞を含めても
 // 配布PostgreSQLのB-tree索引に収まるよう、各識別子をUTF-8で1024バイトまでに制限する。
-export const sourceIdentifier = storableString.refine(
-  (value) => Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES,
-  { message: '取り込み元の識別子はUTF-8で1024バイト以内にしてください' },
-);
+// UTF-8 byte上限はJSON Schema標準keywordで表せないため、descriptionとx-yori拡張へ同じ定数から出す。
+export const sourceIdentifier = storableString
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES, {
+    message: `取り込み元の識別子はUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内にしてください`,
+  })
+  .meta({
+    description: `取り込み元identifierはUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内`,
+    'x-yori-max-utf8-bytes': MAX_SOURCE_IDENTIFIER_BYTES,
+  });
 
 // UUIDは比較・保存の前に小文字の正規形へ揃える。HTTP body/queryとMCP入力を同じ規則にする。
 export const normalizedUuid = z.uuid().transform((value) => value.toLowerCase());
@@ -32,9 +37,17 @@ export const revisionSchema = z.int().min(1).max(MAX_REVISION);
 export const idempotencyKeySchema = storableString.max(512);
 
 // 本文の上限はUTF-16長ではなくUnicodeコードポイント数で判定する。NUL・不正UTF-16も保存しない。
-export const conversationText = storableString.refine((text) => [...text].length <= MAX_TEXT_LENGTH, {
-  message: `本文は${MAX_TEXT_LENGTH}コードポイント以内にしてください`,
-});
+// Unicodeコードポイント上限はJSON Schemaへ直接変換できないため、descriptionとx-yori拡張へ同じ定数から出す。
+export const conversationText = storableString
+  .refine((text) => [...text].length <= MAX_TEXT_LENGTH, {
+    message: `本文は${MAX_TEXT_LENGTH}コードポイント以内にしてください`,
+  })
+  .meta({
+    // JSON Schema 2020-12のmaxLengthはUnicodeコードポイント数なので、標準keywordでも同じ上限を表す。
+    maxLength: MAX_TEXT_LENGTH,
+    description: `本文はUnicodeコードポイントで${MAX_TEXT_LENGTH}以内`,
+    'x-yori-max-code-points': MAX_TEXT_LENGTH,
+  });
 
 // 受信時刻はoffset付きISO文字列に限定する。HTTP入力とMCP入力を共有する。
 export const occurredAtSchema = z.iso.datetime({ offset: true });
@@ -92,14 +105,14 @@ export const searchDetailQuerySchema = z.strictObject({
 export const revisionQueryParamSchema = z.coerce.number().int().min(1).max(MAX_REVISION);
 
 // by-inputは内部input_idか、イベント受付と同じ取り込み元identityのどちらか一方だけを受理する。
-const byInputInternalQuerySchema = z.strictObject({
+export const byInputInternalQuerySchema = z.strictObject({
   project_id: normalizedUuid,
   input_id: normalizedUuid,
   input_revision: revisionQueryParamSchema,
   wait_ms: waitMsParam.optional(),
 });
 
-const byInputExternalQuerySchema = z.strictObject({
+export const byInputExternalQuerySchema = z.strictObject({
   project_id: normalizedUuid,
   source: z.enum(EVENT_SOURCES),
   source_scope: sourceIdentifier,
@@ -110,6 +123,12 @@ const byInputExternalQuerySchema = z.strictObject({
 });
 
 export const searchByInputQuerySchema = z.union([byInputInternalQuerySchema, byInputExternalQuerySchema]);
+
+// by-inputの排他的branch。OpenAPIのparameter列挙とx-yori-input-branchesをZod schemaから生成する。
+export const searchByInputBranchSchemas = {
+  internal: byInputInternalQuerySchema,
+  external: byInputExternalQuerySchema,
+} as const;
 
 export type ParsedSearchByInputQuery = z.infer<typeof searchByInputQuerySchema>;
 
