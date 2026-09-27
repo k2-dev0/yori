@@ -64,8 +64,8 @@ interface SearchRequestRow {
   search_action: string | null;
   status: string;
   result: unknown;
-  input_id: string;
-  input_revision: number;
+  input_message_id: string;
+  input_message_revision: number;
   input_sequence_no: number;
   question: string | null;
   embedding_generation_id: string | null;
@@ -143,7 +143,7 @@ const VECTOR_CANDIDATES_SQL = `
          FROM search_document_sources sx
          JOIN messages mx ON mx.id = sx.message_id
         WHERE sx.document_id = e.document_id
-          AND sx.revision = e.revision
+          AND sx.document_revision = e.revision
           AND mx.session_id = $5
           AND mx.sequence_no >= $6
      )
@@ -168,7 +168,7 @@ const ENTITY_CANDIDATES_SQL = `
          FROM search_document_sources sx
          JOIN messages mx ON mx.id = sx.message_id
         WHERE sx.document_id = e.document_id
-          AND sx.revision = e.revision
+          AND sx.document_revision = e.revision
           AND mx.session_id = $6
           AND mx.sequence_no >= $7
      )
@@ -177,10 +177,10 @@ const ENTITY_CANDIDATES_SQL = `
 `;
 
 const CANDIDATE_SOURCES_SQL = `
-  SELECT document_id, revision, message_id, message_revision, start_offset, end_offset, source_kind
+  SELECT document_id, document_revision, message_id, message_revision, start_offset, end_offset, source_kind
     FROM search_document_sources
-   WHERE (document_id, revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
-   ORDER BY document_id, revision, display_order
+   WHERE (document_id, document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+   ORDER BY document_id, document_revision, display_order
 `;
 
 function vectorLiteral(vector: readonly number[]): string {
@@ -330,12 +330,12 @@ async function loadCandidates(
     const candidates = mergeRoutes(vectorRows.rows, entityRows);
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
-      const sources = await client.query<CandidateSource & { document_id: string; revision: number }>(CANDIDATE_SOURCES_SQL, [
+      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number }>(CANDIDATE_SOURCES_SQL, [
         entries.map((candidate) => candidate.documentId),
         entries.map((candidate) => candidate.revision),
       ]);
       for (const row of sources.rows) {
-        const candidate = candidates.get(`${row.document_id}:${row.revision}`);
+        const candidate = candidates.get(`${row.document_id}:${row.document_revision}`);
         candidate?.sources.push({
           message_id: row.message_id,
           message_revision: row.message_revision,
@@ -586,7 +586,7 @@ async function loadValidCandidate(
        JOIN messages m ON m.id = s.message_id
        JOIN sessions sess ON sess.id = m.session_id
        JOIN message_revisions rev ON rev.message_id = s.message_id AND rev.revision = s.message_revision
-      WHERE s.document_id = $1 AND s.revision = $2
+      WHERE s.document_id = $1 AND s.document_revision = $2
       ORDER BY s.display_order
       FOR SHARE OF m`,
     [candidate.documentId, candidate.revision],
@@ -605,8 +605,8 @@ async function loadValidCandidate(
       return null;
     }
   }
-  const document = await client.query<{ stale: boolean }>(
-    `SELECT p.stale, p.revision
+  const document = await client.query<{ is_stale: boolean }>(
+    `SELECT p.is_stale, p.revision
        FROM search_documents d
        JOIN document_publications p
          ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = $3
@@ -619,7 +619,7 @@ async function loadValidCandidate(
   if (document.rows.length === 0) {
     return null;
   }
-  return { stale: document.rows[0].stale, evidence: sources.rows };
+  return { stale: document.rows[0].is_stale, evidence: sources.rows };
 }
 
 function buildMatch(
@@ -744,7 +744,7 @@ async function markSearchRunning(pool: Pool, job: ClaimedJob, target: JobTarget,
     const updated = await client.query(
       `UPDATE search_requests
           SET status = 'running', error_code = NULL, outcome = NULL, updated_at = now()
-        WHERE id = $1 AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
+        WHERE id = $1 AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
           AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8
           AND search_action = 'new_search' AND status IN ('pending', 'failed', 'running')
         RETURNING id`,
@@ -778,7 +778,7 @@ async function expireStaleSearch(client: PoolClient, job: ClaimedJob, target: Jo
     `UPDATE search_requests
         SET status = 'expired', error_code = 'input_revision_stale', outcome = NULL, result = NULL,
             stage = 'completed', updated_at = now()
-      WHERE id = $1 AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
+      WHERE id = $1 AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
         AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8
         AND status IN ('pending', 'running', 'failed')
       RETURNING id`,
@@ -911,7 +911,7 @@ async function saveSearchResult(
     const request = await client.query<{ status: string; embedding_generation_id: string | null }>(
       `SELECT status, embedding_generation_id FROM search_requests
         WHERE id = $1 AND status = 'running'
-          AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
+          AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
           AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8
           AND search_action = 'new_search'
         FOR UPDATE`,
@@ -949,7 +949,7 @@ async function saveSearchResult(
          JOIN projects p ON p.id = s.project_id
         WHERE m.id = $1
         FOR SHARE OF m, s, p`,
-      [input.request.input_id],
+      [input.request.input_message_id],
     );
     const inputRow = inputMessage.rows[0];
     if (inputRow === undefined) {
@@ -965,7 +965,7 @@ async function saveSearchResult(
       // 入力の所属session/employee/projectが変化した場合は結果を保存せず、jobも完了しない。
       throw new StaleApplyError('input messageのscopeが変化しました');
     }
-    if (inputRow.current_revision !== input.request.input_revision) {
+    if (inputRow.current_revision !== input.request.input_message_revision) {
       // 候補判定後・保存時に入力本文が改訂されたら、old inputの結果を保存せずexpiredで終端する。
       await expireStaleSearch(client, input.job, input.target, input.request);
       await client.query('COMMIT');
@@ -1022,7 +1022,7 @@ async function saveSearchResult(
       `UPDATE search_requests
           SET status = 'completed', outcome = $2, result = $3::jsonb, stage = 'completed', error_code = NULL, updated_at = now()
         WHERE id = $1 AND status = 'running'
-          AND input_id = $4 AND input_revision = $5 AND input_sequence_no = $6
+          AND input_message_id = $4 AND input_message_revision = $5 AND input_sequence_no = $6
           AND company_id = $7 AND project_id = $8 AND employee_id = $9 AND session_id = $10
           AND search_action = 'new_search'
         RETURNING id`,
@@ -1067,11 +1067,11 @@ export function searchRequestIdFromPayload(payload: unknown): string | null {
 // jobのmessage/revisionとsearch_requestのscope・input revision・new_searchを照合する。
 async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
-    `SELECT id, trigger, search_action, status, result, input_id, input_revision, input_sequence_no, question,
+    `SELECT id, trigger, search_action, status, result, input_message_id, input_message_revision, input_sequence_no, question,
               embedding_generation_id
        FROM search_requests
       WHERE id = $1
-        AND input_id = $2 AND input_revision = $3 AND input_sequence_no = $4
+        AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
         AND company_id = $5 AND project_id = $6 AND employee_id = $7 AND session_id = $8`,
     [
       requestId,
