@@ -30,46 +30,174 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const MCP_DOCS_PATH = path.join(REPO_ROOT, 'docs/mcp.md');
 const TOKEN = `contract-token-${randomUUID()}`;
 
-const TOOL_EXPECTATIONS = [
+const UUID_PATTERN = "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$";
+const DATE_TIME_PATTERN = "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$";
+
+// tools/listのJSON Schema期待値。production schemaへ依存せず、公開契約をliteralで固定する。
+const UUID_INPUT_JSON_SCHEMA = { type: 'string', format: 'uuid', pattern: UUID_PATTERN };
+const SOURCE_INPUT_JSON_SCHEMA = { type: 'string', enum: ['codex', 'claude_code'] };
+const REVISION_INPUT_JSON_SCHEMA = { type: 'integer', minimum: 1, maximum: 2_147_483_647 };
+const WAIT_MS_INPUT_JSON_SCHEMA = { type: 'integer', minimum: 0, maximum: 5_000 };
+const IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA = { type: 'string', minLength: 1, maxLength: 512 };
+const SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA = {
+  type: 'string',
+  minLength: 1,
+  description: '取り込み元identifierはUTF-8で1024バイト以内',
+  'x-yori-max-utf8-bytes': 1024,
+};
+const CONVERSATION_TEXT_INPUT_JSON_SCHEMA = {
+  type: 'string',
+  minLength: 1,
+  maxLength: 65_536,
+  description: '本文はUnicodeコードポイントで65536以内',
+  'x-yori-max-code-points': 65_536,
+};
+const CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA = {
+  maxItems: 50,
+  type: 'array',
+  items: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+};
+
+// tools/list内のobject schemaを、properties・required・additionalPropertiesまで含めて組み立てる。
+function jsonSchemaObject(
+  properties: Record<string, unknown>,
+  required: string[],
+): Record<string, unknown> {
+  return { type: 'object', properties, required, additionalProperties: false };
+}
+
+// tools/list直下のinputSchemaは$schemaを持ち、ネストしたidentity schemaは持たない形で公開される。
+function toolInputSchema(
+  properties: Record<string, unknown>,
+  required: string[],
+): Record<string, unknown> {
+  return { $schema: 'https://json-schema.org/draft/2020-12/schema', ...jsonSchemaObject(properties, required) };
+}
+
+const LINK_SESSION_IDENTITY_PROPERTIES = {
+  source: SOURCE_INPUT_JSON_SCHEMA,
+  source_scope: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+  source_session_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+};
+
+const LINK_SESSION_IDENTITY_INPUT_JSON_SCHEMA = jsonSchemaObject(LINK_SESSION_IDENTITY_PROPERTIES, [
+  'source',
+  'source_scope',
+  'source_session_id',
+]);
+
+const LINK_EVIDENCE_INPUT_JSON_SCHEMA = jsonSchemaObject(
+  {
+    ...LINK_SESSION_IDENTITY_PROPERTIES,
+    source_message_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+    revision: REVISION_INPUT_JSON_SCHEMA,
+  },
+  ['source', 'source_scope', 'source_session_id', 'source_message_id', 'revision'],
+);
+
+// 5 toolのname・description・inputSchema全体を1つのsnapshotとして固定し、部分一致ではなくdriftを検出する。
+const EXPECTED_TOOLS = [
   {
     name: 'search_history',
     description: '現在の入力ID・revisionを条件に保存済み会話を検索する',
-    required: ['project_id', 'input_id', 'input_revision', 'query', 'idempotency_key', 'force_refresh'],
+    inputSchema: toolInputSchema(
+      {
+        project_id: UUID_INPUT_JSON_SCHEMA,
+        input_id: UUID_INPUT_JSON_SCHEMA,
+        input_revision: REVISION_INPUT_JSON_SCHEMA,
+        query: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+        idempotency_key: IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA,
+        force_refresh: { type: 'boolean' },
+      },
+      ['project_id', 'input_id', 'input_revision', 'query', 'idempotency_key', 'force_refresh'],
+    ),
   },
   {
     name: 'get_search_result',
     description: 'request_idまたは現在入力のidentityで検索受付の状態と結果を取得する',
-    required: ['project_id'],
+    // 排他branchのrefineは現行SDKの公開schemaへkeywordとして出ない。表現が変わればdeepEqualがdriftとして検出する。
+    inputSchema: toolInputSchema(
+      {
+        project_id: UUID_INPUT_JSON_SCHEMA,
+        request_id: UUID_INPUT_JSON_SCHEMA,
+        wait_ms: WAIT_MS_INPUT_JSON_SCHEMA,
+        input_id: UUID_INPUT_JSON_SCHEMA,
+        input_revision: REVISION_INPUT_JSON_SCHEMA,
+        source: SOURCE_INPUT_JSON_SCHEMA,
+        source_scope: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        source_session_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        source_message_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        revision: REVISION_INPUT_JSON_SCHEMA,
+      },
+      ['project_id'],
+    ),
   },
   {
     name: 'get_evidence',
     description: '保存済みの原文revisionを出典IDから取得する',
-    required: ['project_id', 'message_id', 'revision'],
+    inputSchema: toolInputSchema(
+      {
+        project_id: UUID_INPUT_JSON_SCHEMA,
+        message_id: UUID_INPUT_JSON_SCHEMA,
+        revision: REVISION_INPUT_JSON_SCHEMA,
+      },
+      ['project_id', 'message_id', 'revision'],
+    ),
   },
   {
     name: 'link_session',
     description: '認証社員本人のsessionへの明示的な引き継ぎリンクを根拠発言付きで登録する',
-    required: ['project_id', 'idempotency_key', 'from', 'to', 'evidence'],
+    inputSchema: toolInputSchema(
+      {
+        project_id: UUID_INPUT_JSON_SCHEMA,
+        idempotency_key: IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA,
+        from: LINK_SESSION_IDENTITY_INPUT_JSON_SCHEMA,
+        to: LINK_SESSION_IDENTITY_INPUT_JSON_SCHEMA,
+        evidence: LINK_EVIDENCE_INPUT_JSON_SCHEMA,
+      },
+      ['project_id', 'idempotency_key', 'from', 'to', 'evidence'],
+    ),
   },
   {
     name: 'record_case',
     description: '問題・対応・確認状態を含む短い対応記録をagent_reportとして保存する',
-    required: [
-      'project_id',
-      'idempotency_key',
-      'source',
-      'source_scope',
-      'source_session_id',
-      'source_message_id',
-      'sequence_no',
-      'revision',
-      'occurred_at',
-      'problem',
-      'action',
-      'confirmation_status',
-    ],
+    inputSchema: toolInputSchema(
+      {
+        project_id: UUID_INPUT_JSON_SCHEMA,
+        idempotency_key: IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA,
+        source: SOURCE_INPUT_JSON_SCHEMA,
+        source_scope: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        source_session_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        source_message_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
+        sequence_no: REVISION_INPUT_JSON_SCHEMA,
+        revision: REVISION_INPUT_JSON_SCHEMA,
+        occurred_at: { type: 'string', format: 'date-time', pattern: DATE_TIME_PATTERN },
+        problem: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+        cause: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+        investigation_steps: CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA,
+        action: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+        failed_attempts: CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA,
+        confirmation_status: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
+        constraints: CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA,
+        related_files_or_prs: CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA,
+      },
+      [
+        'project_id',
+        'idempotency_key',
+        'source',
+        'source_scope',
+        'source_session_id',
+        'source_message_id',
+        'sequence_no',
+        'revision',
+        'occurred_at',
+        'problem',
+        'action',
+        'confirmation_status',
+      ],
+    ),
   },
-] as const;
+];
 
 interface ToolInputSchema {
   type?: unknown;
@@ -103,6 +231,11 @@ function requiredNames(schema: { required?: unknown }): string[] {
 async function listTools(): Promise<McpToolDefinition[]> {
   toolsCache ??= await session.listTools();
   return toolsCache;
+}
+
+// tools/listの公開順に依存せず、5 toolをnameの決定順で比較する。
+function byToolName(left: { name: string }, right: { name: string }): number {
+  return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
 }
 
 function inputSchemaOf(tools: McpToolDefinition[], name: string): ToolInputSchema {
@@ -203,6 +336,41 @@ function notReceivedBody(overrides: Record<string, unknown> = {}): Record<string
   };
 }
 
+// by-inputが返す完全なmatched検索view。request_id経路のfound応答との排他を検証する。
+function matchedSearchViewBody(projectId: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return searchViewBody({
+    project_id: projectId,
+    status: 'completed',
+    outcome: 'matched',
+    index_status: {
+      pending_documents: 0,
+      failed_documents: 0,
+      embedding_generation_id: uuidv7(),
+      search_mode: 'exact_vector_and_entity',
+    },
+    matches: [
+      {
+        case_or_document_id: uuidv7(),
+        relevance_kind: ['similar_symptom'],
+        claim_status: 'agent_reported',
+        evidence: [
+          {
+            message_id: uuidv7(),
+            revision: 1,
+            employee_id: uuidv7(),
+            role: 'user',
+            occurred_at: '2026-09-21T01:00:00.000Z',
+            text: '根拠の原文',
+          },
+        ],
+        related_evidence_ids: [],
+        truncated: false,
+      },
+    ],
+    ...overrides,
+  });
+}
+
 function recordCaseReply(request: RecordedCentralRequest): FakeCentralReply {
   const body = request.body as { events?: Array<{ idempotency_key?: string }> } | undefined;
   return {
@@ -245,22 +413,13 @@ function assertToolError(result: McpToolCallResult, label: string): void {
 }
 
 describe('MCP 5 toolの入力契約', () => {
-  it('5 toolのname・description・input schemaの必須fieldを固定する', async () => {
+  it('5 toolのname・description・inputSchema全体を固定snapshotと一致させる', async () => {
     const tools = await listTools();
-    assert.deepEqual(
-      tools.map((tool) => tool.name).sort(),
-      TOOL_EXPECTATIONS.map((expectation) => expectation.name).sort(),
-      '公開toolの集合が固定契約と一致しない',
-    );
-    for (const expectation of TOOL_EXPECTATIONS) {
-      const tool = tools.find((candidate) => candidate.name === expectation.name);
-      assert.ok(tool, `${expectation.name}が公開されていない`);
-      assert.equal(tool.description, expectation.description, `${expectation.name}のdescriptionが固定契約と異なる`);
-      const schema = inputSchemaOf(tools, expectation.name);
-      assert.equal(schema.type, 'object', `${expectation.name}のinput schemaがobjectでない`);
-      assert.equal(schema.additionalProperties, false, `${expectation.name}がunknown fieldを拒否しない`);
-      assert.deepEqual(requiredNames(schema).sort(), [...expectation.required].sort(), `${expectation.name}の必須fieldが異なる`);
-    }
+    const actual = tools
+      .map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
+      .sort(byToolName);
+    const expected = [...EXPECTED_TOOLS].sort(byToolName);
+    assert.deepEqual(actual, expected, 'tools/listの公開契約が固定snapshotとdriftしている');
   });
 
   it('UUID・revision・wait_msの境界がHTTP契約と同じZod制約で公開される', async () => {
@@ -527,6 +686,35 @@ describe('MCP中央API応答の出力契約', () => {
     assert.ok(!JSON.stringify(brokenNotReceived).includes(mixedProjectId), '検索view fieldをnot_received応答として誤受理している');
   });
 
+  it('request_id経路のGET /v1/searches/:idでlookup_status:found応答をtool errorにする', async () => {
+    central.requests.length = 0;
+    const projectId = uuidv7();
+    const requestId = uuidv7();
+    // foundはby-input専用。request_id経路がlookup_status付き応答を受理してはならない。
+    central.setResponder(() => ({ status: 200, body: { lookup_status: 'found', ...matchedSearchViewBody(projectId) } }));
+
+    const result = await session.callTool('get_search_result', validRequestIdArgs(projectId, { request_id: requestId }));
+    assertToolError(result, 'request_id経路のlookup_status:found');
+    assert.equal(central.requests.length, 1, 'request_id経路のrequestが1回だけ届いていない');
+    const request = central.requests[0];
+    assert.ok(request, '中央APIのrequest記録がない');
+    assert.equal(requestUrl(request).pathname, `/v1/searches/${requestId}`, 'request_id経路のURLと異なる');
+  });
+
+  it('by-input経路のGET /v1/searches/by-inputでlookup_statusなし検索view応答をtool errorにする', async () => {
+    central.requests.length = 0;
+    const projectId = uuidv7();
+    // lookup_statusなしの完全な検索viewはrequest_id専用。by-inputはnot_received／foundだけを受理する。
+    central.setResponder(() => ({ status: 200, body: matchedSearchViewBody(projectId) }));
+
+    const result = await session.callTool('get_search_result', validByInputArgs(projectId));
+    assertToolError(result, 'by-input経路のlookup_statusなし検索view');
+    assert.equal(central.requests.length, 1, 'by-input経路のrequestが1回だけ届いていない');
+    const request = central.requests[0];
+    assert.ok(request, '中央APIのrequest記録がない');
+    assert.equal(requestUrl(request).pathname, '/v1/searches/by-input', 'by-input経路のURLと異なる');
+  });
+
   it('related_evidenceの型不正・必須field欠落をtool errorにする', async () => {
     central.requests.length = 0;
     const projectId = uuidv7();
@@ -615,7 +803,7 @@ describe('MCP契約の文書化', () => {
     } catch {
       assert.fail('docs/mcp.md が未作成です');
     }
-    for (const expectation of TOOL_EXPECTATIONS) {
+    for (const expectation of EXPECTED_TOOLS) {
       assert.ok(content.includes(`\`${expectation.name}\``), `docs/mcp.md に ${expectation.name} の記述がない`);
     }
     assert.ok(content.includes('structuredContent'), 'docs/mcp.md にstructuredContentの出力契約がない');
