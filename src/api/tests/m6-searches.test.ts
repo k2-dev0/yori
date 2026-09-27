@@ -273,7 +273,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -305,7 +304,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const cases = [
@@ -372,7 +370,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -421,7 +418,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -465,7 +461,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
     await advanceMessageRevision(pool, current.messageId, '改訂後の現在入力');
 
@@ -534,8 +529,7 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
         searchAction: 'reuse',
         stage: 'awaiting_reused_search',
         reusedFromRequestId: origin.requestId,
-        originalRequestId: origin.requestId,
-      });
+        });
       await advanceMessageRevision(pool, current.messageId, '改訂後の現在入力');
 
       const started = Date.now();
@@ -613,7 +607,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const control = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -627,11 +620,11 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
     for (const item of cases) {
       await pool.query(
         `INSERT INTO message_analysis
-           (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
-            continuity, statement_status, is_searchable, model_version, state_hash, parts)
-         VALUES ($1, $2, 1, $3, $4, 'implementation', '[]'::jsonb, 'new_search', 'same_topic', 'unknown', $5, 'test-model', $6, '[]'::jsonb)
+           (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+            continuity, statement_status, is_searchable, response_models, state_hash, parts)
+         VALUES ($1, $2, 1, $3, $4, 'implementation', '[]'::jsonb, 'new_search', 'same_topic', 'unknown', $5, '["test-model"]'::jsonb, $6, '[]'::jsonb)
          ON CONFLICT (message_id, revision, policy_version) DO UPDATE
-           SET retention = EXCLUDED.retention, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
+           SET retention_category = EXCLUDED.retention_category, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
         [uuidv7(), evidence.messageId, AUTO_SEARCH_POLICY_VERSION, item.retention, item.isSearchable, Buffer.alloc(32)],
       );
       const response = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -675,7 +668,6 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       searchAction: 'reuse',
       stage: 'awaiting_reused_search',
       reusedFromRequestId: origin.requestId,
-      originalRequestId: origin.requestId,
     });
 
     const control = await getSearchById(app, { token: workspace.token, id: current.requestId });
@@ -685,7 +677,7 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
     for (const relation of ['change', 'revoke']) {
       await pool.query(
         `INSERT INTO message_relations
-           (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, evidence_ranges, policy_version)
+           (id, from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, evidence_ranges, policy_version)
          VALUES ($1, $2, 1, $3, 1, $4, true, '[]'::jsonb, $5)`,
         [uuidv7(), origin.messageId, evidence.messageId, relation, AUTO_SEARCH_POLICY_VERSION],
       );
@@ -694,7 +686,7 @@ describe('M6 GET /v1/searches/:id 状態とoutcomeの区別', () => {
       const body = response.json<SearchResponseBody>();
       assert.notEqual(body.outcome, 'matched', `${relation}で無効化された根拠をmatchedとして返している`);
       assert.ok(!body.matches || body.matches.length === 0, `${relation}で無効化されたmatchesを返している`);
-      await pool.query('DELETE FROM message_relations WHERE target_message_id = $1 AND target_revision = 1', [evidence.messageId]);
+      await pool.query('DELETE FROM message_relations WHERE to_message_id = $1 AND to_message_revision = 1', [evidence.messageId]);
     }
   });
 
@@ -1072,8 +1064,8 @@ describe('M6 POST /v1/searches 受付', () => {
     assert.equal(row.trigger, 'manual');
     assert.equal(row.project_id, workspace.projectId);
     assert.equal(row.employee_id, workspace.employeeId);
-    assert.equal(row.input_id, input.messageId);
-    assert.equal(row.input_revision, 1);
+    assert.equal(row.input_message_id, input.messageId);
+    assert.equal(row.input_message_revision, 1);
     assert.equal(row.status, 'pending');
     assert.equal(row.outcome, null);
     assert.equal(row.search_action, 'new_search');
