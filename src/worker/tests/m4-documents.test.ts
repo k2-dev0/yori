@@ -41,9 +41,9 @@ import { advanceRevision, countJobsByKind, minutesFromNow, readJob, seedMessage,
 // - embedding_generations(id, provider, model, dimensions, status, tokenizer/前処理版, metric)
 // - search_documents(id, company_id, project_id, session_id, document_key, desired_revision, is_searchable)
 // - search_document_revisions(document_id, revision, 検索本文, content_hash, chunker_version, status)
-// - search_document_sources(document_id, revision, message_id, message_revision, UTF-16 start/end, display_order)
+// - search_document_sources(document_id, document_revision, message_id, message_revision, UTF-16 start/end, display_order)
 // - document_embeddings(document_id, revision, generation_id, vector(1024), input_hash)
-// - document_publications(document_id, generation_id, revision, stale)
+// - document_publications(document_id, generation_id, revision, is_stale)
 // - embedding_cache(company_id, generation_id, operation, input_hash)
 // - revision status: pending / embedding / ready / failed / superseded / excluded
 // - Voyage接続設定はJEVと同じ方式でenv（VOYAGE_API_KEY / VOYAGE_ACCOUNT_REF / VOYAGE_API_URL /
@@ -235,7 +235,7 @@ interface VoyageApprovalSeed {
 async function insertVoyageApproval(pool: Pool, input: VoyageApprovalSeed): Promise<void> {
   await pool.query(
     `INSERT INTO provider_policy_approvals
-       (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, learning_disabled, retention_terms, confirmed_by, confirmed_at, active)
+       (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, training_disabled, retention_terms, confirmed_by, confirmed_at, is_active)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'admin-a', $10, $11)`,
     [
       uuidv7(),
@@ -356,11 +356,11 @@ async function upsertAnalysis(
   const isSearchable = input.isSearchable ?? true;
   await pool.query(
     `INSERT INTO message_analysis
-       (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
-        continuity, statement_status, is_searchable, model_version, state_hash, parts)
-     VALUES ($1, $2, $3, $4, $5, 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', $6, 'test-model', $7, '[]'::jsonb)
+       (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+        continuity, statement_status, is_searchable, response_models, state_hash, parts)
+     VALUES ($1, $2, $3, $4, $5, 'implementation', '[]'::jsonb, 'none', 'same_topic', 'request', $6, '["test-model"]'::jsonb, $7, '[]'::jsonb)
      ON CONFLICT (message_id, revision, policy_version) DO UPDATE
-       SET retention = EXCLUDED.retention, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
+       SET retention_category = EXCLUDED.retention_category, is_searchable = EXCLUDED.is_searchable, updated_at = now()`,
     [
       uuidv7(),
       input.messageId,
@@ -386,7 +386,7 @@ async function insertMessageRelation(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO message_relations
-       (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, policy_version, evidence_ranges)
+       (id, from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, policy_version, evidence_ranges)
      VALUES ($1, $2, $3, $4, $5, $6, true, $7, '[]'::jsonb)`,
     [
       uuidv7(),
@@ -1334,7 +1334,7 @@ describe('M4 progress_onlyの索引除外', () => {
       isSearchable: false,
     });
     await pool.query(
-      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      `UPDATE provider_policy_approvals SET is_active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
       [workspace.companyId, VOYAGE_PROVIDER],
     );
     const requestsBefore = server.requests.length;
@@ -1355,7 +1355,7 @@ describe('M4 progress_onlyの索引除外', () => {
 
     // 承認を戻してretryすると、Bを含まない新revisionが公開される。
     await pool.query(
-      `UPDATE provider_policy_approvals SET active = true, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      `UPDATE provider_policy_approvals SET is_active = true, updated_at = now() WHERE company_id = $1 AND provider = $2`,
       [workspace.companyId, VOYAGE_PROVIDER],
     );
     assert.equal(await retryJob(pool, second.buildJobId, config), true, 'Voyage承認後にretryできない');
@@ -1418,7 +1418,7 @@ describe('M4 revoke/change relationの索引除外', () => {
 
     // Voyage未承認でも、外部HTTP前の文書plan TXで旧publicationを削除する。
     await pool.query(
-      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      `UPDATE provider_policy_approvals SET is_active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
       [workspace.companyId, VOYAGE_PROVIDER],
     );
     const requestsBefore = server.requests.length;
@@ -1437,16 +1437,16 @@ describe('M4 revoke/change relationの索引除外', () => {
     assert.equal(await currentMessageRevision(pool, revoked.messageId), revoked.revision, 'Aのcurrent revisionが変わった');
     assert.equal(await messageRevisionText(pool, revoked.messageId, revoked.revision), revoked.text, 'Aの原文が消えた');
     const relations = await pool.query<{ relation: string }>(
-      'SELECT relation FROM message_relations WHERE target_message_id = $1',
+      'SELECT relation FROM message_relations WHERE to_message_id = $1',
       [revoked.messageId],
     );
     assert.equal(relations.rows.length, 1, 'relationが保持されていない');
-    const analysis = await pool.query<{ is_searchable: boolean; retention: string }>(
-      'SELECT is_searchable, retention FROM message_analysis WHERE message_id = $1 AND revision = $2',
+    const analysis = await pool.query<{ is_searchable: boolean; retention_category: string }>(
+      'SELECT is_searchable, retention_category FROM message_analysis WHERE message_id = $1 AND revision = $2',
       [revoked.messageId, revoked.revision],
     );
     assert.equal(analysis.rows[0]?.is_searchable, true, 'Aのanalysisが変更された');
-    assert.equal(analysis.rows[0]?.retention, 'substantive', 'Aのretentionが変更された');
+    assert.equal(analysis.rows[0]?.retention_category, 'substantive', 'Aのretentionカテゴリが変更された');
   });
 
   it('現行policyのchange relationも対象messageを索引対象から除外する', async () => {
@@ -2456,7 +2456,7 @@ describe('M4 Green追加契約', () => {
     assert.ok(cacheBefore.length >= 1, '再利用可能なcache行がない');
 
     await pool.query(
-      `UPDATE provider_policy_approvals SET active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
+      `UPDATE provider_policy_approvals SET is_active = false, updated_at = now() WHERE company_id = $1 AND provider = $2`,
       [workspace.companyId, VOYAGE_PROVIDER],
     );
     // 同じcontentのrevisionをpendingへ戻し、cache-hitになり得る再処理を作る。
