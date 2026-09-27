@@ -369,7 +369,7 @@ async function loadDocumentPage(
 ): Promise<DocumentRow[]> {
   const result = await pool.query<DocumentRow>(
     `SELECT d.id, d.desired_revision, d.created_at::text AS created_at_text, r.content, r.content_hash,
-            e.input_hash AS target_hash, p.revision AS target_revision, p.stale AS target_stale
+            e.input_hash AS target_hash, p.revision AS target_revision, p.is_stale AS target_stale
        FROM search_documents d
        JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
        LEFT JOIN document_embeddings e
@@ -454,7 +454,7 @@ async function applyEmbeddings(
         `SELECT s.message_id, s.message_revision, m.current_revision
            FROM search_document_sources s
            JOIN messages m ON m.id = s.message_id
-          WHERE s.document_id = $1 AND s.revision = $2
+          WHERE s.document_id = $1 AND s.document_revision = $2
           ORDER BY s.display_order
           FOR SHARE OF m`,
         [item.id, item.desired_revision],
@@ -473,10 +473,10 @@ async function applyEmbeddings(
         [item.id, item.desired_revision, input.target.id, vectorLiteral(vector), item.content_hash],
       );
       await client.query(
-        `INSERT INTO document_publications (document_id, generation_id, revision, stale)
+        `INSERT INTO document_publications (document_id, generation_id, revision, is_stale)
          VALUES ($1, $2, $3, false)
          ON CONFLICT (document_id, generation_id)
-         DO UPDATE SET revision = EXCLUDED.revision, stale = false, updated_at = now()`,
+         DO UPDATE SET revision = EXCLUDED.revision, is_stale = false, updated_at = now()`,
         [item.id, input.target.id, item.desired_revision],
       );
       // revision statusは世代共通のためcandidate公開では変えない。旧activeのbuild_documentsが
@@ -509,15 +509,15 @@ export async function countIncompleteDocuments(
        LEFT JOIN document_publications p
          ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
       WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
-        AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.stale
+        AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.is_stale
              OR NOT EXISTS (
                SELECT 1 FROM search_document_sources s
-                WHERE s.document_id = d.id AND s.revision = d.desired_revision
+                WHERE s.document_id = d.id AND s.document_revision = d.desired_revision
              )
              OR EXISTS (
                SELECT 1 FROM search_document_sources s
                 JOIN messages m ON m.id = s.message_id
-                WHERE s.document_id = d.id AND s.revision = d.desired_revision
+                WHERE s.document_id = d.id AND s.document_revision = d.desired_revision
                   AND m.current_revision <> s.message_revision
              ))`,
     [projectId, targetGenerationId],
@@ -556,7 +556,7 @@ async function tryCutover(
       `SELECT s.message_id, s.message_revision, m.current_revision
          FROM search_documents d
          JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
-         JOIN search_document_sources s ON s.document_id = d.id AND s.revision = d.desired_revision
+         JOIN search_document_sources s ON s.document_id = d.id AND s.document_revision = d.desired_revision
          JOIN messages m ON m.id = s.message_id
         WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
         ORDER BY s.message_id, s.message_revision, s.display_order
@@ -569,7 +569,7 @@ async function tryCutover(
         USING search_documents d
         LEFT JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
        WHERE p.document_id = d.id AND p.generation_id = $2 AND d.project_id = $1
-         AND (d.is_searchable = false OR p.stale = true OR p.revision <> d.desired_revision
+         AND (d.is_searchable = false OR p.is_stale = true OR p.revision <> d.desired_revision
               OR r.document_id IS NULL OR r.status = 'excluded')`,
       [input.project.id, input.targetGenerationId],
     );
