@@ -165,7 +165,7 @@ async function insertSearchRequest(input: {
   const requestId = input.requestId;
   await pool.query(
     `INSERT INTO search_requests
-       (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no,
+       (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no,
         trigger, status, outcome, search_action, policy_version, result, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'auto', 'completed', 'matched', 'new_search', $9, $10::jsonb, now(), now())`,
     [
@@ -200,7 +200,7 @@ async function insertRelation(sourceMessageId: string, targetMessageId: string, 
   const relationId = uuidv7();
   await pool.query(
     `INSERT INTO message_relations
-       (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, policy_version, evidence_ranges)
+       (id, from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, policy_version, evidence_ranges)
      VALUES ($1, $2, 1, $3, 1, $4, true, $5, '[]'::jsonb)`,
     [relationId, sourceMessageId, targetMessageId, relation, WORKER_POLICY_VERSION],
   );
