@@ -92,7 +92,7 @@ async function loadCachedEvaluation(
     `SELECT response_model AS "responseModel", answers
        FROM jev_evaluations
       WHERE company_id = $1 AND provider = $2 AND account_ref = $3 AND endpoint = $4
-        AND model = $5 AND confidence_threshold = $6 AND policy_version = $7 AND questions_version = $8 AND state_hash = $9
+        AND requested_model = $5 AND confidence_threshold = $6 AND policy_version = $7 AND questions_version = $8 AND state_hash = $9
         AND response_model IS NOT NULL`,
     [
       companyId,
@@ -121,9 +121,9 @@ async function saveCachedEvaluation(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO jev_evaluations
-       (id, company_id, provider, account_ref, endpoint, model, confidence_threshold, policy_version, questions_version, state_hash, answers, response_model)
+       (id, company_id, provider, account_ref, endpoint, requested_model, confidence_threshold, policy_version, questions_version, state_hash, answers, response_model)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
-     ON CONFLICT (company_id, provider, account_ref, endpoint, model, confidence_threshold, policy_version, questions_version, state_hash)
+     ON CONFLICT (company_id, provider, account_ref, endpoint, requested_model, confidence_threshold, policy_version, questions_version, state_hash)
      DO UPDATE SET answers = EXCLUDED.answers, response_model = EXCLUDED.response_model
      WHERE jev_evaluations.response_model IS NULL`,
     [
@@ -157,7 +157,7 @@ async function recordUsage(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO usage_events
-       (id, company_id, provider, account_ref, endpoint, operation, model, response_model, input_tokens, output_tokens, duration_ms, success, error_code)
+       (id, company_id, provider, account_ref, endpoint, operation, requested_model, response_model, input_tokens, output_tokens, duration_ms, success, error_code)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
     [
       uuidv7(),
@@ -294,18 +294,18 @@ async function applyAnalysis(
     }
     await client.query(
       `INSERT INTO message_analysis
-         (id, message_id, revision, policy_version, retention, primary_intent, technical_labels, decision_action,
-          continuity, statement_status, is_searchable, model_version, state_hash, parts)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14::jsonb)
+         (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+          continuity, statement_status, is_searchable, response_models, state_hash, parts)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14::jsonb)
        ON CONFLICT (message_id, revision, policy_version) DO UPDATE
-         SET retention = EXCLUDED.retention,
+         SET retention_category = EXCLUDED.retention_category,
              primary_intent = EXCLUDED.primary_intent,
              technical_labels = EXCLUDED.technical_labels,
              decision_action = EXCLUDED.decision_action,
              continuity = EXCLUDED.continuity,
              statement_status = EXCLUDED.statement_status,
              is_searchable = EXCLUDED.is_searchable,
-             model_version = EXCLUDED.model_version,
+             response_models = EXCLUDED.response_models,
              state_hash = EXCLUDED.state_hash,
              parts = EXCLUDED.parts,
              updated_at = now()`,
@@ -321,7 +321,7 @@ async function applyAnalysis(
         aggregate.continuity,
         aggregate.statementStatus,
         aggregate.isSearchable,
-        aggregate.modelVersion,
+        JSON.stringify(aggregate.responseModels),
         stateHash,
         JSON.stringify(aggregate.parts),
       ],
@@ -336,7 +336,7 @@ async function applyAnalysis(
       }
       await client.query(
         `INSERT INTO message_relations
-           (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, evidence_ranges, policy_version)
+           (id, from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, evidence_ranges, policy_version)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
          ON CONFLICT DO NOTHING`,
         [
@@ -402,7 +402,7 @@ async function findSearchRequestId(client: PoolClient, target: JobTarget): Promi
   const result = await client.query<{ id: string }>(
     `SELECT id
        FROM search_requests
-      WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
+      WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
     [target.messageId, target.targetRevision, WORKER_POLICY_VERSION],
   );
   return result.rows[0]?.id ?? null;
@@ -449,7 +449,7 @@ async function applyRouteDecision(
       await client.query(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, search_action = 'reuse',
-                stage = 'awaiting_reused_search', reused_from_request_id = $2, original_request_id = $2,
+                stage = 'awaiting_reused_search', reused_from_request_id = $2,
                 result = NULL, updated_at = now()
           WHERE id = $1`,
         [searchRequestId, reuse.originRequestId],
@@ -466,7 +466,7 @@ async function applyRouteDecision(
       await client.query(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, search_action = 'new_search',
-                stage = 'awaiting_search', condition_hash = $2, reused_from_request_id = NULL, original_request_id = NULL,
+                stage = 'awaiting_search', condition_hash = $2, reused_from_request_id = NULL,
                 result = NULL, updated_at = now()
           WHERE id = $1`,
         [searchRequestId, condition],
@@ -500,7 +500,7 @@ async function resetSearchForRetry(pool: Pool, target: JobTarget): Promise<void>
   await pool.query(
     `UPDATE search_requests
         SET status = 'pending', error_code = NULL, outcome = NULL, updated_at = now()
-      WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND status = 'failed'`,
+      WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto' AND status = 'failed'`,
     [target.messageId, target.targetRevision, WORKER_POLICY_VERSION],
   );
 }
@@ -635,7 +635,7 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
     await client.query(
       `UPDATE search_requests
           SET status = 'failed', error_code = $4, outcome = NULL, updated_at = now()
-        WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
+        WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
       [job.messageId, job.targetRevision, WORKER_POLICY_VERSION, code],
     );
     return;
@@ -658,9 +658,9 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
               FROM messages m
               JOIN sessions s ON s.id = m.session_id
               JOIN projects p ON p.id = s.project_id
-             WHERE m.id = sr.input_id
-               AND sr.input_id = $3
-               AND sr.input_revision = $4
+             WHERE m.id = sr.input_message_id
+               AND sr.input_message_id = $3
+               AND sr.input_message_revision = $4
                AND sr.input_sequence_no = m.sequence_no
                AND sr.session_id = m.session_id
                AND sr.employee_id = s.employee_id
@@ -812,12 +812,12 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
       const pinned = await client.query<{ embedding_generation_id: string | null; company_id: string }>(
         `SELECT sr.embedding_generation_id, p.company_id
            FROM search_requests sr
-           JOIN messages m ON m.id = sr.input_id
+           JOIN messages m ON m.id = sr.input_message_id
            JOIN sessions s ON s.id = m.session_id
            JOIN projects p ON p.id = s.project_id
           WHERE sr.id = $1
-            AND sr.input_id = $2
-            AND sr.input_revision = $3
+            AND sr.input_message_id = $2
+            AND sr.input_message_revision = $3
             AND sr.input_sequence_no = m.sequence_no
             AND sr.session_id = m.session_id
             AND sr.employee_id = s.employee_id
@@ -848,12 +848,12 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
       const scoped = await client.query(
         `SELECT 1
            FROM search_requests sr
-           JOIN messages m ON m.id = sr.input_id
+           JOIN messages m ON m.id = sr.input_message_id
            JOIN sessions s ON s.id = m.session_id
            JOIN projects p ON p.id = s.project_id
           WHERE sr.id = $1
-            AND sr.input_id = $2
-            AND sr.input_revision = $3
+            AND sr.input_message_id = $2
+            AND sr.input_message_revision = $3
             AND sr.input_sequence_no = m.sequence_no
             AND sr.session_id = m.session_id
             AND sr.employee_id = s.employee_id
@@ -884,7 +884,7 @@ export async function retryJob(pool: Pool, jobId: string, config: WorkerConfig):
       await client.query(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, stage = NULL, updated_at = now()
-          WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
+          WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
         [job.message_id, job.target_revision, WORKER_POLICY_VERSION],
       );
     } else if (job.kind === 'execute_search' && executeSearchRequestId !== null) {
