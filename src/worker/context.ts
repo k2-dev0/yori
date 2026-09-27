@@ -53,7 +53,6 @@ export interface PriorSearch {
   searchAction: string | null;
   policyVersion: string;
   reusedFromRequestId: string | null;
-  originalRequestId: string | null;
   expiresAt: Date | null;
   result: unknown;
   inputText: string | null;
@@ -98,15 +97,14 @@ interface PriorRow {
 
 interface PriorSearchRow {
   id: string;
-  input_id: string;
-  input_revision: number;
+  input_message_id: string;
+  input_message_revision: number;
   input_sequence_no: number;
   status: string;
   outcome: string | null;
   search_action: string | null;
   policy_version: string;
   reused_from_request_id: string | null;
-  original_request_id: string | null;
   expires_at: Date | null;
   result: unknown;
   input_text: string | null;
@@ -167,25 +165,24 @@ export async function loadPriorMessages(pool: Pool, target: JobTarget): Promise<
   }));
 }
 
-const PRIOR_SEARCH_SELECT = `SELECT sr.id, sr.input_id, sr.input_revision, sr.input_sequence_no, sr.status, sr.outcome, sr.search_action,
-            sr.policy_version, sr.reused_from_request_id, sr.original_request_id, sr.expires_at, sr.result,
+const PRIOR_SEARCH_SELECT = `SELECT sr.id, sr.input_message_id, sr.input_message_revision, sr.input_sequence_no, sr.status, sr.outcome,
+            sr.search_action, sr.policy_version, sr.reused_from_request_id, sr.expires_at, sr.result,
             r.text AS input_text, m.current_revision AS input_current_revision
        FROM search_requests sr
-       JOIN messages m ON m.id = sr.input_id
-       LEFT JOIN message_revisions r ON r.message_id = sr.input_id AND r.revision = sr.input_revision`;
+       JOIN messages m ON m.id = sr.input_message_id
+       LEFT JOIN message_revisions r ON r.message_id = sr.input_message_id AND r.revision = sr.input_message_revision`;
 
 function toPriorSearch(row: PriorSearchRow): PriorSearch {
   return {
     requestId: row.id,
-    inputId: row.input_id,
-    inputRevision: row.input_revision,
+    inputId: row.input_message_id,
+    inputRevision: row.input_message_revision,
     inputSequenceNo: row.input_sequence_no,
     status: row.status,
     outcome: row.outcome,
     searchAction: row.search_action,
     policyVersion: row.policy_version,
     reusedFromRequestId: row.reused_from_request_id,
-    originalRequestId: row.original_request_id,
     expiresAt: row.expires_at,
     result: row.result,
     inputText: row.input_text,
