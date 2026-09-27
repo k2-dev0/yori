@@ -154,7 +154,7 @@ describe('外部送信・障害', () => {
 
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, '承認済みなのに分析が保存されていない');
-      assert.equal(analysis.retention, 'substantive');
+      assert.equal(analysis.retention_category, 'substantive');
       assert.equal((await readJob(pool, jobId)).status, 'completed');
 
       const usageRows = await usageEventRows(pool, workspace.companyId);
@@ -274,7 +274,7 @@ describe('外部送信・障害', () => {
         const processing = processJob(pool, job, config);
         // 固定sleepで順序を偽証せず、renewalがlock待ちになったことを観測してから承認を失効させる。
         assert.ok(await waitForLeaseRenewalLockWait(), 'lease更新がjob rowのlock待ちにならない');
-        await pool.query('UPDATE provider_policy_approvals SET active = false WHERE company_id = $1 AND endpoint = $2', [
+        await pool.query('UPDATE provider_policy_approvals SET is_active = false WHERE company_id = $1 AND endpoint = $2', [
           workspace.companyId,
           config.apiUrl,
         ]);
@@ -313,11 +313,11 @@ describe('外部送信・障害', () => {
       const usage = await readUsageEvents(pool, workspace.companyId);
       const brokenRow = usage.find((row) => row.error_code === 'provider_contract_invalid');
       assert.ok(brokenRow, '契約不正のusageが記録されていない');
-      assert.equal(brokenRow.model, 'jev-latest', '要求modelを保持していない');
+      assert.equal(brokenRow.requested_model, 'jev-latest', '要求modelを保持していない');
       assert.equal(brokenRow.response_model, 'jev-broken-2', '検証失敗時に取得できた応答modelを記録していない');
       const unavailableRow = usage.find((row) => row.error_code === 'provider_unavailable');
       assert.ok(unavailableRow, '応答なし失敗のusageが記録されていない');
-      assert.equal(unavailableRow.model, 'jev-latest');
+      assert.equal(unavailableRow.requested_model, 'jev-latest');
       assert.equal(unavailableRow.response_model, null, '応答なし失敗で応答modelを埋めている');
     } finally {
       await server.close();
