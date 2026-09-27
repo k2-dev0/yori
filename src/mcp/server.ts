@@ -1,111 +1,35 @@
 import { McpServer, type CallToolResult } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
-import { EVENT_SOURCES, MAX_TEXT_LENGTH } from '../api/contract.js';
+import { MAX_TEXT_LENGTH } from '../api/contract.js';
 import { buildCaseReportText, caseReportWarnings } from './case-report.js';
 import { CentralApiClient, CentralApiError } from './central.js';
 import { loadMcpConfig, type McpConfig } from './config.js';
+import {
+  getEvidenceInputSchema,
+  getEvidenceToolOutputSchema,
+  getSearchResultInputSchema,
+  getSearchResultToolOutputSchema,
+  linkSessionInputSchema,
+  linkSessionToolOutputSchema,
+  recordCaseInputSchema,
+  recordCaseToolOutputSchema,
+  searchHistoryInputSchema,
+  searchHistoryToolOutputSchema,
+} from './schema.js';
 
 // M6のstdio MCPアダプター。stdoutはprotocol専用にし、診断はstderrだけへ出す。
 // 中央HTTP APIの結果をstructured contentとtextで返し、4xx/5xx・timeout・応答不正はtool errorにして
 // 空結果やno_matchへ変換しない。tokenはAuthorization以外へ出さない。
 
-const searchHistorySchema = z.strictObject({
-  project_id: z.uuid(),
-  input_id: z.uuid(),
-  input_revision: z.int().min(1).max(2_147_483_647),
-  query: z.string().min(1).max(65_536),
-  idempotency_key: z.string().min(1).max(512),
-  force_refresh: z.boolean(),
-});
-
-const getSearchResultSchema = z
-  .strictObject({
-    project_id: z.uuid(),
-    request_id: z.uuid().optional(),
-    wait_ms: z.int().min(0).max(5000).optional(),
-    input_id: z.uuid().optional(),
-    input_revision: z.int().min(1).max(2_147_483_647).optional(),
-    source: z.enum(EVENT_SOURCES).optional(),
-    source_scope: z.string().min(1).max(1024).optional(),
-    source_session_id: z.string().min(1).max(1024).optional(),
-    source_message_id: z.string().min(1).max(1024).optional(),
-    revision: z.int().min(1).max(2_147_483_647).optional(),
-  })
-  .refine(
-    (value) => {
-      const branchCount = [value.request_id, value.input_id, value.source].filter((item) => item !== undefined).length;
-      if (branchCount !== 1) {
-        return false;
-      }
-      if (value.request_id !== undefined) {
-        return value.input_id === undefined && value.input_revision === undefined && value.source === undefined;
-      }
-      if (value.input_id !== undefined) {
-        return value.input_revision !== undefined && value.source === undefined;
-      }
-      return (
-        value.source_scope !== undefined &&
-        value.source_session_id !== undefined &&
-        value.source_message_id !== undefined &&
-        value.revision !== undefined
-      );
-    },
-    { message: 'request_id、input_id+input_revision、外部identityのどれか1つだけを指定してください' },
-  );
-
-const getEvidenceSchema = z.strictObject({
-  project_id: z.uuid(),
-  message_id: z.uuid(),
-  revision: z.int().min(1).max(2_147_483_647),
-});
-
-// HTTP APIと同じstrict入力を公開する。identityと根拠revisionの組み合わせはSDKのschema検証に従う。
-const linkSessionIdentitySchema = z.strictObject({
-  source: z.enum(EVENT_SOURCES),
-  source_scope: z.string().min(1).max(1024),
-  source_session_id: z.string().min(1).max(1024),
-});
-
-const linkSessionSchema = z.strictObject({
-  project_id: z.uuid(),
-  idempotency_key: z.string().min(1).max(512),
-  from: linkSessionIdentitySchema,
-  to: linkSessionIdentitySchema,
-  evidence: linkSessionIdentitySchema.extend({
-    source_message_id: z.string().min(1).max(1024),
-    revision: z.int().min(1).max(2_147_483_647),
-  }),
-});
-
-const recordCaseSchema = z.strictObject({
-  project_id: z.uuid(),
-  idempotency_key: z.string().min(1).max(512),
-  source: z.enum(EVENT_SOURCES),
-  source_scope: z.string().min(1).max(1024),
-  source_session_id: z.string().min(1).max(1024),
-  source_message_id: z.string().min(1).max(1024),
-  sequence_no: z.int().min(1).max(2_147_483_647),
-  revision: z.int().min(1).max(2_147_483_647),
-  occurred_at: z.iso.datetime({ offset: true }),
-  problem: z.string().min(1).max(65_536),
-  cause: z.string().min(1).max(65_536).optional(),
-  investigation_steps: z.array(z.string().min(1).max(65_536)).max(50).optional(),
-  action: z.string().min(1).max(65_536),
-  failed_attempts: z.array(z.string().min(1).max(65_536)).max(50).optional(),
-  confirmation_status: z.string().min(1).max(65_536),
-  constraints: z.array(z.string().min(1).max(65_536)).max(50).optional(),
-  related_files_or_prs: z.array(z.string().min(1).max(65_536)).max(50).optional(),
-});
-
 function toolError(message: string): CallToolResult {
   return { isError: true, content: [{ type: 'text' as const, text: message }] };
 }
 
-// 成功は応答をそのままstructured contentとtextで返す。失敗は固定文言だけのtool errorにする。
-async function runTool(action: () => Promise<unknown>): Promise<CallToolResult> {
+// 最終値をtool出力schemaへ通してからstructured contentとtextで同値に返す。失敗は固定文言だけのtool errorにする。
+async function runTool<T>(outputSchema: z.ZodType<T>, action: () => Promise<unknown>): Promise<CallToolResult> {
   try {
-    const value = await action();
+    const value = outputSchema.parse(await action());
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(value) }],
       structuredContent: value as Record<string, unknown>,
@@ -121,33 +45,33 @@ function createServer(config: McpConfig): McpServer {
 
   server.registerTool(
     'search_history',
-    { description: '現在の入力ID・revisionを条件に保存済み会話を検索する', inputSchema: searchHistorySchema },
-    async (args) => runTool(() => client.searchHistory(args)),
+    { description: '現在の入力ID・revisionを条件に保存済み会話を検索する', inputSchema: searchHistoryInputSchema },
+    async (args) => runTool(searchHistoryToolOutputSchema, () => client.searchHistory(args)),
   );
   server.registerTool(
     'get_search_result',
     {
       description: 'request_idまたは現在入力のidentityで検索受付の状態と結果を取得する',
-      inputSchema: getSearchResultSchema,
+      inputSchema: getSearchResultInputSchema,
     },
-    async (args) => runTool(() => client.getSearchResult(args)),
+    async (args) => runTool(getSearchResultToolOutputSchema, () => client.getSearchResult(args)),
   );
   server.registerTool(
     'get_evidence',
-    { description: '保存済みの原文revisionを出典IDから取得する', inputSchema: getEvidenceSchema },
-    async (args) => runTool(() => client.getEvidence(args)),
+    { description: '保存済みの原文revisionを出典IDから取得する', inputSchema: getEvidenceInputSchema },
+    async (args) => runTool(getEvidenceToolOutputSchema, () => client.getEvidence(args)),
   );
   server.registerTool(
     'link_session',
     {
       description: '認証社員本人のsessionへの明示的な引き継ぎリンクを根拠発言付きで登録する',
-      inputSchema: linkSessionSchema,
+      inputSchema: linkSessionInputSchema,
     },
-    async (args) => runTool(() => client.linkSession(args)),
+    async (args) => runTool(linkSessionToolOutputSchema, () => client.linkSession(args)),
   );
   server.registerTool(
     'record_case',
-    { description: '問題・対応・確認状態を含む短い対応記録をagent_reportとして保存する', inputSchema: recordCaseSchema },
+    { description: '問題・対応・確認状態を含む短い対応記録をagent_reportとして保存する', inputSchema: recordCaseInputSchema },
     async (args) => {
       const text = buildCaseReportText(args);
       // 600文字超はwarningで受理するが、既存イベント本文上限を超える本文は中央APIへ送らずtool errorにする。
@@ -155,7 +79,7 @@ function createServer(config: McpConfig): McpServer {
         return toolError(`対応記録が本文上限${MAX_TEXT_LENGTH}文字を超えています`);
       }
       const warnings = caseReportWarnings(text);
-      return runTool(async () => {
+      return runTool(recordCaseToolOutputSchema, async () => {
         const response = await client.recordCase(args.project_id, {
           idempotency_key: args.idempotency_key,
           source: args.source,
