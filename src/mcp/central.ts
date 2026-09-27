@@ -1,57 +1,20 @@
 import { z } from 'zod';
+import {
+  evidenceResponseOutputSchema,
+  getEvidenceInputSchema,
+  getSearchResultInputSchema,
+  linkSessionInputSchema,
+  linkSessionOutputSchema,
+  recordCaseOutputSchema,
+  searchAcceptedOutputSchema,
+  searchHistoryInputSchema,
+  searchResultOutputSchema,
+} from './schema.js';
 
 // 中央HTTP APIの呼出し。tokenはAuthorizationだけに載せ、応答bodyや外部error bodyをtool結果・ログへ出さない。
 export class CentralApiError extends Error {}
 
-// 各toolが要求する最小の応答schema。未知fieldは保持したまま、identityと必須fieldだけを検証する。
-const searchHistoryResponseSchema = z.looseObject({ request_id: z.uuid() });
-
-const notReceivedResponseSchema = z.looseObject({ lookup_status: z.literal('not_received') });
-
-const searchViewResponseSchema = z.looseObject({
-  request_id: z.uuid(),
-  input_id: z.uuid(),
-  input_revision: z.int().min(1),
-  trigger: z.string(),
-  status: z.string(),
-  outcome: z.string().nullable(),
-  project_id: z.uuid(),
-});
-
-const searchResultResponseSchema = z.union([notReceivedResponseSchema, searchViewResponseSchema]);
-
-const evidenceResponseSchema = z.looseObject({
-  message_id: z.uuid(),
-  revision: z.int().min(1),
-  employee_id: z.uuid(),
-  role: z.string(),
-  occurred_at: z.string(),
-  text: z.string(),
-});
-
-// M7 link_sessionの成功応答。statusは公開APIのactiveだけを成功として受理する。
-const linkSessionResponseSchema = z.looseObject({
-  link_id: z.uuid(),
-  project_id: z.uuid(),
-  from_session_id: z.uuid(),
-  to_session_id: z.uuid(),
-  evidence_message_id: z.uuid(),
-  evidence_revision: z.int().min(1),
-  status: z.literal('active'),
-});
-
-const eventsResponseSchema = z.looseObject({
-  results: z
-    .array(
-      z.looseObject({
-        idempotency_key: z.string().min(1).max(512),
-        message_id: z.uuid(),
-        revision: z.int().min(1),
-        request_id: z.uuid().nullable(),
-      }),
-    )
-    .min(1),
-});
+// 応答schemaは./schema.tsの出力契約を正本にし、loose validationで追加fieldを保持する。
 
 function parseResponse<T extends z.ZodType>(schema: T, value: unknown): z.infer<T> {
   const parsed = schema.safeParse(value);
@@ -69,47 +32,11 @@ interface CentralApiOptions {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-export interface SearchHistoryInput {
-  project_id: string;
-  input_id: string;
-  input_revision: number;
-  query: string;
-  idempotency_key: string;
-  force_refresh: boolean;
-}
-
-export interface GetSearchResultInput {
-  project_id: string;
-  request_id?: string;
-  wait_ms?: number;
-  input_id?: string;
-  input_revision?: number;
-  source?: string;
-  source_scope?: string;
-  source_session_id?: string;
-  source_message_id?: string;
-  revision?: number;
-}
-
-export interface GetEvidenceInput {
-  project_id: string;
-  message_id: string;
-  revision: number;
-}
-
-export interface LinkSessionIdentity {
-  source: string;
-  source_scope: string;
-  source_session_id: string;
-}
-
-export interface LinkSessionInput {
-  project_id: string;
-  idempotency_key: string;
-  from: LinkSessionIdentity;
-  to: LinkSessionIdentity;
-  evidence: LinkSessionIdentity & { source_message_id: string; revision: number };
-}
+// tool入力の型は./schema.tsのZod schemaから推論し、handler引数とcentral clientの要求を一致させる。
+export type SearchHistoryInput = z.infer<typeof searchHistoryInputSchema>;
+export type GetSearchResultInput = z.infer<typeof getSearchResultInputSchema>;
+export type GetEvidenceInput = z.infer<typeof getEvidenceInputSchema>;
+export type LinkSessionInput = z.infer<typeof linkSessionInputSchema>;
 
 export interface RecordCaseEvent {
   idempotency_key: string;
@@ -128,7 +55,7 @@ export class CentralApiClient {
   constructor(private readonly options: CentralApiOptions) {}
 
   async searchHistory(input: SearchHistoryInput): Promise<unknown> {
-    return parseResponse(searchHistoryResponseSchema, await this.request('POST', '/v1/searches', input));
+    return parseResponse(searchAcceptedOutputSchema, await this.request('POST', '/v1/searches', input));
   }
 
   async getSearchResult(input: GetSearchResultInput): Promise<unknown> {
@@ -140,7 +67,7 @@ export class CentralApiClient {
       }
       const query = params.toString();
       const path = `/v1/searches/${input.request_id}${query === '' ? '' : `?${query}`}`;
-      const view = parseResponse(searchResultResponseSchema, await this.request('GET', path));
+      const view = parseResponse(searchResultOutputSchema, await this.request('GET', path));
       // request_id branchはproject_idをqueryへ送れないため、応答側の案件identityを入力と照合する。
       // 両案件memberでも別案件の受付を返さない。
       const responseProjectId = 'project_id' in view ? view.project_id : undefined;
@@ -163,16 +90,16 @@ export class CentralApiClient {
       params.set('source_message_id', input.source_message_id ?? '');
       params.set('revision', String(input.revision ?? 0));
     }
-    return parseResponse(searchResultResponseSchema, await this.request('GET', `/v1/searches/by-input?${params.toString()}`));
+    return parseResponse(searchResultOutputSchema, await this.request('GET', `/v1/searches/by-input?${params.toString()}`));
   }
 
   async getEvidence(input: GetEvidenceInput): Promise<unknown> {
     const params = new URLSearchParams({ project_id: input.project_id, revision: String(input.revision) });
-    return parseResponse(evidenceResponseSchema, await this.request('GET', `/v1/evidence/${input.message_id}?${params.toString()}`));
+    return parseResponse(evidenceResponseOutputSchema, await this.request('GET', `/v1/evidence/${input.message_id}?${params.toString()}`));
   }
 
   async linkSession(input: LinkSessionInput): Promise<unknown> {
-    const response = parseResponse(linkSessionResponseSchema, await this.request('POST', '/v1/session-links', input));
+    const response = parseResponse(linkSessionOutputSchema, await this.request('POST', '/v1/session-links', input));
     // 応答schemaだけでなく、要求した案件のlinkが返ったことを照合する。
     if (response.project_id.toLowerCase() !== input.project_id.toLowerCase()) {
       throw new CentralApiError('中央APIの応答project_idが入力と一致しません');
@@ -182,7 +109,7 @@ export class CentralApiClient {
 
   async recordCase(projectId: string, event: RecordCaseEvent): Promise<unknown> {
     const response = parseResponse(
-      eventsResponseSchema,
+      recordCaseOutputSchema,
       await this.request('POST', '/v1/events', { project_id: projectId, events: [event] }),
     );
     // 既存events APIの冪等identity確認と同じ責務。要求eventと一致しない応答を成功扱いしない。
