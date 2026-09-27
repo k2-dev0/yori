@@ -199,9 +199,10 @@ const searchViewOutputFields = {
   index_status: indexStatusOutputSchema.optional(),
 };
 
-// request_id branchはlookup_statusを持たない。not_received／foundの追加fieldとして誤受理しないよう排他にする。
+// GET /v1/searches/:id（request_id branch）はlookup_statusを持たない検索viewだけを返す。
+// found／not_receivedの追加fieldをrequest_id応答として誤受理しないよう排他にする。
 const searchViewOutputBaseSchema = z.looseObject(searchViewOutputFields);
-export const searchViewOutputSchema = searchViewOutputBaseSchema.refine(
+export const requestIdSearchViewOutputSchema = searchViewOutputBaseSchema.refine(
   (value) => value.lookup_status === undefined,
   { message: 'lookup_statusはfound／not_received branchだけが返します' },
 );
@@ -222,11 +223,14 @@ const foundSearchOutputSchema = z.looseObject({
   ...searchViewOutputFields,
 });
 
-// request_id branchはlookup_statusなしの検索viewを返す。foundを先に判定して分岐を保つ。
+// GET /v1/searches/by-inputはfoundの完全viewかnot_receivedだけを返す。lookup_statusなしviewは受理しない。
+export const byInputSearchLookupOutputSchema = z.union([notReceivedOutputSchema, foundSearchOutputSchema]);
+
+// tool最終出力はrequest_id／by-input両経路の正しい戻り値をunionで受け、foundを先に判定して分岐を保つ。
 export const searchResultOutputSchema = z.union([
   notReceivedOutputSchema,
   foundSearchOutputSchema,
-  searchViewOutputSchema,
+  requestIdSearchViewOutputSchema,
 ]);
 
 export const evidenceResponseOutputSchema = evidenceOutputSchema;
