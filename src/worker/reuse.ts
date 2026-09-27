@@ -64,8 +64,8 @@ async function evidenceReusable(pool: PoolClient, target: JobTarget, prior: Prio
     if (!row || row.project_id !== target.projectId || row.company_id !== target.companyId || row.current_revision !== item.revision) {
       return false;
     }
-    const analysis = await pool.query<{ retention: string; is_searchable: boolean }>(
-      `SELECT retention, is_searchable
+    const analysis = await pool.query<{ retention_category: string; is_searchable: boolean }>(
+      `SELECT retention_category, is_searchable
          FROM message_analysis
         WHERE message_id = $1 AND revision = $2
         ORDER BY created_at DESC
@@ -73,13 +73,13 @@ async function evidenceReusable(pool: PoolClient, target: JobTarget, prior: Prio
       [item.messageId, item.revision],
     );
     const latest = analysis.rows[0];
-    if (latest && (latest.retention === 'progress_only' || !latest.is_searchable)) {
+    if (latest && (latest.retention_category === 'progress_only' || !latest.is_searchable)) {
       return false;
     }
     const invalidated = await pool.query(
       `SELECT 1
          FROM message_relations
-        WHERE target_message_id = $1 AND target_revision = $2 AND relation IN ('revoke', 'change')
+        WHERE to_message_id = $1 AND to_message_revision = $2 AND relation IN ('revoke', 'change')
         LIMIT 1`,
       [item.messageId, item.revision],
     );
