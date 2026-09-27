@@ -119,8 +119,8 @@ interface LinkRow {
 }
 
 interface CorrectionRow {
-  source_message_id: string;
-  source_revision: number;
+  from_message_id: string;
+  from_message_revision: number;
   relation: string;
   message_id: string;
   revision: number;
@@ -198,17 +198,17 @@ async function loadCorrections(input: ExplorationInput): Promise<RelatedEvidence
     const next: Array<{ messageId: string; revision: number }> = [];
     for (const parent of frontier) {
       const rows = await input.pool.query<CorrectionRow>(
-        `SELECT r.source_message_id, r.source_revision, r.relation,
+        `SELECT r.from_message_id, r.from_message_revision, r.relation,
                 m.id AS message_id, m.current_revision AS revision, m.sequence_no, m.session_id,
                 s.employee_id, m.role, m.occurred_at, rev.text
            FROM message_relations r
-           JOIN messages m ON m.id = r.source_message_id
+           JOIN messages m ON m.id = r.from_message_id
            JOIN sessions s ON s.id = m.session_id
            JOIN projects p ON p.id = s.project_id
-           JOIN message_revisions rev ON rev.message_id = r.source_message_id AND rev.revision = r.source_revision
-          WHERE r.target_message_id = $1 AND r.target_revision = $2
+           JOIN message_revisions rev ON rev.message_id = r.from_message_id AND rev.revision = r.from_message_revision
+          WHERE r.to_message_id = $1 AND r.to_message_revision = $2
             AND r.relation IN ('change', 'revoke')
-            AND m.current_revision = r.source_revision
+            AND m.current_revision = r.from_message_revision
             AND s.project_id = $3 AND p.company_id = $4
             AND (m.session_id <> $5 OR m.sequence_no < $6)
           ORDER BY r.created_at, r.id`,
@@ -222,12 +222,12 @@ async function loadCorrections(input: ExplorationInput): Promise<RelatedEvidence
         ],
       );
       for (const row of rows.rows) {
-        const key = `${row.source_message_id}:${row.source_revision}`;
+        const key = `${row.from_message_id}:${row.from_message_revision}`;
         const relation: RelatedRelation = {
           relation: row.relation,
           relatedToMessageId: parent.messageId,
           relatedToRevision: parent.revision,
-          relationSourceRevision: row.source_revision,
+          relationSourceRevision: row.from_message_revision,
         };
         let draft = bySource.get(key);
         if (draft === undefined) {
@@ -239,7 +239,7 @@ async function loadCorrections(input: ExplorationInput): Promise<RelatedEvidence
           draft = draftOf(row, 'correction', { relations: [] });
           bySource.set(key, draft);
           drafts.push(draft);
-          next.push({ messageId: row.source_message_id, revision: row.source_revision });
+          next.push({ messageId: row.from_message_id, revision: row.from_message_revision });
         }
         const relations = draft.relations as RelatedRelation[];
         if (
@@ -835,8 +835,8 @@ export async function revalidateRelatedEvidence(
       for (const relation of draft.relations) {
         const found = await client.query(
           `SELECT 1 FROM message_relations
-            WHERE source_message_id = $1 AND source_revision = $2
-              AND target_message_id = $3 AND target_revision = $4 AND relation = $5
+            WHERE from_message_id = $1 AND from_message_revision = $2
+              AND to_message_id = $3 AND to_message_revision = $4 AND relation = $5
             FOR SHARE`,
           [
             draft.messageId,
