@@ -75,8 +75,8 @@ export async function ingestEvents(pool: Pool, auth: AuthContext, request: Event
 interface StoredReceipt {
   request_hash: Buffer;
   message_id: string;
-  revision: number;
-  request_id: string | null;
+  message_revision: number;
+  search_request_id: string | null;
 }
 
 interface StoredMessage {
@@ -91,7 +91,7 @@ interface StoredMessage {
 async function applyEvent(client: PoolClient, auth: AuthContext, projectId: string, event: ParsedEvent): Promise<EventResult> {
   const requestHash = receiptHash({ companyId: auth.companyId, employeeId: auth.employeeId, projectId, event });
   const storedReceipt = await client.query<StoredReceipt>(
-    `SELECT request_hash, message_id, revision, request_id
+    `SELECT request_hash, message_id, message_revision, search_request_id
        FROM event_receipts
       WHERE company_id = $1 AND employee_id = $2 AND idempotency_key = $3`,
     [auth.companyId, auth.employeeId, event.idempotency_key],
@@ -104,8 +104,8 @@ async function applyEvent(client: PoolClient, auth: AuthContext, projectId: stri
     return {
       idempotency_key: event.idempotency_key,
       message_id: receipt.message_id,
-      revision: receipt.revision,
-      request_id: receipt.request_id,
+      revision: receipt.message_revision,
+      request_id: receipt.search_request_id,
     };
   }
 
@@ -153,7 +153,7 @@ async function applyEvent(client: PoolClient, auth: AuthContext, projectId: stri
   }
 
   await client.query(
-    `INSERT INTO event_receipts (id, company_id, employee_id, project_id, idempotency_key, request_hash, message_id, revision, request_id)
+    `INSERT INTO event_receipts (id, company_id, employee_id, project_id, idempotency_key, request_hash, message_id, message_revision, search_request_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [uuidv7(), auth.companyId, auth.employeeId, projectId, event.idempotency_key, requestHash, messageId, event.revision, requestId],
   );
@@ -161,12 +161,13 @@ async function applyEvent(client: PoolClient, auth: AuthContext, projectId: stri
   return { idempotency_key: event.idempotency_key, message_id: messageId, revision: event.revision, request_id: requestId };
 }
 
-// source_scopeは会社・社員・クライアントscopeを前置きで名前空間化し、別社員の同名sessionを統合しない。
+// 公開fieldのsource_scopeは会社・社員・クライアントscopeを前置きで名前空間化してDBのsource_namespaceへ保存し、
+// 別社員の同名sessionを統合しない。
 async function resolveSession(client: PoolClient, auth: AuthContext, projectId: string, event: ParsedEvent): Promise<string> {
-  const sourceScope = `v1|${auth.companyId}|${auth.employeeId}|${event.source_scope}`;
+  const sourceNamespace = `v1|${auth.companyId}|${auth.employeeId}|${event.source_scope}`;
   const existing = await client.query<{ id: string; project_id: string }>(
-    'SELECT id, project_id FROM sessions WHERE source = $1 AND source_scope = $2 AND source_session_id = $3',
-    [event.source, sourceScope, event.source_session_id],
+    'SELECT id, project_id FROM sessions WHERE source = $1 AND source_namespace = $2 AND source_session_id = $3',
+    [event.source, sourceNamespace, event.source_session_id],
   );
   const session = existing.rows[0];
   if (session) {
@@ -177,9 +178,9 @@ async function resolveSession(client: PoolClient, auth: AuthContext, projectId: 
   }
   const id = uuidv7();
   await client.query(
-    `INSERT INTO sessions (id, project_id, employee_id, source, source_scope, source_session_id, started_at)
+    `INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [id, projectId, auth.employeeId, event.source, sourceScope, event.source_session_id, new Date(event.occurred_at)],
+    [id, projectId, auth.employeeId, event.source, sourceNamespace, event.source_session_id, new Date(event.occurred_at)],
   );
   return id;
 }
@@ -241,7 +242,7 @@ async function resolveAutoSearchRequest(
   const existing = await client.query<{ id: string }>(
     `SELECT id
        FROM search_requests
-      WHERE input_id = $1 AND input_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
+      WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
     [messageId, event.revision, AUTO_SEARCH_POLICY_VERSION],
   );
   const request = existing.rows[0];
@@ -250,7 +251,8 @@ async function resolveAutoSearchRequest(
   }
   const id = uuidv7();
   await client.query(
-    `INSERT INTO search_requests (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger, policy_version)
+    `INSERT INTO search_requests
+       (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no, trigger, policy_version)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'auto', $9)`,
     [id, auth.companyId, projectId, auth.employeeId, sessionId, messageId, event.revision, event.sequence_no, AUTO_SEARCH_POLICY_VERSION],
   );
