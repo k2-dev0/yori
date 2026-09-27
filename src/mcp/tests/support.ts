@@ -40,6 +40,7 @@ interface JsonRpcMessage {
 
 export interface McpToolDefinition {
   name: string;
+  description?: unknown;
   inputSchema?: unknown;
 }
 
@@ -149,9 +150,11 @@ export class McpSession {
 
   async listTools(timeoutMs = 8_000): Promise<McpToolDefinition[]> {
     const result = await this.request('tools/list', {}, timeoutMs);
-    const tools = (result as { tools?: Array<{ name?: unknown; inputSchema?: unknown }> } | undefined)?.tools ?? [];
+    const tools =
+      (result as { tools?: Array<{ name?: unknown; description?: unknown; inputSchema?: unknown }> } | undefined)?.tools ?? [];
     return tools.map((tool) => ({
       name: typeof tool.name === 'string' ? tool.name : '',
+      description: tool.description,
       inputSchema: tool.inputSchema,
     }));
   }
