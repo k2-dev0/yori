@@ -1,3 +1,5 @@
+import type { ErrorBody, ErrorCode, EventResult, EventsResponse } from './response-schema.js';
+
 // M1で確定したイベント受付の契約。API実装とテストで共有する。
 export const MAX_EVENT_BODY_BYTES = 1_048_576;
 export const MIN_BATCH_SIZE = 1;
@@ -33,23 +35,8 @@ export interface EventsRequestBody {
   events: EventInput[];
 }
 
-export interface EventResult {
-  idempotency_key: string;
-  message_id: string;
-  revision: number;
-  request_id: string | null;
-}
-
-export interface EventsResponse {
-  results: EventResult[];
-}
-
-export interface ErrorBody {
-  error: {
-    code: string;
-    message?: string;
-  };
-}
+// 公開応答の型はresponse-schema.tsのZod schemaを正本にし、既存import名だけを維持する。
+export type { ErrorBody, ErrorCode, EventResult, EventsResponse };
 
 // event_receipts.request_hash のcanonical JSONはこのキー順で固定する。
 // occurred_at は受信したISO文字列をそのまま使う。
