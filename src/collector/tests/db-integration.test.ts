@@ -92,13 +92,13 @@ describeWithDatabase('collector → 既存APIの縦通し (DATABASE_URL必須)',
           ['assistant', 2, 'item-assistant', '回答本文'],
         ],
       );
-      const sessionRow = await pool.query<{ source: string; source_scope: string; source_session_id: string }>(
-        'SELECT source, source_scope, source_session_id FROM sessions',
+      const sessionRow = await pool.query<{ source: string; source_namespace: string; source_session_id: string }>(
+        'SELECT source, source_namespace, source_session_id FROM sessions',
       );
       assert.equal(sessionRow.rows.length, 1);
       assert.equal(sessionRow.rows[0].source, 'codex');
-      // 既存APIはsource_scopeへ会社・社員の前置きを付けて保存する（src/api/events.ts）。
-      assert.equal(sessionRow.rows[0].source_scope, `v1|${workspace.companyId}|${workspace.employeeId}|github.test/Org/Repo`);
+      // 既存APIはsource_namespaceへ会社・社員の前置きを付けて保存する（src/api/events.ts）。
+      assert.equal(sessionRow.rows[0].source_namespace, `v1|${workspace.companyId}|${workspace.employeeId}|github.test/Org/Repo`);
       assert.equal(sessionRow.rows[0].source_session_id, 'session-db');
       assert.equal(await countRows(pool, 'search_requests'), 1, 'user発言の自動検索受付が保存されていない');
 
