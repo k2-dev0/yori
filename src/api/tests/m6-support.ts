@@ -94,8 +94,8 @@ export interface SearchRequestRow {
   project_id: string;
   employee_id: string;
   session_id: string;
-  input_id: string;
-  input_revision: number;
+  input_message_id: string;
+  input_message_revision: number;
   input_sequence_no: number;
   trigger: string;
   status: string;
@@ -104,7 +104,6 @@ export interface SearchRequestRow {
   stage: string | null;
   policy_version: string;
   reused_from_request_id: string | null;
-  original_request_id: string | null;
   result: unknown;
   error_code: string | null;
   created_at: Date;
@@ -142,7 +141,6 @@ export interface SearchRequestPatch {
   result?: unknown;
   errorCode?: string | null;
   reusedFromRequestId?: string | null;
-  originalRequestId?: string | null;
   expiresAt?: Date | null;
 }
 
@@ -154,7 +152,6 @@ const PATCH_COLUMNS = {
   result: 'result',
   errorCode: 'error_code',
   reusedFromRequestId: 'reused_from_request_id',
-  originalRequestId: 'original_request_id',
   expiresAt: 'expires_at',
 } as const satisfies Record<keyof SearchRequestPatch, string>;
 
