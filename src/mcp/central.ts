@@ -1,14 +1,15 @@
 import { z } from 'zod';
 import {
+  byInputSearchLookupOutputSchema,
   evidenceResponseOutputSchema,
   getEvidenceInputSchema,
   getSearchResultInputSchema,
   linkSessionInputSchema,
   linkSessionOutputSchema,
   recordCaseOutputSchema,
+  requestIdSearchViewOutputSchema,
   searchAcceptedOutputSchema,
   searchHistoryInputSchema,
-  searchResultOutputSchema,
 } from './schema.js';
 
 // 中央HTTP APIの呼出し。tokenはAuthorizationだけに載せ、応答bodyや外部error bodyをtool結果・ログへ出さない。
@@ -67,11 +68,11 @@ export class CentralApiClient {
       }
       const query = params.toString();
       const path = `/v1/searches/${input.request_id}${query === '' ? '' : `?${query}`}`;
-      const view = parseResponse(searchResultOutputSchema, await this.request('GET', path));
+      // request_id branchはlookup_statusなしviewだけを受理する。
+      const view = parseResponse(requestIdSearchViewOutputSchema, await this.request('GET', path));
       // request_id branchはproject_idをqueryへ送れないため、応答側の案件identityを入力と照合する。
       // 両案件memberでも別案件の受付を返さない。
-      const responseProjectId = 'project_id' in view ? view.project_id : undefined;
-      if (typeof responseProjectId !== 'string' || responseProjectId.toLowerCase() !== input.project_id.toLowerCase()) {
+      if (view.project_id.toLowerCase() !== input.project_id.toLowerCase()) {
         throw new CentralApiError('中央APIの応答project_idが入力と一致しません');
       }
       return view;
@@ -90,7 +91,8 @@ export class CentralApiClient {
       params.set('source_message_id', input.source_message_id ?? '');
       params.set('revision', String(input.revision ?? 0));
     }
-    return parseResponse(searchResultOutputSchema, await this.request('GET', `/v1/searches/by-input?${params.toString()}`));
+    // by-input branchはfoundの完全viewかnot_receivedだけを受理する。
+    return parseResponse(byInputSearchLookupOutputSchema, await this.request('GET', `/v1/searches/by-input?${params.toString()}`));
   }
 
   async getEvidence(input: GetEvidenceInput): Promise<unknown> {
