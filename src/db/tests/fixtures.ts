@@ -108,7 +108,7 @@ export interface SessionRowInput {
 export async function insertSession(pool: Pool, input: SessionRowInput): Promise<string> {
   const id = uuidv7();
   await pool.query(
-    `INSERT INTO sessions (id, project_id, employee_id, source, source_scope, source_session_id, started_at)
+    `INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [
       id,
