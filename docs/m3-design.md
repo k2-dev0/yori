@@ -44,15 +44,15 @@ workerはroute laneとclassify lane各1、合計2を上限にし、同時に1job
 
 有効期間は初期10分。pending/runningも共有可能。completedはmatchedのみでexpires_at内。failed/expired/skipped/no_match、対象不明、失効はnew_search。matchedの`result.matches[].evidence[]`を計画10.3に従い検証し、原文revisionが現行・同案件、最新分析がprogress_onlyでないことと、採用済みrevoke/change関係による無効化がないことを確認する。不明な結果形式・根拠なしは再利用しない。M5以降も取得時に権限/根拠再検証が必要。
 
-new_searchは条件hash（会社/案件/社員/session、原文質問、文脈hash、policy）と段階awaiting_searchを保存しexecute_searchをenqueue。受付はpendingのまま。reuseは先行request参照とoriginal_request_id・現在input_idを保持し段階awaiting_reused_search、既存結果を別入力の新規結果としてコピーしない。skipはcompleted/skipped。振り分け後の後続検索・再利用元完了追跡・MCP取得はM5/M6。
+new_searchは条件hash（会社/案件/社員/session、原文質問、文脈hash、policy）と段階awaiting_searchを保存しexecute_searchをenqueue。受付はpendingのまま。reuseは先行request参照`reused_from_request_id`（旧`original_request_id`はCOALESCE(original, reused)で統合）と現在`input_message_id`を保持し段階awaiting_reused_search、既存結果を別入力の新規結果としてコピーしない。skipはcompleted/skipped。振り分け後の後続検索・再利用元完了追跡・MCP取得はM5/M6。
 
 ## ポリシー・失敗・運用
 
-`provider_policy_approvals`はcompany、provider、account参照、endpoint完全一致、規約URL/確認日、学習不使用、保持条件、設定確認時刻/確認者、activeを保持。credentialは保存しない。学習確認は管理者の申告記録であり提供元の設定を変更/証明しない。各HTTP送信直前にDBから承認を確認する（part・再試行も同じ）。未承認はblocked_policy、検索はfailed/provider_policy_unverified、原文保持。無設定なら偽の分類に進まず停止する。redirectは拒否し承認外endpointへ資格情報/本文を送らない。
+`provider_policy_approvals`はcompany、provider、account参照、endpoint完全一致、規約URL/確認日、`training_disabled`（学習不使用）、保持条件、設定確認時刻/確認者、`is_active`を保持。credentialは保存しない。学習確認は管理者の申告記録であり提供元の設定を変更/証明しない。各HTTP送信直前にDBから承認を確認する（part・再試行も同じ）。未承認はblocked_policy、検索はfailed/provider_policy_unverified、原文保持。無設定なら偽の分類に進まず停止する。redirectは拒否し承認外endpointへ資格情報/本文を送らない。
 
 接続設定はJEV_API_KEY、JEV_ACCOUNT_REF、JEV_API_URL（既定公式HTTPS）、JEV_MODELとworker予算/timeout/閾値。合成fixtureのloopback HTTP endpointをテストで利用できるが、本番の非loopback HTTPは拒否。自動fallback先なし。
 
-`usage_events`はcompany、provider/account/endpoint、operation、model、実usage（不明はnull）、外部所要時間、成功/エラーを記録する。ログに原文・key・外部error bodyを出さない。DB適用時間も本文なしで計測する。429/529/5xx/timeout/通信障害は既存バックオフ/Retry-After、401/422/応答契約不正はfailed。検索受付は障害中failedとcodeを持ち、明示retryまたは自動再試行着手時にpendingへ戻す。no_matchにしない。
+`usage_events`はcompany、provider/account/endpoint、operation、`requested_model`、実usage（不明はnull）、外部所要時間、成功/エラーを記録する。ログに原文・key・外部error bodyを出さない。DB適用時間も本文なしで計測する。429/529/5xx/timeout/通信障害は既存バックオフ/Retry-After、401/422/応答契約不正はfailed。検索受付は障害中failedとcodeを持ち、明示retryまたは自動再試行着手時にpendingへ戻す。no_matchにしない。
 
 CLIはworker起動、指定jobのfailed/blocked_policyからの明示retry、承認登録/失効。承認はJSONファイルからZod検証して登録し、資格情報を引数に含めない。retryは先に承認を確認し検索受付も同一TXで戻す。運用手順に実データ送信前の確認、別account/endpointへの承認非継承、M4/M5待ちの見分けを記す。
 
@@ -76,7 +76,7 @@ CLIはworker起動、指定jobのfailed/blocked_policyからの明示retry、承
 - 外部評価後、保存TX内で比較対象の受付を同じIDで読み直し、評価した入力revisionの有効性を確認する。chain終端はnew_search確定済みに限定し、検索要否未判定のpending受付は再利用しない。chainの各受付・元入力へ共有行ロックを取り、参照の保存とjob完了のcommitまで保持する。イベント受付と同じ会社・社員単位のadvisory lockを行ロックより先に取得し、batch改訂とのロック順逆転を防ぐ。HTTP待ち中はこれらのロックを保持しない。
 - lease更新等のDB待機後、HTTP送信直前にも有効な送信承認を確認する。外部待機中にDB lockは保持しない。
 - ワーカー待機はタイマー満了・停止通知の両経路でtimer/listenerを解放する。
-- 設定modelはcache照合に保持し、応答modelは別途cache・usage・各partへ記録する。analysisのmodel_versionは応答modelが全part同一ならその値、混在なら重複除去した応答modelのJSON配列文字列とする。過去cacheで応答modelが不明なものは再利用せず再評価する。追加migrationで既存データを保持する。
+- 設定modelはcache照合に保持し、応答modelは別途cache・usage・各partへ記録する。`message_analysis.response_models`は応答modelを重複除去した出現順のjsonb文字列配列とし、旧`model_version`の空文字は`[]`、通常の単一model名は1要素配列、JSON配列文字列はその配列へ移行する。partごとの応答modelも`parts[].response_model`へ保存し、他のkeyは維持する。過去cacheで応答modelが不明なものは再利用せず再評価する。追加migrationで既存データを保持する。
 - 保留事項2：成功ヘッダー受信後の本文受信中のtimeout/通信切断は、現在provider_contract_invalidとして恒久失敗になる。原文は残り、明示retryで回復できる。今回この挙動は変更しない。
 - 再レビューで追加された「同じ関係を示す複数partの根拠範囲が最初の1件だけになる」「正常応答の所要時間に本文受信時間が含まれない」は、ユーザー指定の今回の修正対象から外す。
 - 再取得後から保存までの先行入力改訂は、上記の保存TXへ検証を移して対処した。実DBのロック待ちを観測する4回帰ケース（直接/chain × 改訂先行/保存先行）を追加し、修正前に4件失敗、修正後に成功を確認。改訂が先に確定した場合はnew_searchへ戻し、再利用の確定が先なら改訂はcommitまで待つ。保存後に行われる改訂についてはM5/M6の結果取得時にも再検証が必要。
