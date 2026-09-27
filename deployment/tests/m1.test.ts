@@ -28,7 +28,7 @@ function insertWorkspaceSql(): string {
 function insertMessageSql(messageId: string): string {
   const contentHash = createHash('sha256').update(RAW_TEXT, 'utf8').digest('hex');
   return `
-    INSERT INTO sessions (id, project_id, employee_id, source, source_scope, source_session_id, started_at)
+    INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
       VALUES ('${SESSION_ID}', '${PROJECT_ID}', '${EMPLOYEE_ID}', 'codex', 'e2e-scope', 'e2e-session', '2026-09-21T01:00:00Z');
     INSERT INTO messages (id, session_id, source_message_id, sequence_no, role, occurred_at, current_revision)
       VALUES ('${messageId}', '${SESSION_ID}', 'e2e-msg', 1, 'user', '2026-09-21T01:00:00Z', 1);
