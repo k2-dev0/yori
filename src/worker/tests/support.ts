@@ -331,7 +331,7 @@ export async function seedSearchRequest(pool: Pool, input: SearchRequestSeed): P
   const id = uuidv7();
   await pool.query(
     `INSERT INTO search_requests
-       (id, company_id, project_id, employee_id, session_id, input_id, input_revision, input_sequence_no, trigger,
+       (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no, trigger,
         status, outcome, search_action, policy_version, question, reused_from_request_id, result, created_at, updated_at, expires_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $17, $18)`,
     [
@@ -427,11 +427,11 @@ export interface StoredAnalysisPart {
   length: number;
   text?: string;
   retention?: string;
-  model_version?: string;
+  response_model?: string;
 }
 
 export interface StoredAnalysis {
-  retention: string;
+  retention_category: string;
   primary_intent: string;
   technical_labels: string[];
   decision_action: string;
@@ -439,7 +439,7 @@ export interface StoredAnalysis {
   statement_status: string;
   is_searchable: boolean;
   policy_version: string;
-  model_version: string;
+  response_models: string[];
   state_hash: Buffer;
   parts: StoredAnalysisPart[];
 }
@@ -447,8 +447,8 @@ export interface StoredAnalysis {
 export async function readAnalysis(pool: Pool, messageId: string, revision: number): Promise<StoredAnalysis | undefined> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredAnalysis>(
-    `SELECT retention, primary_intent, technical_labels, decision_action, continuity, statement_status,
-            is_searchable, policy_version, model_version, state_hash, parts
+    `SELECT retention_category, primary_intent, technical_labels, decision_action, continuity, statement_status,
+            is_searchable, policy_version, response_models, state_hash, parts
        FROM message_analysis WHERE message_id = $1 AND revision = $2 AND policy_version = $3`,
     [messageId, revision, WORKER_POLICY_VERSION],
   );
@@ -464,10 +464,10 @@ export async function countAnalysis(pool: Pool, messageId?: string): Promise<num
 }
 
 export interface StoredRelation {
-  source_message_id: string;
-  source_revision: number;
-  target_message_id: string;
-  target_revision: number;
+  from_message_id: string;
+  from_message_revision: number;
+  to_message_id: string;
+  to_message_revision: number;
   relation: string;
   is_explicit: boolean;
   policy_version: string;
@@ -476,8 +476,8 @@ export interface StoredRelation {
 export async function readRelations(pool: Pool, sourceMessageId: string, sourceRevision: number): Promise<StoredRelation[]> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredRelation>(
-    `SELECT source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, policy_version
-       FROM message_relations WHERE source_message_id = $1 AND source_revision = $2`,
+    `SELECT from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, policy_version
+       FROM message_relations WHERE from_message_id = $1 AND from_message_revision = $2`,
     [sourceMessageId, sourceRevision],
   );
   return result.rows;
@@ -496,7 +496,7 @@ export async function seedRelation(
   await assertM3Tables(pool);
   await pool.query(
     `INSERT INTO message_relations
-       (id, source_message_id, source_revision, target_message_id, target_revision, relation, is_explicit, policy_version, evidence_ranges)
+       (id, from_message_id, from_message_revision, to_message_id, to_message_revision, relation, is_explicit, policy_version, evidence_ranges)
      VALUES ($1, $2, $3, $4, $5, $6, true, $7, '[]'::jsonb)`,
     [uuidv7(), input.sourceMessageId, input.sourceRevision, input.targetMessageId, input.targetRevision, input.relation, WORKER_POLICY_VERSION],
   );
@@ -517,7 +517,7 @@ export async function seedApproval(pool: Pool, input: ApprovalSeed): Promise<str
   const id = uuidv7();
   await pool.query(
     `INSERT INTO provider_policy_approvals
-       (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, learning_disabled, retention_terms, confirmed_by, confirmed_at, active)
+       (id, company_id, provider, account_ref, endpoint, terms_url, terms_checked_at, training_disabled, retention_terms, confirmed_by, confirmed_at, is_active)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       id,
@@ -549,7 +549,7 @@ export async function usageEventRows(pool: Pool, companyId: string): Promise<str
 
 export interface StoredUsageEvent {
   operation: string;
-  model: string;
+  requested_model: string;
   response_model: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -561,7 +561,7 @@ export interface StoredUsageEvent {
 export async function readUsageEvents(pool: Pool, companyId: string): Promise<StoredUsageEvent[]> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredUsageEvent>(
-    `SELECT operation, model, response_model, input_tokens, output_tokens, success, error_code
+    `SELECT operation, requested_model, response_model, input_tokens, output_tokens, success, error_code
        FROM usage_events WHERE company_id = $1 ORDER BY created_at, id`,
     [companyId],
   );
@@ -569,7 +569,7 @@ export async function readUsageEvents(pool: Pool, companyId: string): Promise<St
 }
 
 export interface StoredEvaluation {
-  model: string;
+  requested_model: string;
   response_model: string | null;
   answers: Record<string, unknown>;
   state_hash: Buffer;
@@ -579,7 +579,7 @@ export interface StoredEvaluation {
 export async function readEvaluations(pool: Pool, companyId: string): Promise<StoredEvaluation[]> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredEvaluation>(
-    `SELECT model, response_model, answers, state_hash
+    `SELECT requested_model, response_model, answers, state_hash
        FROM jev_evaluations WHERE company_id = $1 ORDER BY created_at, id`,
     [companyId],
   );
