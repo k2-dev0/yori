@@ -1,7 +1,7 @@
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { z } from 'zod';
-import { MAX_EVENT_BODY_BYTES, type ErrorBody } from './contract.js';
+import { MAX_EVENT_BODY_BYTES, type ErrorBody, type ErrorCode } from './contract.js';
 import { authenticate, EventConflictError, ingestEvents, isProjectMember } from './events.js';
 import {
   createSearch,
@@ -12,6 +12,17 @@ import {
   SearchNotFoundError,
   SearchTargetError,
 } from './searches.js';
+import {
+  errorResponseSchema,
+  eventsResponseSchema,
+  evidenceResponseSchema,
+  healthLiveResponseSchema,
+  healthReadyResponseSchema,
+  searchAcceptedResponseSchema,
+  searchLookupResponseSchema,
+  searchViewResponseSchema,
+  sessionLinkResponseSchema,
+} from './response-schema.js';
 import {
   eventsRequestSchema,
   evidenceQuerySchema,
@@ -37,15 +48,15 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     void reply.code(statusCode).send(errorBody(errorCodeForStatus(statusCode)));
   });
 
-  app.get('/health/live', async (_request, reply) => reply.code(200).send({ status: 'ok' }));
+  app.get('/health/live', async (_request, reply) => reply.code(200).send(healthLiveResponseSchema.parse({ status: 'ok' })));
 
   app.get('/health/ready', async (_request, reply) => {
     try {
       await deps.pool.query('SELECT 1');
-      return reply.code(200).send({ status: 'ready' });
+      return reply.code(200).send(healthReadyResponseSchema.parse({ status: 'ready' }));
     } catch {
       // DB等の依存が落ちていても受付可否だけを返し、接続情報やSQLは出さない。
-      return reply.code(503).send({ status: 'unavailable' });
+      return reply.code(503).send(healthReadyResponseSchema.parse({ status: 'unavailable' }));
     }
   });
 
@@ -62,7 +73,7 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
       return reply.code(403).send(errorBody('forbidden'));
     }
     try {
-      return reply.code(202).send(await ingestEvents(deps.pool, auth, parsed.data));
+      return reply.code(202).send(eventsResponseSchema.parse(await ingestEvents(deps.pool, auth, parsed.data)));
     } catch (error) {
       if (error instanceof EventConflictError || isUniqueViolation(error)) {
         return reply.code(409).send(errorBody('conflict'));
@@ -86,7 +97,7 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     }
     try {
       const created = await createSearch(deps.pool, auth, parsed.data);
-      return reply.code(created.reused ? 200 : 202).send({ request_id: created.requestId });
+      return reply.code(created.reused ? 200 : 202).send(searchAcceptedResponseSchema.parse({ request_id: created.requestId }));
     } catch (error) {
       if (error instanceof SearchConflictError || isUniqueViolation(error)) {
         return reply.code(409).send(errorBody('conflict'));
@@ -116,7 +127,7 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     }
     try {
       const created = await createSessionLink(deps.pool, auth, parsed.data);
-      return reply.code(created.statusCode).send(created.response);
+      return reply.code(created.statusCode).send(sessionLinkResponseSchema.parse(created.response));
     } catch (error) {
       if (error instanceof SessionLinkNotFoundError) {
         return reply.code(404).send(errorBody('not_found'));
@@ -144,7 +155,8 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
-    return reply.code(200).send(await lookupSearchByInput(deps.pool, auth, parsed.data, parsed.data.wait_ms ?? 0));
+    const view = await lookupSearchByInput(deps.pool, auth, parsed.data, parsed.data.wait_ms ?? 0);
+    return reply.code(200).send(searchLookupResponseSchema.parse(view));
   });
 
   // request IDの結果取得は同一会社・案件membershipだけを返し、他案件の存在を開示しない。
@@ -162,7 +174,8 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
       return reply.code(400).send(errorBody('invalid_request'));
     }
     try {
-      return reply.code(200).send(await readSearch(deps.pool, auth, id.data.toLowerCase(), parsed.data.wait_ms ?? 0));
+      const view = await readSearch(deps.pool, auth, id.data.toLowerCase(), parsed.data.wait_ms ?? 0);
+      return reply.code(200).send(searchViewResponseSchema.parse(view));
     } catch (error) {
       if (error instanceof SearchNotFoundError) {
         return reply.code(404).send(errorBody('not_found'));
@@ -192,14 +205,14 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     if (evidence === null) {
       return reply.code(404).send(errorBody('not_found'));
     }
-    return reply.code(200).send(evidence);
+    return reply.code(200).send(evidenceResponseSchema.parse(evidence));
   });
 
   return app;
 }
 
 // HTTP statusから利用側が分岐に使う固定code文字列を選ぶ。
-function errorCodeForStatus(statusCode: number): string {
+function errorCodeForStatus(statusCode: number): ErrorCode {
   if (statusCode === 400) return 'invalid_request';
   if (statusCode === 401) return 'unauthorized';
   if (statusCode === 403) return 'forbidden';
@@ -208,9 +221,9 @@ function errorCodeForStatus(statusCode: number): string {
   return 'internal_error';
 }
 
-// 応答のエラー本文はcodeだけにし、内部メッセージを含めない。
-function errorBody(code: string): ErrorBody {
-  return { error: { code } };
+// 応答のエラー本文は公開response schemaへ通し、code以外のfieldを追加しない。
+function errorBody(code: ErrorCode): ErrorBody {
+  return errorResponseSchema.parse({ error: { code } });
 }
 
 // PostgreSQLの一意制約違反だけを409候補として判定する。
