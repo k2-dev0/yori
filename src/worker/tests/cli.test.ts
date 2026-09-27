@@ -91,12 +91,13 @@ describe('worker CLI', () => {
         }),
       );
       assert.equal(await runCli(['approve', approvalPath], env), 0, 'approveが失敗');
-      const approval = await pool.query<{ id: string; active: boolean; terms_checked_at: Date | null }>(
-        'SELECT id, active, terms_checked_at FROM provider_policy_approvals WHERE company_id = $1 AND endpoint = $2',
+      const approval = await pool.query<{ id: string; training_disabled: boolean; is_active: boolean; terms_checked_at: Date | null }>(
+        'SELECT id, training_disabled, is_active, terms_checked_at FROM provider_policy_approvals WHERE company_id = $1 AND endpoint = $2',
         [workspace.companyId, config.apiUrl],
       );
       assert.equal(approval.rows.length, 1, '承認が登録されていない');
-      assert.equal(approval.rows[0].active, true);
+      assert.equal(approval.rows[0].training_disabled, true, 'CLIのlearning_disabledがtraining_disabled列へ反映されていない');
+      assert.equal(approval.rows[0].is_active, true);
       assert.ok(approval.rows[0].terms_checked_at, '規約確認日が保存されていない');
 
       assert.equal(await runCli(['retry', blockedJob.id], env), 0, 'retryが失敗');
@@ -108,10 +109,10 @@ describe('worker CLI', () => {
       assert.equal(server.requests.length, 1);
 
       assert.equal(await runCli(['revoke', approval.rows[0].id], env), 0, 'revokeが失敗');
-      const revoked = await pool.query<{ active: boolean }>('SELECT active FROM provider_policy_approvals WHERE id = $1', [
+      const revoked = await pool.query<{ is_active: boolean }>('SELECT is_active FROM provider_policy_approvals WHERE id = $1', [
         approval.rows[0].id,
       ]);
-      assert.equal(revoked.rows[0].active, false, '承認が失効していない');
+      assert.equal(revoked.rows[0].is_active, false, '承認が失効していない');
 
       const otherSessionId = await seedSession(pool, workspace);
       const other = await seedUserMessage(pool, { workspace, sessionId: otherSessionId, sequenceNo: 1, text: '失効後の対象発言' });
