@@ -75,13 +75,13 @@ describe('分類と原文保持', () => {
 
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.retention, 'substantive');
+      assert.equal(analysis.retention_category, 'substantive');
       assert.equal(analysis.is_searchable, true);
       assert.equal(analysis.primary_intent, 'requirements');
       assert.equal(analysis.statement_status, 'request');
       assert.ok(analysis.technical_labels.includes('backend'), `technical_labelsが不正: ${analysis.technical_labels.join(',')}`);
       assert.equal(analysis.policy_version, 'initial-v1');
-      assert.ok(analysis.model_version.length > 0, 'model_versionが保存されていない');
+      assert.ok(analysis.response_models.length > 0, 'response_modelsが保存されていない');
       assert.ok(analysis.state_hash.length > 0, 'state_hashが保存されていない');
       assert.equal(analysis.parts.length, 1);
       assert.deepEqual(
@@ -125,8 +125,8 @@ describe('分類と原文保持', () => {
       await processClassify(seeded.messageId, server);
       const relations = await readRelations(pool, seeded.messageId, 1);
       assert.equal(relations.length, 1, '承認関係が1件でない');
-      assert.equal(relations[0].target_message_id, proposal.messageId, '候補revisionへリンクしていない');
-      assert.equal(relations[0].target_revision, 1);
+      assert.equal(relations[0].to_message_id, proposal.messageId, '候補revisionへリンクしていない');
+      assert.equal(relations[0].to_message_revision, 1);
       assert.equal(relations[0].relation, 'accept');
       assert.equal(relations[0].is_explicit, true, '明示された承認関係をinferredとして保存している');
       assert.equal(relationExplicitQuestions.size, 1, '候補1件で候補専用relation_explicit質問が1件でない');
@@ -134,7 +134,7 @@ describe('分類と原文保持', () => {
 
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.retention, 'decision_signal');
+      assert.equal(analysis.retention_category, 'decision_signal');
       assert.equal(analysis.decision_action, 'accept');
     } finally {
       await server.close();
@@ -159,7 +159,7 @@ describe('分類と原文保持', () => {
       await processClassify(seeded.messageId, server);
       const relations = await readRelations(pool, seeded.messageId, 1);
       assert.equal(relations.length, 1, '撤回関係が1件でない');
-      assert.equal(relations[0].target_message_id, proposal.messageId);
+      assert.equal(relations[0].to_message_id, proposal.messageId);
       assert.equal(relations[0].relation, 'revoke');
       assert.equal(relations[0].is_explicit, true, '明示された撤回関係をinferredとして保存している');
     } finally {
@@ -211,7 +211,7 @@ describe('分類と原文保持', () => {
 
       const relations = await readRelations(pool, seeded.messageId, 1);
       assert.equal(relations.length, 1, '選択候補への関係が1件でない');
-      assert.equal(relations[0]?.target_message_id, selectedProposal.messageId, '選択候補へリンクしていない');
+      assert.equal(relations[0]?.to_message_id, selectedProposal.messageId, '選択候補へリンクしていない');
       assert.equal(relations[0]?.is_explicit, false, '非選択候補のexplicit回答を選択候補のinferredへ適用している');
       assert.deepEqual(
         [...answeredRelationExplicitIds].sort(),
@@ -284,7 +284,7 @@ describe('分類と原文保持', () => {
       await processClassify(seeded.messageId, server);
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.retention, 'progress_only');
+      assert.equal(analysis.retention_category, 'progress_only');
       assert.equal(analysis.is_searchable, false, '高信頼progress_onlyが検索対象のまま');
       assert.equal((await readRevision(pool, seeded.messageId, 1))?.text, text, 'progress_onlyで原文が消えている');
     } finally {
@@ -308,7 +308,7 @@ describe('分類と原文保持', () => {
       await processClassify(seeded.messageId, server);
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.retention, 'unknown', '低信頼分類を採用している');
+      assert.equal(analysis.retention_category, 'unknown', '低信頼分類を採用している');
       assert.equal(analysis.is_searchable, true, '低信頼分類で検索対象から外している');
       assert.equal(analysis.technical_labels.includes('backend'), false, '低信頼ラベルを採用している');
     } finally {
@@ -362,17 +362,17 @@ describe('分類と原文保持', () => {
 
       const analysis = await readAnalysis(pool, seeded.messageId, 1);
       assert.ok(analysis, 'message_analysisが保存されていない');
-      assert.equal(analysis.model_version, 'jev-actual-7', 'analysisのmodel_versionが実応答modelでない');
-      assert.equal(analysis.parts[0]?.model_version, 'jev-actual-7', 'partのmodel_versionが実応答modelでない');
+      assert.deepEqual(analysis.response_models, ['jev-actual-7'], 'analysisのresponse_modelsが実応答modelの配列でない');
+      assert.equal(analysis.parts[0]?.response_model, 'jev-actual-7', 'partのresponse_modelが実応答modelでない');
 
       const usage = await readUsageEvents(pool, workspace.companyId);
       assert.equal(usage.length, 1);
-      assert.equal(usage[0].model, 'jev-latest', 'usageの要求modelがaliasでない');
+      assert.equal(usage[0].requested_model, 'jev-latest', 'usageの要求modelがaliasでない');
       assert.equal(usage[0].response_model, 'jev-actual-7', 'usageの応答modelが実応答modelでない');
 
       const evaluations = await readEvaluations(pool, workspace.companyId);
       assert.equal(evaluations.length, 1);
-      assert.equal(evaluations[0].model, 'jev-latest', 'cache keyのmodelがaliasでない');
+      assert.equal(evaluations[0].requested_model, 'jev-latest', 'cache keyのmodelがaliasでない');
       assert.equal(evaluations[0].response_model, 'jev-actual-7', 'cacheの応答modelが実応答modelでない');
     } finally {
       await server.close();
