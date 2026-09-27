@@ -383,6 +383,10 @@ describe('OpenAPI 3.1契約の生成', () => {
         assert.ok(jsonResponseSchema(document, operation, status) !== undefined, `${route.path} ${status} にJSON response schemaがない`);
       }
       for (const status of route.errors) {
+        // health/readyの503は受付可否本文（status=unavailable）で、共通error本文ではない。
+        if (status === '503') {
+          continue;
+        }
         const errorSchema = jsonResponseSchema(document, operation, status);
         assert.deepEqual(requiredNames(errorSchema).sort(), ['error'], `${route.path} ${status} のerror本文が{error}でない`);
         const errorProperty = resolveSchema(document, errorSchema?.properties?.error);
