@@ -6,6 +6,9 @@ export const MIN_BATCH_SIZE = 1;
 export const MAX_BATCH_SIZE = 100;
 export const MAX_TEXT_LENGTH = 65_536;
 export const MAX_SOURCE_IDENTIFIER_BYTES = 1024;
+export const MAX_CUSTOM_REDACTION_RULES = 100;
+export const MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS = 4096;
+export const CUSTOM_REDACTION_PLACEHOLDER = '[REDACTED:custom]';
 export const AUTO_SEARCH_POLICY_VERSION = 'initial-v1';
 
 // 同一社員のイベント保存と再利用確定を直列化するtransaction advisory lockの名前空間。
