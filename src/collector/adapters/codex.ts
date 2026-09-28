@@ -1,7 +1,8 @@
 import type { TranscriptRecord } from '../transcript.js';
 
-// ローカルCodex Desktopの確認済み対応版。CLIインストール版0.155.1とは別物として扱う。
-export const SUPPORTED_CODEX_CLI_VERSION = '0.155.0-alpha.9.2';
+// ローカルCodex Desktopの確認済み対応版allowlist。先頭が旧確認版、末尾が最新確認版。
+// 外部CLI版0.156.1とは別物として扱う。
+export const SUPPORTED_CODEX_CLI_VERSIONS: readonly string[] = ['0.155.0-alpha.9.2', '0.155.0-alpha.16.4'];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -47,7 +48,14 @@ export function parseCodexTranscriptLine(line: string): TranscriptRecord {
   if (!isRecord(value) || typeof value.type !== 'string') {
     return { kind: 'unknown' };
   }
-  if (value.type === 'response_item' || value.type === 'compacted') {
+  // 既知の非会話top-level recordはpayload本文を読まずに無視する。未知top-level一般だけを診断対象にする。
+  if (
+    value.type === 'response_item' ||
+    value.type === 'turn_context' ||
+    value.type === 'token_usage_record' ||
+    value.type === 'world_state' ||
+    value.type === 'compacted'
+  ) {
     return { kind: 'ignored' };
   }
   if (value.type === 'session_meta') {
