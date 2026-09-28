@@ -157,3 +157,22 @@ export const evidenceQuerySchema = z.strictObject({
   project_id: normalizedUuid,
   revision: revisionQueryParamSchema,
 });
+
+// collector setupはcollectorが正規化したcanonical host/pathだけを受理し、URL・local path・空白は400にする。
+export const canonicalRepository = storableString
+  .refine((value) => /^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?\/[^\s]+$/.test(value), {
+    message: 'repositoryはcanonical host/pathで指定してください',
+  })
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES, {
+    message: `repositoryはUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内にしてください`,
+  })
+  .meta({
+    description: `canonical repositoryはUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内のhost/path`,
+    'x-yori-max-utf8-bytes': MAX_SOURCE_IDENTIFIER_BYTES,
+  });
+
+export const collectorSetupRequestSchema = z.strictObject({
+  repository: canonicalRepository,
+});
+
+export type ParsedCollectorSetupRequest = z.infer<typeof collectorSetupRequestSchema>;
