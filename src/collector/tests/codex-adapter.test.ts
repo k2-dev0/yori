@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { SUPPORTED_CODEX_CLI_VERSION, parseCodexTranscriptLine } from '../adapters/codex.js';
+import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from '../adapters/codex.js';
 import { codexMessageLine, codexSessionLine } from './support.js';
 
 describe('Codex transcriptアダプター', () => {
@@ -8,7 +8,7 @@ describe('Codex transcriptアダプター', () => {
     assert.deepEqual(parseCodexTranscriptLine(codexSessionLine('session-1')), {
       kind: 'session',
       source_session_id: 'session-1',
-      transcript_version: SUPPORTED_CODEX_CLI_VERSION,
+      transcript_version: SUPPORTED_CODEX_CLI_VERSIONS.at(-1),
     });
   });
 
