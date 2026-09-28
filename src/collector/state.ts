@@ -106,6 +106,14 @@ CREATE TABLE IF NOT EXISTS diagnostics (
   occurrences INTEGER NOT NULL,
   UNIQUE (namespace, code, byte_offset)
 );
+CREATE TABLE IF NOT EXISTS project_policies (
+  namespace TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  rules TEXT NOT NULL,
+  PRIMARY KEY (namespace, repository)
+);
 `;
 
 // endpointとtoken hashからstate namespaceを決める。資格情報変更で旧queueを新社員へ送らない。
@@ -436,4 +444,40 @@ export function updateSessionNextSequence(
   state.db
     .prepare('UPDATE source_sessions SET next_sequence = ? WHERE namespace = ? AND source = ? AND source_session_id = ?')
     .run(nextSequence, namespace, source, sessionId);
+}
+
+// setup APIで解決したprojectとpolicyのlast-known cache。rulesはtoken由来の鍵で暗号化した文字列として保持する。
+export interface CachedProjectPolicy {
+  projectId: string;
+  version: number;
+  encryptedRules: string;
+}
+
+export function getCachedProjectPolicy(
+  state: CollectorState,
+  namespace: string,
+  repository: string,
+): CachedProjectPolicy | undefined {
+  const row = state.db
+    .prepare('SELECT project_id, version, rules FROM project_policies WHERE namespace = ? AND repository = ?')
+    .get(namespace, repository);
+  if (row === undefined) {
+    return undefined;
+  }
+  return { projectId: String(row.project_id), version: Number(row.version), encryptedRules: String(row.rules) };
+}
+
+export function upsertCachedProjectPolicy(
+  state: CollectorState,
+  namespace: string,
+  repository: string,
+  policy: CachedProjectPolicy,
+): void {
+  state.db
+    .prepare(
+      `INSERT INTO project_policies (namespace, repository, project_id, version, rules) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (namespace, repository)
+       DO UPDATE SET project_id = excluded.project_id, version = excluded.version, rules = excluded.rules`,
+    )
+    .run(namespace, repository, policy.projectId, policy.version, policy.encryptedRules);
 }
