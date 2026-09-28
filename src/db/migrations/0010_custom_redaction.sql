@@ -38,7 +38,9 @@ CREATE TABLE company_redaction_rules (
   PRIMARY KEY (company_id, literal),
   CONSTRAINT company_redaction_rules_literal_not_empty CHECK (literal <> ''),
   CONSTRAINT company_redaction_rules_literal_not_placeholder_fragment CHECK (NOT yori_is_redaction_placeholder_fragment(literal)),
-  CONSTRAINT company_redaction_rules_literal_length CHECK (char_length(literal) <= 4096)
+  -- 512 code pointsならUTF-8最大4 bytes/pointでも2048 bytes程度で、
+  -- (company_id, literal)主キーのB-tree index rowの通常上限（約2704 bytes）内に収まる。
+  CONSTRAINT company_redaction_rules_literal_length CHECK (char_length(literal) <= 512)
 );
 
 -- literalは最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
