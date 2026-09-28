@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { createDecipheriv, createHash } from 'node:crypto';
 import { renameSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { v7 as uuidv7 } from 'uuid';
 import { collectFromHook, flushCollector } from '../collect.js';
+import { decryptCachedRules, encryptCachedRules } from '../policy-cache.js';
 import { parseCollectorConfig, type CollectorConfig } from '../config.js';
-import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
+import { closeCollectorState, collectorNamespace, openCollectorState, upsertCachedProjectPolicy } from '../state.js';
 import {
   ackResponse,
   appendTranscript,
@@ -506,6 +508,59 @@ describe('collectorのsetup policy適用', () => {
     } finally {
       coldMock.restore();
       await cold.cleanup();
+    }
+  });
+});
+
+// 復号鍵はtoken本体をKDF入力に含め、SQLiteへ保存されるnamespaceだけからは再現できない。
+describe('collectorのpolicy cache暗号化', () => {
+  const RULES = ['AcmeSecret', 'ProjectCodename'];
+
+  // 漏えいしたDBコピーから鍵を再現する攻撃を模し、指定鍵での復号を試みる。
+  function decryptWithKey(key: Buffer, value: string): string {
+    const parts = value.split('.');
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(parts[0]!, 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[1]!, 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
+  }
+
+  it('同じtoken/apiUrlだけ復号でき、別token・別apiUrlでは復号できない', () => {
+    const encrypted = encryptCachedRules('token-a', API_URL, RULES);
+
+    assert.deepEqual(decryptCachedRules('token-a', API_URL, encrypted), RULES, '同じtoken/apiUrlで復号できていない');
+    assert.equal(decryptCachedRules('token-b', API_URL, encrypted), undefined, '別tokenで復号できている');
+    assert.equal(decryptCachedRules('token-a', 'https://other.example.test', encrypted), undefined, '別apiUrlで復号できている');
+  });
+
+  it('stateのnamespaceとencryptedRulesだけではtokenなしに復号できない', async () => {
+    const fixture = await createCollectorFixture();
+    const token = 'token-a';
+    const namespace = collectorNamespace(API_URL, token);
+    const encrypted = encryptCachedRules(token, API_URL, RULES);
+    try {
+      const state = openCollectorState(fixture.stateDir);
+      try {
+        upsertCachedProjectPolicy(state, namespace, REPOSITORY, { projectId: uuidv7(), version: 1, encryptedRules: encrypted });
+        const row = state.db
+          .prepare('SELECT namespace, rules FROM project_policies WHERE namespace = ? AND repository = ?')
+          .get(namespace, REPOSITORY) as { namespace: string; rules: string } | undefined;
+        assert.ok(row, 'cacheがSQLiteへ保存されていない');
+        assert.equal(row.namespace, namespace, 'namespaceがstateへ保存されていない');
+        assert.equal(row.rules, encrypted, 'encryptedRulesがstateへ保存されていない');
+        assert.deepEqual(decryptCachedRules(token, API_URL, row.rules), RULES, 'tokenを持つcollectorがcacheを復号できていない');
+
+        // 修正前方式（namespace由来の鍵）はDBコピーのnamespaceから再現できるため、鍵更新後は復号できない。
+        const namespaceDerivedKey = createHash('sha256').update(`yori-collector-policy\n${row.namespace}`, 'utf8').digest();
+        assert.throws(() => decryptWithKey(namespaceDerivedKey, row.rules), 'namespaceから再現した旧鍵で復号できている');
+      } finally {
+        closeCollectorState(state);
+      }
+
+      await assertStateDoesNotContain(fixture.stateDir, 'AcmeSecret');
+      await assertStateDoesNotContain(fixture.stateDir, 'ProjectCodename');
+      await assertStateDoesNotContain(fixture.stateDir, token);
+    } finally {
+      await fixture.cleanup();
     }
   });
 });
