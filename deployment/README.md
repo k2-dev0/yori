@@ -155,6 +155,7 @@ user名・database名の変更は`ALTER ROLE`・`ALTER DATABASE`や新規DB作�
 
 - 本番DB volumeは`deployment/compose.yaml`で`yori-pgdata`固定。`YORI_PGDATA_VOLUME`等で別名を渡しても変わらず、意図しない別名の空DBを作らない。
 - 実社員データ投入直前にLightsail自動snapshotを有効にする。大きなmigration・更新の前にも手動snapshotを取得する。
+- Lightsail instanceを削除する前には、保持が必要な自動snapshotをmanual snapshotとして明示的に保持する。自動snapshotはinstance削除時に失われるため、削除後も復旧点を残すにはmanual snapshotが必要。削除前に管理者が保持対象（実社員データ投入後・大きなmigration適用後などの復旧点）を確認する。
 - 復旧試験はsnapshotから別instanceを作成し、`yori-pgdata`、migration version、healthを確認する。元instanceへ破壊的に上書きしない。
 - `docker compose down`ではvolumeを保持する。本番手順に`down -v`を含めない。`down -v`は`yori-pgdata`の原文を削除するため実行しない。instance snapshotはPostgreSQLの論理backupやPITRの代替ではない。
 
