@@ -144,3 +144,18 @@ export type NotReceivedView = z.infer<typeof notReceivedResponseSchema>;
 export type SearchLookupView = z.infer<typeof searchLookupResponseSchema>;
 export type EvidenceView = z.infer<typeof evidenceResponseSchema>;
 export type SessionLinkResponse = z.infer<typeof sessionLinkResponseSchema>;
+
+// collector setupは自社projectとcurrent policyのversion/rulesだけを返し、他社・tokenは含めない。
+export const redactionPolicyResponseSchema = z.strictObject({
+  version: z.int().min(0),
+  rules: z.array(storableString),
+});
+
+export const collectorSetupResponseSchema = z.strictObject({
+  project_id: z.uuid(),
+  repository: storableString,
+  redaction_policy: redactionPolicyResponseSchema,
+});
+
+export type RedactionPolicyView = z.infer<typeof redactionPolicyResponseSchema>;
+export type CollectorSetupResponse = z.infer<typeof collectorSetupResponseSchema>;
