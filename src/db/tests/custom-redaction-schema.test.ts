@@ -1,0 +1,208 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { after, before, beforeEach, describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { v7 as uuidv7 } from 'uuid';
+import { createPool, requireDatabaseUrl } from '../pool.js';
+import { runMigrations } from '../migrator.js';
+import { insertCompany, resetDatabase, seedWorkspace, type WorkspaceFixture } from './fixtures.js';
+
+// 会社単位の伏せ字policy（version付き）とproject repository aliasのDB契約。
+// 管理者は別repositoryのyori-cliからDBへliteralを更新するため、重複・空・placeholder・長さはDB制約でも拒否する。
+
+const pool = createPool(requireDatabaseUrl());
+let workspace: WorkspaceFixture;
+
+const MIGRATIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
+const PREVIOUS_MIGRATIONS = [
+  '0001_init.sql',
+  '0002_m3.sql',
+  '0003_m3_response_model.sql',
+  '0004_m4.sql',
+  '0005_m5.sql',
+  '0006_m6.sql',
+  '0007_m7.sql',
+  '0008_m8.sql',
+  '0009_column_names.sql',
+] as const;
+
+const MAX_CUSTOM_LITERAL_CODE_POINTS = 4096;
+
+before(async () => {
+  await runMigrations(pool);
+});
+
+beforeEach(async () => {
+  await resetDatabase(pool);
+  workspace = await seedWorkspace(pool);
+});
+
+after(async () => {
+  await pool.end();
+});
+
+async function expectDbError(operation: Promise<unknown>, code: string, label: string): Promise<void> {
+  await assert.rejects(
+    operation,
+    (error: { code?: string }) => {
+      assert.equal(error.code, code, `${label}: 期待したSQLSTATE ${code} ではなく ${String(error.code)}`);
+      return true;
+    },
+    `${label}: DBエラーにならない`,
+  );
+}
+
+async function readMigrationFile(file: string): Promise<string> {
+  try {
+    return await readFile(path.join(MIGRATIONS_DIR, file), 'utf8');
+  } catch {
+    assert.fail(`${file} が存在しない`);
+  }
+}
+
+async function insertPolicy(companyId: string, version: number, rules: string[] = []): Promise<void> {
+  await pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, $2)', [companyId, version]);
+  for (const rule of rules) {
+    await pool.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, rule]);
+  }
+}
+
+function insertRule(companyId: string, literal: string): Promise<unknown> {
+  return pool.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, literal]);
+}
+
+function insertAlias(projectId: string, companyId: string, repository: string): Promise<unknown> {
+  return pool.query('INSERT INTO project_repositories (project_id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+    projectId,
+    companyId,
+    repository,
+  ]);
+}
+
+describe('custom伏せ字policyのschema契約', () => {
+  it('会社単位のversionとrulesを保存し、未登録会社は行を持たない', async () => {
+    await insertPolicy(workspace.companyId, 2, ['AcmeSecret', 'hunter2']);
+
+    const policy = await pool.query<{ version: number }>('SELECT version FROM company_redaction_policies WHERE company_id = $1', [
+      workspace.companyId,
+    ]);
+    assert.equal(policy.rows[0]?.version, 2);
+
+    const rules = await pool.query<{ literal: string }>(
+      'SELECT literal FROM company_redaction_rules WHERE company_id = $1 ORDER BY literal',
+      [workspace.companyId],
+    );
+    assert.deepEqual(rules.rows.map((row) => row.literal), ['AcmeSecret', 'hunter2']);
+
+    const otherCompanyId = await insertCompany(pool, 'company-policy-empty');
+    const otherPolicy = await pool.query('SELECT version FROM company_redaction_policies WHERE company_id = $1', [otherCompanyId]);
+    assert.equal(otherPolicy.rows.length, 0, '未登録会社へversion行を作っている（未登録はversion 0・rules空として扱う）');
+  });
+
+  it('空・placeholder・上限超過literal、重複、version 0、親のないruleを拒否する', async () => {
+    await insertPolicy(workspace.companyId, 1, ['AcmeSecret']);
+
+    await expectDbError(insertRule(workspace.companyId, ''), '23514', '空literal');
+    await expectDbError(insertRule(workspace.companyId, '[REDACTED:custom]'), '23514', 'placeholder literal');
+    await expectDbError(
+      insertRule(workspace.companyId, 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS + 1)),
+      '23514',
+      '上限超過literal',
+    );
+    await expectDbError(insertRule(workspace.companyId, 'AcmeSecret'), '23505', '重複literal');
+    await expectDbError(
+      pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, 2)', [workspace.companyId]),
+      '23505',
+      '会社あたり1行のversion（主キー）',
+    );
+    const versionZeroCompanyId = await insertCompany(pool, 'company-policy-zero');
+    await expectDbError(
+      pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, 0)', [versionZeroCompanyId]),
+      '23514',
+      'version 0（未登録会社の既定値は保存しない）',
+    );
+
+    const orphanCompanyId = await insertCompany(pool, 'company-policy-orphan');
+    await expectDbError(insertRule(orphanCompanyId, 'AcmeSecret'), '23503', 'policy行のない会社のrule');
+
+    await pool.query('UPDATE company_redaction_policies SET version = 3 WHERE company_id = $1', [workspace.companyId]);
+    const updated = await pool.query<{ version: number }>('SELECT version FROM company_redaction_policies WHERE company_id = $1', [
+      workspace.companyId,
+    ]);
+    assert.equal(updated.rows[0]?.version, 3);
+  });
+});
+
+describe('project repository aliasのschema契約', () => {
+  it('primary repositoryをbackfillし、同じ会社の重複aliasを拒否して会社境界を保つ', async () => {
+    const aliasRepository = 'github.com/Org/Alias';
+    await insertAlias(workspace.projectId, workspace.companyId, aliasRepository);
+
+    await expectDbError(insertAlias(workspace.projectId, workspace.companyId, aliasRepository), '23505', '同一project内の重複alias');
+
+    const secondProject = await pool.query<{ id: string }>(
+      'INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3) RETURNING id',
+      [uuidv7(), workspace.companyId, 'repo-b'],
+    );
+    await expectDbError(insertAlias(secondProject.rows[0]!.id, workspace.companyId, 'repo-a'), '23505', '同一会社で同じrepositoryを複数projectへ割当');
+
+    const otherCompanyId = await insertCompany(pool, 'company-alias');
+    const otherProject = await pool.query<{ id: string }>(
+      'INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3) RETURNING id',
+      [uuidv7(), otherCompanyId, 'repo-c'],
+    );
+    await insertAlias(otherProject.rows[0]!.id, otherCompanyId, 'repo-a');
+    const otherAliases = await pool.query('SELECT project_id FROM project_repositories WHERE project_id = $1', [otherProject.rows[0]!.id]);
+    assert.equal(otherAliases.rows.length, 1, '別会社では同じcanonical repositoryを拒否している');
+
+    await expectDbError(insertAlias(workspace.projectId, otherCompanyId, 'github.com/Org/Mismatch'), '23503', 'projectと別会社の組合せ');
+    await expectDbError(insertAlias(uuidv7(), workspace.companyId, 'github.com/Org/Unknown'), '23503', '不存在projectのalias');
+  });
+
+  it('0009適用済みDBのprimary repositoryを新migrationでaliasへbackfillする', async () => {
+    const databaseName = `yori_custom_redaction_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    await pool.query(`CREATE DATABASE ${databaseName}`);
+    const legacyUrl = new URL(requireDatabaseUrl());
+    legacyUrl.pathname = `/${databaseName}`;
+    const legacy = createPool(legacyUrl.toString());
+    try {
+      for (const file of PREVIOUS_MIGRATIONS) {
+        await legacy.query(await readMigrationFile(file));
+      }
+      await legacy.query(
+        `CREATE TABLE schema_migrations (
+           version text PRIMARY KEY,
+           applied_at timestamptz NOT NULL DEFAULT now()
+         )`,
+      );
+      for (const file of PREVIOUS_MIGRATIONS) {
+        await legacy.query('INSERT INTO schema_migrations (version) VALUES ($1)', [file]);
+      }
+
+      const companyId = uuidv7();
+      const projectId = uuidv7();
+      await legacy.query('INSERT INTO companies (id, name) VALUES ($1, $2)', [companyId, 'legacy-policy-company']);
+      await legacy.query('INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+        projectId,
+        companyId,
+        'github.com/Legacy/Primary',
+      ]);
+
+      const applied = await runMigrations(legacy);
+      assert.ok(applied.length >= 1, 'primary repository backfillを含む新migrationが適用されていない');
+
+      const alias = await legacy.query<{ project_id: string; company_id: string; repository_identifier: string }>(
+        'SELECT project_id, company_id, repository_identifier FROM project_repositories WHERE project_id = $1',
+        [projectId],
+      );
+      assert.deepEqual(alias.rows, [
+        { project_id: projectId, company_id: companyId, repository_identifier: 'github.com/Legacy/Primary' },
+      ]);
+    } finally {
+      await legacy.end();
+      await pool.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    }
+  });
+});
