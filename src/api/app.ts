@@ -2,6 +2,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { z } from 'zod';
 import { MAX_EVENT_BODY_BYTES, type ErrorBody, type ErrorCode } from './contract.js';
+import { resolveCollectorSetup } from './collector-setup.js';
 import { authenticate, EventConflictError, ingestEvents, isProjectMember } from './events.js';
 import {
   createSearch,
@@ -13,6 +14,7 @@ import {
   SearchTargetError,
 } from './searches.js';
 import {
+  collectorSetupResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -24,6 +26,7 @@ import {
   sessionLinkResponseSchema,
 } from './response-schema.js';
 import {
+  collectorSetupRequestSchema,
   eventsRequestSchema,
   evidenceQuerySchema,
   searchByInputQuerySchema,
@@ -108,6 +111,28 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
       if (error instanceof SearchNotFoundError) {
         return reply.code(404).send(errorBody('not_found'));
       }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  // 認証済みcollectorのsetup。canonical repositoryからmember projectとcurrent policyだけを返す。
+  app.post('/v1/collector/setup', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    const parsed = collectorSetupRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const setup = await resolveCollectorSetup(deps.pool, auth, parsed.data.repository);
+      if (setup === null) {
+        // 別会社・非member・未登録は同じ404にし、repositoryの存在を開示しない。
+        return reply.code(404).send(errorBody('not_found'));
+      }
+      return reply.code(200).send(collectorSetupResponseSchema.parse(setup));
+    } catch {
       return reply.code(500).send(errorBody('internal_error'));
     }
   });
