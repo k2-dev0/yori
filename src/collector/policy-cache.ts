@@ -1,14 +1,14 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { collectorNamespace } from './state.js';
 
 // custom ruleは伏せ字対象のliteralそのものなので、端末のstateへ平文で残さない。
-// tokenを保存せずに導出した鍵で暗号化し、cacheありの通信失敗時だけ復号してlast-known policyに使う。
+// 鍵はtoken本体・apiUrl・用途を分離したKDF入力から導出し、SQLiteへ保存されるnamespaceは入力に使わない。
+// DBコピー（namespace＋encryptedRules）だけではtokenなしに復号できず、cacheありの通信失敗時だけ復号する。
 
 const IV_BYTES = 12;
+const POLICY_CACHE_KEY_DOMAIN = 'yori-collector-policy-cache-v2';
 
 function policyCacheKey(token: string, apiUrl: string): Buffer {
-  const namespace = collectorNamespace(apiUrl, token);
-  return createHash('sha256').update(`yori-collector-policy\n${namespace}`, 'utf8').digest();
+  return createHash('sha256').update(JSON.stringify([POLICY_CACHE_KEY_DOMAIN, apiUrl, token]), 'utf8').digest();
 }
 
 // 適用順を保ったrule配列をAES-256-GCMで暗号化し、iv.tag.ciphertextのbase64連結にする。
