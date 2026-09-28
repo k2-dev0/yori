@@ -34,16 +34,16 @@
 `deployment/compose.yaml`の`worker`はapiのhealthcheck後に起動し、共有node_modules volumeへの同時`npm ci`を避ける。本番のcredentialは`/etc/yori/yori.env`からComposeへ渡し、migration・bootstrap・承認登録の後に起動する。
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
 # 別repositoryの yori-cli bootstrap（会社・社員・案件・所属・token）
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm --no-deps worker npm run provider:approve -- /path/to/approval.json
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d api worker
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm --no-deps worker npm run provider:approve -- /path/to/approval.json
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d api worker
 ```
 
 - 起動順序は migration → yori-cli bootstrap → `provider:approve`（Jev／Voyage承認）→ worker起動。`provider:approve`はdb起動後・api/worker本起動前に`run --rm --no-deps worker`で実行し、起動済みのdbへ同一networkで接続する。未承認のまま起動しても外部送信は`blocked_policy`で止まる。
 - 起動前に `sudo node --env-file=/etc/yori/yori.env deployment/check-production-config.mjs` で10キーの未設定・空と`YORI_POSTGRES_PASSWORD`が小文字64桁hexであることを検査する。Node 24がenv fileを読み、shのsourceとして評価しない。root:root 0600を読むため`node` commandへ`sudo`を付け、値は出力しない。
-- `docker compose`へ実secretを渡す場合は`--env-file /etc/yori/yori.env`を使い、command line引数へ書かない。設定・配置の詳細は[deployment/README.md](../deployment/README.md)を参照する。
+- `/etc/yori/yori.env`はroot:root 0600のため、これを読む`docker compose` commandも`sudo docker compose --env-file /etc/yori/yori.env ...`で実行する（一般ユーザーではpermission deniedになる）。実secretはcommand line引数へ書かない。設定・配置の詳細は[deployment/README.md](../deployment/README.md)を参照する。
 
 tsxで直接動かす場合も、事前に`/etc/yori/yori.env`の値を環境へexportする（実値はcommand line引数へ書かない）:
 
