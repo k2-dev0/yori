@@ -9,6 +9,20 @@ import { REPO_ROOT } from './docker.js';
 // M8の配置契約。production profileはCaddy HTTPS gatewayだけを外部公開し、
 // 永続化とlog rotationを維持する。実クラウド作成・実外部API送信は行わない。
 
+// production composeの設定を満たす合成env。passwordは合成の固定64桁hexで、実秘密・実domainは使わない。
+const PRODUCTION_ENV = {
+  YORI_POSTGRES_USER: 'yori',
+  YORI_POSTGRES_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  YORI_POSTGRES_DB: 'yori',
+  YORI_DOMAIN: 'example.invalid',
+  JEV_API_KEY: 'jev-test-key',
+  JEV_ACCOUNT_REF: 'jev-test-account',
+  JEV_API_URL: 'https://api.typesafe.ai/v1/systemone',
+  VOYAGE_API_KEY: 'voyage-test-key',
+  VOYAGE_ACCOUNT_REF: 'voyage-test-account',
+  VOYAGE_API_URL: 'https://api.voyageai.com/v1/embeddings',
+};
+
 interface ComposePort {
   host_ip?: string;
   published?: string;
@@ -42,12 +56,22 @@ interface ComposeConfig {
 }
 
 // compose configはdaemon不要で、テスト環境のCOMPOSE_*・volume名へ左右されないenvで実行する。
-function composeConfig(args: string[]): Promise<ComposeConfig> {
+function composeConfig(args: string[], overrides: NodeJS.ProcessEnv = {}): Promise<ComposeConfig> {
   const env = { ...process.env };
   for (const key of [
     'COMPOSE_FILE',
     'COMPOSE_PROJECT_NAME',
     'COMPOSE_PROFILES',
+    'YORI_POSTGRES_USER',
+    'YORI_POSTGRES_PASSWORD',
+    'YORI_POSTGRES_DB',
+    'YORI_DOMAIN',
+    'JEV_API_KEY',
+    'JEV_ACCOUNT_REF',
+    'JEV_API_URL',
+    'VOYAGE_API_KEY',
+    'VOYAGE_ACCOUNT_REF',
+    'VOYAGE_API_URL',
     'YORI_API_PORT',
     'YORI_PGDATA_VOLUME',
     'YORI_NODE_MODULES_VOLUME',
@@ -58,6 +82,7 @@ function composeConfig(args: string[]): Promise<ComposeConfig> {
   ]) {
     delete env[key];
   }
+  Object.assign(env, overrides);
   return new Promise((resolve, reject) => {
     const child = spawn('docker', ['compose', ...args, 'config', '--format', 'json'], { cwd: REPO_ROOT, env });
     let stdout = '';
@@ -85,7 +110,7 @@ function isLoopback(hostIp: string | undefined): boolean {
 
 describe('M8 配置: production profileのCaddy HTTPS gateway', () => {
   it('production profileはCaddyを提供し、外部公開を80/443だけにする', async () => {
-    const config = await composeConfig(['--profile', 'production', '-f', 'deployment/compose.yaml']);
+    const config = await composeConfig(['--profile', 'production', '-f', 'deployment/compose.yaml'], PRODUCTION_ENV);
     const services = config.services;
     const caddy = services.caddy;
     assert.ok(caddy, `production profileにcaddy serviceがない: ${Object.keys(services).join(', ')}`);
@@ -154,7 +179,7 @@ describe('M8 配置: production profileのCaddy HTTPS gateway', () => {
   });
 
   it('production profileなしの通常composeはgateway portを公開しない', async () => {
-    const config = await composeConfig(['-f', 'deployment/compose.yaml']);
+    const config = await composeConfig(['-f', 'deployment/compose.yaml'], PRODUCTION_ENV);
     assert.equal(Object.hasOwn(config.services, 'caddy'), false, 'production profileのcaddyが既定起動へ含まれる');
     for (const [name, service] of Object.entries(config.services)) {
       for (const port of service.ports ?? []) {
