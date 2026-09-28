@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { buildApp } from '../app.js';
 import type { EventsResponse } from '../contract.js';
+import { redactConversationText } from '../redaction.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import { resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
@@ -66,14 +67,15 @@ describe('POST /v1/events のcustom伏せ字適用', () => {
       'SELECT request_hash FROM event_receipts WHERE company_id = $1 AND employee_id = $2 AND idempotency_key = $3',
       [workspace.companyId, workspace.employeeId, event.idempotency_key],
     );
+    // receipt hashはcustom policy変更から独立し、built-in適用後の本文で決まる。
     const expectedHash = canonicalReceiptHash({
       ...event,
       company_id: workspace.companyId,
       employee_id: workspace.employeeId,
       project_id: workspace.projectId,
-      text: redactedText,
+      text: redactConversationText(rawText),
     });
-    assert.ok(receipt.rows[0]?.request_hash.equals(expectedHash), 'receipt hashが置換後本文で計算されていない');
+    assert.ok(receipt.rows[0]?.request_hash.equals(expectedHash), 'receipt hashがbuilt-in適用後の本文で計算されていない');
 
     const storedRaw = await pool.query<{ count: string }>(
       "SELECT count(*)::text AS count FROM message_revisions WHERE text LIKE '%' || $1 || '%'",
@@ -109,6 +111,67 @@ describe('POST /v1/events のcustom伏せ字適用', () => {
 
     assert.equal(await readCurrentRevisionText(freshMessageId), '[REDACTED:custom] を含む新規本文');
     assert.equal(await readCurrentRevisionText(existingMessageId), existing.text, 'policy登録で既存本文を書き換えている');
+  });
+
+  it('ACK喪失後の同一body再送はpolicy追加後も同じreceiptで成功し、別bodyの衝突は維持する', async () => {
+    // policy追加前の受付（collectorのACK喪失を模す）。
+    const event = buildEventInput({ idempotency_key: 'receipt-policy-change-1', text: 'AcmeSecret と AlphaSecret と 固定本文' });
+    const requestBody = buildEventBatch(workspace.projectId, [event]);
+    const first = await postEvents(app, { token: workspace.token, body: requestBody });
+    assert.equal(first.statusCode, 202, `初回受付に失敗: ${first.statusCode} ${first.body}`);
+    const firstResult = first.json<EventsResponse>().results[0]!;
+    assert.equal(await readCurrentRevisionText(firstResult.message_id), event.text);
+
+    await savePolicy(workspace.companyId, 1, ['AcmeSecret', 'AlphaSecret']);
+
+    // 同じidempotency_key＋同じ受信bodyはpolicy追加後も同じreceiptとして成功する。
+    const retry = await postEvents(app, { token: workspace.token, body: requestBody });
+    assert.equal(retry.statusCode, 202, `policy追加後の同一body再送が失敗: ${retry.statusCode} ${retry.body}`);
+    const retryResult = retry.json<EventsResponse>().results[0];
+    assert.equal(retryResult?.message_id, firstResult.message_id, '同一body再送で新しいmessageが作られている');
+    assert.equal(retryResult?.revision, 1);
+    assert.equal(await readCurrentRevisionText(firstResult.message_id), event.text, 'policy追加で既存本文を遡及変更している');
+
+    const receipt = await pool.query<{ request_hash: Buffer }>(
+      'SELECT request_hash FROM event_receipts WHERE company_id = $1 AND employee_id = $2 AND idempotency_key = $3',
+      [workspace.companyId, workspace.employeeId, event.idempotency_key],
+    );
+    assert.ok(
+      receipt.rows[0]?.request_hash.equals(
+        canonicalReceiptHash({
+          ...event,
+          company_id: workspace.companyId,
+          employee_id: workspace.employeeId,
+          project_id: workspace.projectId,
+          text: redactConversationText(event.text),
+        }),
+      ),
+      'receipt hashがcustom policy追加で変化している',
+    );
+
+    // 異なる受信bodyがcustomで同じplaceholderになってもconflictを維持する。
+    // 直前のeventと同じsource sessionのため、sequence_no=1は使用済み。session identity契約に合わせて2を使う。
+    const firstBody = buildEventInput({ idempotency_key: 'receipt-different-body-1', sequence_no: 2, text: 'AcmeSecret のみ' });
+    const sent = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [firstBody]) });
+    assert.equal(sent.statusCode, 202, `初回bodyの受付に失敗: ${sent.statusCode} ${sent.body}`);
+    const conflict = await postEvents(app, {
+      token: workspace.token,
+      body: buildEventBatch(workspace.projectId, [{ ...firstBody, text: 'AlphaSecret のみ' }]),
+    });
+    assert.equal(conflict.statusCode, 409, `別受信bodyがplaceholder一致で受理された: ${conflict.statusCode} ${conflict.body}`);
+
+    // policy追加前の既存revisionはrawのままが契約。後から受けたbodyのrevisionだけを対象にする。
+    const sentResult = sent.json<EventsResponse>().results[0]!;
+    const rawRows = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM message_revisions WHERE message_id = $1 AND (text LIKE '%AcmeSecret%' OR text LIKE '%AlphaSecret%')",
+      [sentResult.message_id],
+    );
+    assert.equal(rawRows.rows[0]?.count, '0', '生bodyがmessage_revisionsへ保存されている');
+    const sentRevisions = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM message_revisions WHERE message_id = $1',
+      [sentResult.message_id],
+    );
+    assert.equal(sentRevisions.rows[0]?.count, '1', 'conflictした別bodyがrevisionとして保存されている');
   });
 
   it('別会社のpolicy ruleを自社の保存本文へ適用しない', async () => {
