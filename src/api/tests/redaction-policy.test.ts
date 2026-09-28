@@ -22,6 +22,20 @@ function applyPolicy(text: string, rules: readonly string[]): string {
 }
 
 describe('custom伏せ字policyの純粋関数', () => {
+  it('置換済みbuilt-in/custom placeholderを再適用してもbyte一致を維持する', () => {
+    const placeholders =
+      '[REDACTED:custom] と [REDACTED:aws_access_key] と [REDACTED:env_value] と [REDACTED:authorization] と [REDACTED:private_key]';
+    const rules = ['AcmeSecret'];
+    assert.equal(applyPolicy(placeholders, rules), placeholders, 'placeholder自体を置換している');
+
+    const once = applyPolicy(`AcmeSecret と ${placeholders}`, rules);
+    assert.equal(applyPolicy(once, rules), once, 'placeholderを含む置換済み本文が再適用で変化している');
+    assert.equal(applyPolicy(applyPolicy(once, rules), rules), once, '2回目以降の再適用で変化している');
+
+    const builtIn = applyPolicy('PASSWORD=hunter2 と AKIAIOSFODNN7EXAMPLE', ['hunter2']);
+    assert.equal(applyPolicy(builtIn, ['hunter2']), builtIn, 'built-in placeholderが再適用で壊れている');
+  });
+
   it('exact literalだけをcase-sensitiveに置換し、regex特殊文字もliteralとして扱う', () => {
     assert.equal(applyPolicy('AcmeSecret と acmesecret', ['AcmeSecret']), '[REDACTED:custom] と acmesecret');
     assert.equal(applyPolicy('前AcmeSecret後', ['AcmeSecret']), '前[REDACTED:custom]後');
@@ -51,6 +65,12 @@ describe('custom伏せ字policyの純粋関数', () => {
     assert.throws(() => applyPolicy('x', ['[REDACTED:custom]']), 'placeholderそのものを拒否していない');
     assert.throws(() => applyPolicy('x', ['x'.repeat(MAX_LITERAL_CODE_POINTS + 1)]), '上限超過literalを拒否していない');
     assert.throws(() => applyPolicy('x', ['dup', 'dup']), '重複literalを拒否していない');
+    for (const fragment of ['REDACTED', 'custom', '[REDACTED', 'ED:custom]', 'env_value', 'authorization', ':']) {
+      assert.throws(
+        () => applyPolicy('x', [fragment]),
+        `placeholderの部分文字列 ${fragment} を受理している`,
+      );
+    }
     assert.throws(() => applyPolicy('x', Array.from({ length: MAX_CUSTOM_RULES + 1 }, (_, index) => `rule-${index}`)), '件数超過を拒否していない');
     assert.throws(() => applyPolicy('x', ['ok', 42 as unknown as string]), '非文字列ruleを拒否していない');
 
