@@ -28,7 +28,7 @@ const PREVIOUS_MIGRATIONS = [
   '0009_column_names.sql',
 ] as const;
 
-const MAX_CUSTOM_LITERAL_CODE_POINTS = 4096;
+const MAX_CUSTOM_LITERAL_CODE_POINTS = 512;
 
 before(async () => {
   await runMigrations(pool);
@@ -115,6 +115,16 @@ describe('custom伏せ字policyのschema契約', () => {
       [workspace.companyId],
     );
     assert.equal(accepted.rows[0]?.count, '1', '部分文字列でないliteralを拒否している');
+
+    // 512 code pointsの最大literalは主キーのB-tree index row上限内で保存・読出しでき、513は拒否する。
+    const maxLiteral = 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS);
+    await insertRule(workspace.companyId, maxLiteral);
+    const storedMax = await pool.query<{ literal: string }>(
+      'SELECT literal FROM company_redaction_rules WHERE company_id = $1 AND literal = $2',
+      [workspace.companyId, maxLiteral],
+    );
+    assert.equal(storedMax.rows[0]?.literal, maxLiteral, '512 code pointsのliteralを保存・読出しできない');
+    await expectDbError(insertRule(workspace.companyId, maxLiteral), '23505', '境界literalの重複');
     await expectDbError(
       insertRule(workspace.companyId, 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS + 1)),
       '23514',
