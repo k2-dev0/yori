@@ -56,7 +56,8 @@ const collectorConfigSchema = z
     api_url: apiUrlSchema,
     token_env: z.string().min(1),
     state_dir: z.string().min(1).refine((value) => path.isAbsolute(value), { message: 'state_dirは絶対pathで指定してください' }),
-    projects: z.array(projectSchema),
+    // 旧設定との後方互換: projects対応表を書かなくても、hook cwdのrepositoryでsetup APIを解決する。
+    projects: z.array(projectSchema).optional().default([]),
   })
   .superRefine((config, ctx) => {
     const repositories = new Set<string>();
