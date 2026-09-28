@@ -1,6 +1,11 @@
 # M1の通常Compose project。既存のCompose project・データへは触れない。
 # DBはホストへポートを公開しない。通常upでmigrationを走らせないためmigrateはtools profileに置く。
+# 本番の10キー（YORI_POSTGRES_*/YORI_DOMAIN/JEV_*/VOYAGE_*）はdefaultを置かず、未設定・空はrequired interpolationで失敗させる。
 name: yori
+
+# api・worker・migrateで同じDATABASE_URLを使う。定義はここ1箇所だけにする。
+x-database-environment: &database-environment
+  DATABASE_URL: "postgres://${YORI_POSTGRES_USER:?required}:${YORI_POSTGRES_PASSWORD:?required}@db:5432/${YORI_POSTGRES_DB:?required}"
 
 x-node-service: &node-service
   image: node:24.21.0-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
@@ -10,7 +15,7 @@ x-node-service: &node-service
     - yori-node-modules:/app/node_modules
     - yori-npm-cache:/root/.npm
   environment:
-    DATABASE_URL: postgres://yori:yori@db:5432/yori
+    <<: *database-environment
     API_HOST: 0.0.0.0
     API_PORT: "3210"
   depends_on:
@@ -26,9 +31,9 @@ services:
   db:
     image: pgvector/pgvector:0.8.6-pg18-trixie@sha256:78bf48b801e792f99e3ac62b5036fd3876e9be48afda16c1e331af1c75ceb2ff
     environment:
-      POSTGRES_USER: yori
-      POSTGRES_PASSWORD: yori
-      POSTGRES_DB: yori
+      POSTGRES_USER: ${YORI_POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${YORI_POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: ${YORI_POSTGRES_DB:?required}
     command:
       - postgres
       - -c
@@ -42,7 +47,7 @@ services:
     volumes:
       - yori-pgdata:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U yori -d yori"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -82,19 +87,19 @@ services:
       - -c
       - test -x node_modules/.bin/tsx || npm ci --no-audit --no-fund; exec ./node_modules/.bin/tsx src/worker/cli.ts start
     environment:
-      DATABASE_URL: postgres://yori:yori@db:5432/yori
-      JEV_API_KEY: ${JEV_API_KEY:-}
-      JEV_ACCOUNT_REF: ${JEV_ACCOUNT_REF:-}
-      JEV_API_URL: ${JEV_API_URL:-https://api.typesafe.ai/v1/systemone}
+      <<: *database-environment
+      JEV_API_KEY: ${JEV_API_KEY:?required}
+      JEV_ACCOUNT_REF: ${JEV_ACCOUNT_REF:?required}
+      JEV_API_URL: ${JEV_API_URL:?required}
       JEV_MODEL: ${JEV_MODEL:-jev-latest}
       JEV_CONFIDENCE_THRESHOLD: ${JEV_CONFIDENCE_THRESHOLD:-0.8}
       JEV_INPUT_BUDGET_BYTES: ${JEV_INPUT_BUDGET_BYTES:-8000}
       JEV_REQUEST_TIMEOUT_MS: ${JEV_REQUEST_TIMEOUT_MS:-20000}
       JEV_JOB_LEASE_MS: ${JEV_JOB_LEASE_MS:-60000}
       JEV_WORKER_POLL_MS: ${JEV_WORKER_POLL_MS:-1000}
-      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
-      VOYAGE_ACCOUNT_REF: ${VOYAGE_ACCOUNT_REF:-}
-      VOYAGE_API_URL: ${VOYAGE_API_URL:-https://api.voyageai.com/v1/embeddings}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?required}
+      VOYAGE_ACCOUNT_REF: ${VOYAGE_ACCOUNT_REF:?required}
+      VOYAGE_API_URL: ${VOYAGE_API_URL:?required}
       VOYAGE_REQUEST_TIMEOUT_MS: ${VOYAGE_REQUEST_TIMEOUT_MS:-20000}
 
   # M8: production profileのHTTPS gateway。通常起動には含めず、apiのhealthcheck後に起動する。
@@ -106,7 +111,7 @@ services:
       api:
         condition: service_healthy
     environment:
-      YORI_DOMAIN: ${YORI_DOMAIN:-localhost}
+      YORI_DOMAIN: ${YORI_DOMAIN:?required}
     ports:
       - "80:80"
       - "443:443"
@@ -130,10 +135,11 @@ services:
       - -c
       - npm ci --no-audit --no-fund && exec npm run migrate
 
-# volume名は既定で開発用の固定名のまま（通常composeのDB永続化を維持）。
+# 本番DB volumeはyori-pgdataへ固定し、外部envによる別名指定で空DBを作れないようにする。
+# 他のvolume名は従来どおり開発用にenvで指定できる。
 volumes:
   yori-pgdata:
-    name: ${YORI_PGDATA_VOLUME:-yori-pgdata}
+    name: yori-pgdata
   yori-caddy-data:
     name: ${YORI_CADDY_DATA_VOLUME:-yori-caddy-data}
   yori-caddy-config:
