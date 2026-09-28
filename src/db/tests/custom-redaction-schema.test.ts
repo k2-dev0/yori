@@ -106,6 +106,15 @@ describe('custom伏せ字policyのschema契約', () => {
 
     await expectDbError(insertRule(workspace.companyId, ''), '23514', '空literal');
     await expectDbError(insertRule(workspace.companyId, '[REDACTED:custom]'), '23514', 'placeholder literal');
+    for (const fragment of ['REDACTED', 'custom', '[REDACTED', 'ED:custom]', 'env_value', 'authorization']) {
+      await expectDbError(insertRule(workspace.companyId, fragment), '23514', `placeholder部分文字列 ${fragment}`);
+    }
+    await insertRule(workspace.companyId, 'ProjectCodename');
+    const accepted = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1 AND literal = 'ProjectCodename'",
+      [workspace.companyId],
+    );
+    assert.equal(accepted.rows[0]?.count, '1', '部分文字列でないliteralを拒否している');
     await expectDbError(
       insertRule(workspace.companyId, 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS + 1)),
       '23514',
@@ -133,7 +142,73 @@ describe('custom伏せ字policyのschema契約', () => {
     ]);
     assert.equal(updated.rows[0]?.version, 3);
   });
+
+  it('規則件数をDBで100件に制限し、並行atomic replaceでも101件目を拒否する', async () => {
+    const companyId = await insertCompany(pool, 'company-rule-limit');
+    await insertPolicy(
+      companyId,
+      1,
+      Array.from({ length: 99 }, (_, index) => `rule-${String(index).padStart(3, '0')}`),
+    );
+    assert.equal(await ruleCount(companyId), 99);
+
+    await insertRule(companyId, 'rule-100');
+    assert.equal(await ruleCount(companyId), 100);
+    await expectDbError(insertRule(companyId, 'rule-101'), '23514', '101件目のrule');
+    assert.equal(await ruleCount(companyId), 100, '拒否後も100件を維持していない');
+
+    // yori-cliのatomic replace（新versionのruleを一括insert）でも、超過分はtransactionごとrollbackする。
+    const replaceClient = await pool.connect();
+    try {
+      await replaceClient.query('BEGIN');
+      await expectDbError(
+        replaceClient.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, 'rule-102']),
+        '23514',
+        'transaction内101件目',
+      );
+      await replaceClient.query('ROLLBACK');
+    } finally {
+      replaceClient.release();
+    }
+    assert.equal(await ruleCount(companyId), 100, 'rollbackで件数が変わっている');
+
+    // 並行transactionではpolicy行lockにより100件目が片方だけ成功する。
+    const raceCompanyId = await insertCompany(pool, 'company-rule-race');
+    await insertPolicy(
+      raceCompanyId,
+      1,
+      Array.from({ length: 99 }, (_, index) => `race-${String(index).padStart(3, '0')}`),
+    );
+    const insertSql = 'INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)';
+    const clientA = await pool.connect();
+    const clientB = await pool.connect();
+    try {
+      await clientA.query('BEGIN');
+      await clientA.query(insertSql, [raceCompanyId, 'race-a']);
+      await clientB.query('BEGIN');
+      const second = clientB.query(insertSql, [raceCompanyId, 'race-b']);
+      await clientA.query('COMMIT');
+      const outcome = await second.then(
+        () => 'fulfilled' as const,
+        (error: { code?: string }) => ({ code: error.code }),
+      );
+      assert.deepEqual(outcome, { code: '23514' }, `並行insertが ${JSON.stringify(outcome)} になった`);
+      await clientB.query('ROLLBACK');
+    } finally {
+      clientA.release();
+      clientB.release();
+    }
+    assert.equal(await ruleCount(raceCompanyId), 100, '並行insertで上限を越えている');
+  });
 });
+
+async function ruleCount(companyId: string): Promise<number> {
+  const result = await pool.query<{ count: string }>(
+    'SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1',
+    [companyId],
+  );
+  return Number(result.rows[0]?.count);
+}
 
 describe('project repository aliasのschema契約', () => {
   it('primary repositoryをbackfillし、同じ会社の重複aliasを拒否して会社境界を保つ', async () => {
@@ -159,6 +234,64 @@ describe('project repository aliasのschema契約', () => {
 
     await expectDbError(insertAlias(workspace.projectId, otherCompanyId, 'github.com/Org/Mismatch'), '23503', 'projectと別会社の組合せ');
     await expectDbError(insertAlias(uuidv7(), workspace.companyId, 'github.com/Org/Unknown'), '23503', '不存在projectのalias');
+  });
+
+  it('primary/aliasをまたぐrepository一意性をINSERT/UPDATE双方で保証する', async () => {
+    const aliasRepository = 'github.com/Org/Alias';
+    await insertAlias(workspace.projectId, workspace.companyId, aliasRepository);
+    // 同一projectのprimary backfill行は許可し続ける。
+    await insertAlias(workspace.projectId, workspace.companyId, 'repo-a');
+
+    const secondProjectId = uuidv7();
+    await pool.query('INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+      secondProjectId,
+      workspace.companyId,
+      'repo-b',
+    ]);
+
+    await expectDbError(
+      pool.query('INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+        uuidv7(),
+        workspace.companyId,
+        aliasRepository,
+      ]),
+      '23505',
+      '他projectのaliasをprimaryとしてINSERT',
+    );
+    await expectDbError(
+      pool.query('UPDATE projects SET repository_identifier = $1 WHERE id = $2', [aliasRepository, secondProjectId]),
+      '23505',
+      '他projectのaliasへprimaryをUPDATE',
+    );
+
+    await insertAlias(secondProjectId, workspace.companyId, 'github.com/Org/Other');
+    await expectDbError(
+      pool.query(
+        'UPDATE project_repositories SET repository_identifier = $1 WHERE project_id = $2 AND repository_identifier = $3',
+        ['repo-a', secondProjectId, 'github.com/Org/Other'],
+      ),
+      '23505',
+      '他projectのprimaryへaliasをUPDATE',
+    );
+    await expectDbError(
+      pool.query(
+        'UPDATE project_repositories SET repository_identifier = $1 WHERE project_id = $2 AND repository_identifier = $3',
+        [aliasRepository, secondProjectId, 'github.com/Org/Other'],
+      ),
+      '23505',
+      '他projectのaliasへaliasをUPDATE',
+    );
+
+    // 同一projectのaliasは制限なく登録でき、一意性は他projectとの間だけで保たれる。
+    await insertAlias(secondProjectId, workspace.companyId, 'github.com/Org/Second-Alias');
+    const secondAliases = await pool.query<{ repository_identifier: string }>(
+      'SELECT repository_identifier FROM project_repositories WHERE project_id = $1 ORDER BY repository_identifier',
+      [secondProjectId],
+    );
+    assert.deepEqual(secondAliases.rows.map((row) => row.repository_identifier), [
+      'github.com/Org/Other',
+      'github.com/Org/Second-Alias',
+    ]);
   });
 
   it('0009適用済みDBのprimary repositoryを新migrationでaliasへbackfillする', async () => {
