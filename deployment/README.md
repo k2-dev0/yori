@@ -159,6 +159,48 @@ user名・database名の変更は`ALTER ROLE`・`ALTER DATABASE`や新規DB作�
 - 復旧試験はsnapshotから別instanceを作成し、`yori-pgdata`、migration version、healthを確認する。元instanceへ破壊的に上書きしない。
 - `docker compose down`ではvolumeを保持する。本番手順に`down -v`を含めない。`down -v`は`yori-pgdata`の原文を削除するため実行しない。instance snapshotはPostgreSQLの論理backupやPITRの代替ではない。
 
+## Macからの1コマンドdeploy
+
+Macのrepository rootから`npm run deploy:production`を実行すると、引数省略時はlocal HEAD、`-- <40桁hex SHA>`指定時はそのcommitをLightsailへ配布する。local scriptはrepository rootとdirty（tracked/staged/untracked）を確認し、dirtyならSSH前に非0で停止する。`git fetch origin main`後、targetが`origin/main`に含まれなければ失敗し、未push commitは配布しない。deploy本体は`deployment/deploy.sh`の現在の本文を`ssh <host> bash -s -- <SHA>`のstdinへ渡すため、remoteに旧scriptが無い初回でも動く。
+
+### 1回だけ必要なSSH alias設定
+
+`~/.ssh/config`へLightsail用のaliasを用意する。既定のalias名は`yori-production`（`YORI_DEPLOY_HOST`でoverride可）。ProxyJumpでさくらVPS経由にする場合は次の形にする。IP・user・key pathは実環境の値へ置き換え、repositoryへは保存しない。
+
+```sh
+Host yori-production
+  HostName <LightsailのIPまたはhost>
+  User <LightsailのSSH user>
+  IdentityFile ~/.ssh/<Lightsail用key>
+  ProxyJump <さくらVPSのalias>
+```
+
+- deploy scriptは`ssh` lower layerの`~/.ssh/config`だけを使い、AWS APIやLightsail consoleは呼ばない。ProxyJumpの経路・key配置は利用者が管理する。
+- remote側のrepositoryは`/srv/yori`、環境設定はroot:root 0600の`/etc/yori/yori.env`を前提とする（前節までと共通）。
+
+### 通常の実行とoverride
+
+```sh
+npm run deploy:production                 # local HEADを配布
+npm run deploy:production -- <40桁hex SHA> # 指定commitを配布
+```
+
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `YORI_DEPLOY_HOST` | `yori-production` | `~/.ssh/config`のSSH alias |
+| `YORI_DEPLOY_HEALTH_URL` | `https://yori-pilot.online/health/ready` | remote成功後に200を確認する公開health URL |
+
+- hostは安全なSSH alias文字だけ、targetは40桁hex SHAだけを受理する。URLはhttps固定で、loopback（127.0.0.1・::1・localhost）のhttpだけテスト用途に許可する。
+- secret・password・keyは引数やlogへ出さない。remoteのsecretは`/etc/yori/yori.env`のままで、`docker compose --env-file`だけが読む。
+
+### remote側の順序と失敗時の挙動
+
+remote scriptは`/srv/yori/.git`配下のlockを`flock -n`で取り、同時deployを拒否する。lock下ではremote worktreeのdirty確認、`git fetch origin main`、targetの存在・`origin/main`への包含・HEADからのfast-forward可否の確認、`git merge --ff-only`、merge後HEADのtarget一致確認を行う。`git reset`・`git checkout`・force mergeは行わない。
+
+その後、`/etc/yori/yori.env`がroot:root 0600であることを確認し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml`で`config --quiet`、`pull`、`db up -d --wait`、`--profile tools run --rm migrate`、`--profile production up -d --wait --force-recreate --no-deps api worker caddy`の順に実行する。config・pull・db・migrateのどれかが失敗した場合はapi・worker・caddyを再作成しない。`down -v`やvolume削除、schema rollback、`git reset`は行わない。再作成後は`docker compose port api 3210`で得たloopback addressの`/health/ready`が200であることを確認し、compose psとold/new SHAを表示する。secretを含むenvの内容は表示しない。
+
+Mac側はremote成功後だけ`YORI_DEPLOY_HEALTH_URL`を1回確認し、200なら終了0、SSHまたはhealthが失敗なら非0で終了する。更新・rollbackの考え方は「6. 更新とrollback」と同じで、migrationはforward-onlyとする。
+
 ## イベント受付の契約
 
 `POST /v1/events` は合成fixtureや端末収集アダプターからの会話イベントを受ける。`<token>`は社員へ発行した生tokenで、DBにはSHA-256のみ保存されている。
