@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { v7 as uuidv7 } from 'uuid';
-import { collectFromHook } from '../collect.js';
+import { collectFromHook, flushCollector } from '../collect.js';
 import { parseCollectorConfig, type CollectorConfig } from '../config.js';
 import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
 import {
@@ -208,6 +208,112 @@ describe('collectorのsetup policy適用', () => {
     } finally {
       mock.restore();
       await fixture.cleanup();
+    }
+  });
+
+  it('cacheなしsetup失敗で保留したsourceを、flushの再取得成功で本文から収集して送信する', async () => {
+    const fixture = await createCollectorFixture();
+    const projectId = uuidv7();
+    let online = false;
+    const mock = installFetchMock((request) => {
+      if (isSetupRequest(request)) {
+        if (!online) {
+          throw new Error('network down');
+        }
+        return setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] });
+      }
+      return ackResponse(request);
+    });
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'AcmeSecret を flush で読む' }),
+      ]);
+      await collectFromHook(hookInput(fixture, transcript, 'codex', 'session-1'));
+      assert.equal(eventRequests(mock.requests).length, 0, '取得失敗のcollectで送信している');
+      assert.equal(outboxCount(fixture, 'token-a'), 0, '取得失敗のcollectでoutboxへ積んでいる');
+
+      online = true;
+      await flushCollector({ config: policyConfig(fixture.stateDir), token: 'token-a' });
+
+      assert.equal(mock.requests.filter(isSetupRequest).length, 2, 'flushがsetup APIを再取得していない');
+      const batches = parseSentBatches(eventRequests(mock.requests));
+      assert.equal(batches[0]?.project_id, projectId, 'flushで解決したprojectへ送っていない');
+      assert.deepEqual(
+        batches.flatMap((batch) => batch.events).map((event) => event.text),
+        ['[REDACTED:custom] を flush で読む'],
+      );
+      await assertStateDoesNotContain(fixture.stateDir, 'AcmeSecret');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('flushもcacheあり一時失敗はlast-known、cacheなし失敗は本文未読・送信0にする', async () => {
+    const fixture = await createCollectorFixture();
+    const projectId = uuidv7();
+    let online = true;
+    const mock = installFetchMock((request) => {
+      if (isSetupRequest(request)) {
+        if (!online) {
+          throw new Error('network down');
+        }
+        return setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] });
+      }
+      return ackResponse(request);
+    });
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'AcmeSecret 1' }),
+      ]);
+      await collectFromHook(hookInput(fixture, transcript, 'codex', 'session-1'));
+
+      online = false;
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'user', text: 'AcmeSecret を flush でも伏せる' })}\n`,
+      );
+      await flushCollector({ config: policyConfig(fixture.stateDir), token: 'token-a' });
+
+      assert.deepEqual(sentEvents(eventRequests(mock.requests)).map((event) => event.text), [
+        '[REDACTED:custom] 1',
+        '[REDACTED:custom] を flush でも伏せる',
+      ]);
+      assert.equal(mock.requests.filter(isSetupRequest).length, 2, 'flushがsetupを試行していない');
+      await assertStateDoesNotContain(fixture.stateDir, 'AcmeSecret');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+
+    // cacheなし: 取得失敗のcollectで保持したsourceを、失敗の続くflushで読まない。
+    const cold = await createCollectorFixture();
+    const coldMock = installFetchMock((request) => {
+      if (isSetupRequest(request)) {
+        throw new Error('network down');
+      }
+      return ackResponse(request);
+    });
+    try {
+      const transcript = path.join(cold.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'AcmeSecret を読まない' }),
+      ]);
+      await collectFromHook(hookInput(cold, transcript, 'codex', 'session-1'));
+      await flushCollector({ config: policyConfig(cold.stateDir), token: 'token-a' });
+
+      assert.equal(eventRequests(coldMock.requests).length, 0, 'cacheなし失敗のflushで送信している');
+      assert.equal(coldMock.requests.length, 2, 'flushがsetupを試行していない');
+      assert.equal(outboxCount(cold, 'token-a'), 0, 'cacheなし失敗のflushでoutboxへ積んでいる');
+      await assertStateDoesNotContain(cold.stateDir, 'AcmeSecret');
+    } finally {
+      coldMock.restore();
+      await cold.cleanup();
     }
   });
 
