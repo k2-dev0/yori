@@ -5,7 +5,7 @@ import { redactConversationText } from '../redaction.js';
 
 // 会社単位のcustom伏せ字policy。APIとcollectorが同じ純粋関数でbuilt-inとcustomを併用する。
 // 未実装exportはundefinedのままassertで失敗させ、Red理由を「policy関数未実装」に固定する。
-// 上限値は本testで固定する: custom literalは4096コードポイント、会社ごとに100件。
+// 上限値は本testで固定する: custom literalは512コードポイント、会社ごとに100件。
 
 interface PolicyRedactionModule {
   redactConversationTextWithPolicy?: (text: string, policy: { version: number; rules: readonly string[] }) => string;
@@ -13,7 +13,7 @@ interface PolicyRedactionModule {
 
 const policyFunction = (redactionModule as unknown as PolicyRedactionModule).redactConversationTextWithPolicy;
 
-const MAX_LITERAL_CODE_POINTS = 4096;
+const MAX_LITERAL_CODE_POINTS = 512;
 const MAX_CUSTOM_RULES = 100;
 
 function applyPolicy(text: string, rules: readonly string[]): string {
