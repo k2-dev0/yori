@@ -4,7 +4,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
 import { CLASSIFY_MESSAGE_PRIORITY, ROUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import { loadCompanyRedactionPolicy } from './redaction-policy.js';
-import { redactConversationTextWithPolicy } from './redaction.js';
+import { redactConversationText, redactConversationTextWithPolicy } from './redaction.js';
 import type { EventsRequest, ParsedEvent } from './schema.js';
 
 export interface AuthContext {
@@ -61,11 +61,13 @@ export async function ingestEvents(pool: Pool, auth: AuthContext, request: Event
     const policy = await loadCompanyRedactionPolicy(client, auth.companyId);
     const results: EventResult[] = [];
     for (const event of request.events) {
-      // 受付境界でも同じ置換を通し、collectorを経ない直接送信でも生値を保存しない。
-      // receipt hash・revision比較・保存はすべて置換後の本文を使う。
-      results.push(
-        await applyEvent(client, auth, request.project_id, { ...event, text: redactConversationTextWithPolicy(event.text, policy) }),
-      );
+      // receiptの衝突判定はcustom policy変更から独立させる。built-inだけを適用した決定的な本文でhashし、
+      // same idempotency_key＋同じ受信bodyはpolicy追加後も同じreceiptとして成功させる。
+      const receiptText = redactConversationText(event.text);
+      // 保存本文はcurrent policyのcustom置換まで適用する。異なる受信bodyが同じplaceholderになっても
+      // receiptTextが異なるため、衝突判定はconflictを維持する。
+      const storedEvent = { ...event, text: redactConversationTextWithPolicy(receiptText, policy) };
+      results.push(await applyEvent(client, auth, request.project_id, storedEvent, receiptText));
     }
     await client.query('COMMIT');
     return { results };
@@ -93,8 +95,19 @@ interface StoredMessage {
 }
 
 // 1件のイベントを冪等キー→session→message/revision→検索受付→job→receiptの順で保存する。
-async function applyEvent(client: PoolClient, auth: AuthContext, projectId: string, event: ParsedEvent): Promise<EventResult> {
-  const requestHash = receiptHash({ companyId: auth.companyId, employeeId: auth.employeeId, projectId, event });
+async function applyEvent(
+  client: PoolClient,
+  auth: AuthContext,
+  projectId: string,
+  event: ParsedEvent,
+  receiptText: string,
+): Promise<EventResult> {
+  const requestHash = receiptHash({
+    companyId: auth.companyId,
+    employeeId: auth.employeeId,
+    projectId,
+    event: { ...event, text: receiptText },
+  });
   const storedReceipt = await client.query<StoredReceipt>(
     `SELECT request_hash, message_id, message_revision, search_request_id
        FROM event_receipts
