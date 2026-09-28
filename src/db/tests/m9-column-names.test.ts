@@ -675,6 +675,7 @@ describe('M9 従来schemaからのdata preservation', () => {
         'usage_events.modelがrequested_modelへ移っていない、またはresponse_modelを壊している',
       );
 
+      await runMigrations(legacy);
       assert.deepEqual(await runMigrations(legacy), [], '0009適用後の再実行でmigrationが再適用された');
       const afterRerun = await legacy.query<{ count: string }>('SELECT count(*)::text AS count FROM sessions');
       assert.equal(afterRerun.rows[0]?.count, '1', '再実行でデータが変わった');
