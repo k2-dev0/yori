@@ -47,6 +47,10 @@ const REQUIRED_TABLES = [
   'document_entities',
   // M7: 明示session引き継ぎリンク。
   'session_links',
+  // M10: 会社単位のcustom伏せ字policyとproject repository alias。
+  'company_redaction_policies',
+  'company_redaction_rules',
+  'project_repositories',
   // M8: 再索引runとDB検索duration観測。
   'reindex_runs',
   'search_duration_samples',
@@ -122,6 +126,7 @@ describe('migration管理', () => {
       '0007_m7.sql',
       '0008_m8.sql',
       '0009_column_names.sql',
+      '0010_custom_redaction.sql',
     ]);
   });
 
@@ -130,7 +135,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '9');
+    assert.equal(versions.rows[0].count, '10');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -144,6 +149,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0007_m7.sql'), '0007_m7.sql がない');
     assert.ok(files.includes('0008_m8.sql'), '0008_m8.sql がない');
     assert.ok(files.includes('0009_column_names.sql'), '0009_column_names.sql がない');
+    assert.ok(files.includes('0010_custom_redaction.sql'), '0010_custom_redaction.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
