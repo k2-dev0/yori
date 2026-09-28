@@ -282,7 +282,11 @@ describe('会話の収集', () => {
         config: fixture.config,
         token: 'token-a',
       });
-      assert.equal(mock.requests.length, 0, '未登録repositoryから送信している');
+      // projects対応表が無い設定はsetup APIの解決を試み、失敗時は本文を読まず送信0件にする。
+      const eventRequests = () => mock.requests.filter((request) => request.url.endsWith('/v1/events'));
+      assert.equal(mock.requests.length, 1, 'cacheなしsetup失敗でもeventを送信している');
+      assert.ok(mock.requests[0].url.endsWith('/v1/collector/setup'), 'setup APIでprojectを解決していない');
+      assert.equal(eventRequests().length, 0, '未登録repositoryから送信している');
       await assertStateDoesNotContain(fixture.stateDir, secret);
 
       const registered = buildCollectorConfig({
@@ -291,14 +295,14 @@ describe('会話の収集', () => {
       });
       await flushCollector({ config: registered, token: 'token-a' });
 
-      assert.equal(mock.requests.length, 1, '登録後のflushで保留分が送信されていない');
-      const [batch] = parseSentBatches(mock.requests);
+      assert.equal(eventRequests().length, 1, '登録後のflushで保留分が送信されていない');
+      const [batch] = parseSentBatches(eventRequests());
       assert.equal(batch.project_id, projectId);
       assert.deepEqual(
         batch.events.map((event) => [event.source_message_id, event.text]),
         [['item-1', '保留される本文']],
       );
-      assert.ok(!mock.requests[0].body.includes(secret));
+      assert.ok(!eventRequests()[0].body.includes(secret));
 
       await collectFromHook({
         source: 'codex',
@@ -306,7 +310,7 @@ describe('会話の収集', () => {
         config: registered,
         token: 'token-a',
       });
-      assert.equal(mock.requests.length, 1, 'flush後に同じ発言を再送している');
+      assert.equal(eventRequests().length, 1, 'flush後に同じ発言を再送している');
     } finally {
       mock.restore();
       await fixture.cleanup();
