@@ -5,7 +5,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 ## 前提
 
 - Node.js 24以降と`git`（案件特定に`git -C <cwd> rev-parse`と`remote.origin.url`を使う）。
-- 中央APIの社員token（`POST /v1/events`のBearer）と、案件の`project_id`。
+- 中央APIの社員token（`POST /v1/events`・`POST /v1/collector/setup`のBearer）。案件は設定の`project_id`ではなく、hook cwdのcanonical repositoryでsetup APIが解決する。
 - 対応版: Codex Desktopは`cli_version=0.155.0-alpha.9.2`と`0.155.0-alpha.16.4`、Claude Codeは`2.1.220`。明示した版だけを許可し、外部Codex CLI `0.156.1`はDesktop transcriptの確認根拠がないため対象に含めない。未知版のログは本文を取り込まず診断にだけ記録して保留する。旧版形式へのフォールバックはしない。
 - 外部へ送る先は設定の中央APIだけ。Jev/Voyage等の呼出しはない。
 
@@ -17,17 +17,14 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 {
   "api_url": "https://yori.example.com",
   "token_env": "YORI_TOKEN",
-  "state_dir": "/Users/example/.yori-collector",
-  "projects": [
-    { "repository": "github.com/example/project-a", "project_id": "018f0a00-0000-7000-8000-000000000001" }
-  ]
+  "state_dir": "/Users/example/.yori-collector"
 }
 ```
 
 - `api_url`はHTTPSのみ（開発用loopback `http://127.0.0.1`等だけHTTP可）。userinfo/query/fragmentは拒否する。
-- `repository`は`host/path`のcanonical形式。HTTPS/SSH/SCP形式のremote URLを書いても正規化される。同じremoteのworktreeは同じ案件になる。
-- 同じrepositoryの重複・未登録repositoryは拒否・保留する。ディレクトリ名から案件を推定しない。
+- `projects`（`repository`と`project_id`の対応表）は旧設定との後方互換で任意。新しい設定では書かず、hook cwdの`git remote.origin.url`からcanonical repositoryを求めて`POST /v1/collector/setup`でprojectとcurrent伏せ字policyを解決する。ディレクトリ名から案件を推定しない。
 - 正規化後のrepositoryは既存APIと同じ1024 UTF-8 bytes以内とし、NUL・単独サロゲートを拒否する。収集入口でも確認し、超過値をoutboxへ入れない。
+- setupで解決したprojectとpolicyは`state_dir`のSQLiteへcacheする。rulesはtoken由来の鍵で暗号化し、平文literalをstateへ残さない。collectは毎回setupを試み、cacheなしの失敗は本文を読まず送信0件、cacheありの一時失敗はlast-known policyで継続する。
 
 ## フック
 
@@ -55,6 +52,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 ## CLI
 
 開発時はtsx、配布時は`node dist/collector/cli.js`で同じentryを実行する。
+`npm run build`は依存をbundleした`dist/collector/yori-collector.mjs`と、version・checksumを持つ`dist/collector/collector-manifest.json`も生成する。repositoryやnode_modulesを持たない端末では、この1ファイルをNode.js 24以降で実行する。
 
 ```sh
 npm run collector:collect -- --source codex --config ~/.yori-collector.json < hook.json
@@ -78,7 +76,7 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 
 ## 診断と制約
 
-- 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
+- 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。会社のcustom rule（exact・case-sensitive・最長一致・最大100件/4096コードポイント、regexなし）は`[REDACTED:custom]`へ置換し、built-in置換を弱めない。collectorを経ないAPI直接送信でも受付側で同じpolicyを適用する。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
 - 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。本文長の判定は置換後に行う。
 - Codex Desktopから収集するのは`event_msg/item_completed`の`UserMessage`と`AgentMessage`だけ。`response_item`、`turn_context`、`token_usage_record`、`world_state`、`compacted`は既知の非会話top-level recordとして無診断で無視する。`Reasoning`、`CommandExecution`、`FileChange`、`Extension`、tool call/outputも収集しない。未知のtop-level typeは`transcript_unknown_record`として診断する。
 - 完成行を文字列へ変換する前にUTF-8を検証する。不正バイトを含む行は置換せず除外し、`transcript_invalid_utf8`とoffsetを記録する。正常なUnicodeと後続行は保持する。未完行の途中で切れた文字は完成まで判定しない。
