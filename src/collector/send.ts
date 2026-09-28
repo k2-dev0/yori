@@ -15,6 +15,13 @@ export interface DeliverPendingInput {
   token: string;
   automatic: boolean;
   blockedProjects: ReadonlySet<string>;
+  // setup APIで解決した (project, repository) の組。設定のprojects対応表が無くてもoutboxを送れるようにする。
+  resolvedTargets?: ReadonlySet<string>;
+}
+
+// resolvedTargetsのkey。project_idとcanonical repositoryの組を衝突なく表す。
+export function resolvedTargetKey(projectId: string, sourceScope: string): string {
+  return `${projectId}\n${sourceScope}`;
 }
 
 type PostOutcome =
@@ -107,7 +114,7 @@ interface QueueTarget {
 // config.projectsと対応が取れないoutbox（設定から削除・再割当）は送らず保持する。
 // automaticは恒久failedとbackoff中を対象にしない。
 function selectDeliverableProject(
-  input: Pick<DeliverPendingInput, 'state' | 'namespace' | 'config' | 'automatic' | 'blockedProjects'>,
+  input: Pick<DeliverPendingInput, 'state' | 'namespace' | 'config' | 'automatic' | 'blockedProjects' | 'resolvedTargets'>,
 ): QueueTarget | null {
   const rows = input.state.db
     .prepare(
@@ -125,7 +132,8 @@ function selectDeliverableProject(
     const configured = input.config.projects.some(
       (project) => project.project_id === projectId && project.repository === sourceScope,
     );
-    if (!configured) {
+    const resolved = input.resolvedTargets?.has(resolvedTargetKey(projectId, sourceScope)) ?? false;
+    if (!configured && !resolved) {
       continue;
     }
     if (input.blockedProjects.has(projectId)) {
