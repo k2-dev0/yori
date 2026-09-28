@@ -8,3 +8,9 @@ CLAUDE.md
 
 node_modules/
 dist/
+
+# 本番envの実値は追跡しない（.env.exampleだけを再包含する）。
+.env
+.env.*
+*.env
+!.env.example
