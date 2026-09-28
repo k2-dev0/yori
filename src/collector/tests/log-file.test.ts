@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { MAX_BATCH_SIZE, MAX_EVENT_BODY_BYTES } from '../../api/contract.js';
 import { collectFromHook, flushCollector } from '../collect.js';
-import { closeCollectorState, collectorNamespace, getCursor, listCollectorDiagnostics, openCollectorState } from '../state.js';
+import { closeCollectorState, collectorNamespace, getCursor, getSession, listCollectorDiagnostics, openCollectorState } from '../state.js';
 import {
   ackResponse,
   appendTranscript,
@@ -41,6 +41,10 @@ function codexPaddedLine(targetBytes: number, messageId: string): string {
   assert.ok(targetBytes >= baseBytes, '指定byte長が小さい');
   return build(targetBytes - baseBytes);
 }
+
+// 実装予定のCodex複数版allowlist。未実装のexportへ依存せずliteralで固定する。
+const NEW_CODEX_CLI_VERSION = '0.155.0-alpha.16.4';
+const OLD_CODEX_CLI_VERSION = '0.155.0-alpha.9.2';
 
 describe('transcript差分と診断', () => {
   it('不正UTF-8の行を置換せず除外し、両エージェントの正常な後続本文を保持する', async () => {
@@ -914,6 +918,304 @@ describe('transcript差分と診断', () => {
         sentEvents(mock.requests).map((event) => [event.source_message_id, event.text]),
         [['ok-1', '正常sessionの本文']],
       );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('Desktop確認版0.155.0-alpha.16.4のsessionとUserMessage/AgentMessage commentary/finalを収集する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1', NEW_CODEX_CLI_VERSION),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-user', role: 'user', text: 'fixture-user-text', timestamp: '2026-09-21T10:00:01.000+09:00' }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-commentary', role: 'assistant', text: 'fixture-assistant-commentary-text', phase: 'commentary' }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-final', role: 'assistant', text: 'fixture-assistant-final-text', phase: 'final_answer' }),
+      ]);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.source_session_id, event.role, event.text, event.occurred_at, event.sequence_no]),
+        [
+          ['item-user', 'session-1', 'user', 'fixture-user-text', '2026-09-21T01:00:01.000Z', 1],
+          ['item-commentary', 'session-1', 'assistant', 'fixture-assistant-commentary-text', '2026-09-21T00:00:01.000Z', 2],
+          ['item-final', 'session-1', 'assistant', 'fixture-assistant-final-text', '2026-09-21T00:00:01.000Z', 3],
+        ],
+      );
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 1, '再読込で再送している');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('新旧Codex版のeventは既存schemaのfieldだけを送り、record内の不要内容を混入しない', async () => {
+    const extraUser = JSON.stringify({
+      timestamp: '2026-09-21T00:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: 'session-1',
+        turn_id: 'FIXTURE_TURN_ID',
+        item: {
+          id: 'item-user',
+          type: 'UserMessage',
+          extra: 'FIXTURE_USER_EXTRA',
+          content: [
+            { type: 'text', text: 'fixture-user-text' },
+            { type: 'input_text' },
+          ],
+        },
+      },
+      top_level_extra: 'FIXTURE_TOP_EXTRA',
+    });
+    const extraAssistant = JSON.stringify({
+      timestamp: '2026-09-21T00:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: 'session-1',
+        turn_id: 'FIXTURE_TURN_ID',
+        item: {
+          id: 'item-assistant',
+          type: 'AgentMessage',
+          phase: 'final_answer',
+          extra: 'FIXTURE_ASSISTANT_EXTRA',
+          content: [
+            { type: 'Text', text: 'fixture-assistant-text' },
+            { type: 'Reasoning' },
+          ],
+        },
+      },
+      top_level_extra: 'FIXTURE_TOP_EXTRA',
+    });
+    const expectedEventKeys = [
+      'idempotency_key',
+      'source',
+      'source_scope',
+      'source_session_id',
+      'source_message_id',
+      'sequence_no',
+      'revision',
+      'role',
+      'occurred_at',
+      'text',
+    ].sort();
+    for (const cliVersion of [OLD_CODEX_CLI_VERSION, NEW_CODEX_CLI_VERSION]) {
+      const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+      const mock = installFetchMock(ackResponse);
+      try {
+        const transcript = path.join(fixture.root, 'codex.jsonl');
+        await writeTranscript(transcript, [codexSessionLine('session-1', cliVersion), extraUser, extraAssistant]);
+        await collectFromHook({
+          source: 'codex',
+          hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+          config: fixture.config,
+          token: 'token-a',
+        });
+        const events = sentEvents(mock.requests);
+        assert.deepEqual(
+          events.map((event) => Object.keys(event).sort()),
+          [expectedEventKeys, expectedEventKeys],
+          `${cliVersion}でeventへ不要fieldが混入している`,
+        );
+        assert.deepEqual(
+          events.map((event) => [
+            event.source,
+            event.source_scope,
+            event.source_session_id,
+            event.source_message_id,
+            event.sequence_no,
+            event.revision,
+            event.role,
+            event.occurred_at,
+            event.text,
+          ]),
+          [
+            ['codex', 'github.com/Org/Repo', 'session-1', 'item-user', 1, 1, 'user', '2026-09-21T00:00:02.000Z', 'fixture-user-text'],
+            ['codex', 'github.com/Org/Repo', 'session-1', 'item-assistant', 2, 1, 'assistant', '2026-09-21T00:00:03.000Z', 'fixture-assistant-text'],
+          ],
+        );
+        const sentBody = JSON.stringify(mock.requests.map((request) => request.body));
+        for (const marker of ['FIXTURE_TURN_ID', 'FIXTURE_USER_EXTRA', 'FIXTURE_TOP_EXTRA', 'FIXTURE_ASSISTANT_EXTRA']) {
+          assert.ok(!sentBody.includes(marker), `${cliVersion}で${marker}を送信している`);
+        }
+      } finally {
+        mock.restore();
+        await fixture.cleanup();
+      }
+    }
+  });
+
+  it('Desktop確認版の既知非会話top-levelは無診断で無視し、未知top-levelだけを診断する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const lines = [
+        codexSessionLine('session-1', NEW_CODEX_CLI_VERSION),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-user', role: 'user', text: 'fixture-user-text' }),
+        JSON.stringify({ timestamp: '2026-09-21T00:00:02.000Z', type: 'turn_context', payload: { turn_id: 'fixture-turn', model: 'fixture-model' } }),
+        JSON.stringify({ timestamp: '2026-09-21T00:00:03.000Z', type: 'token_usage_record', payload: { total_tokens: 1 } }),
+        JSON.stringify({ timestamp: '2026-09-21T00:00:04.000Z', type: 'world_state', payload: { cwd: '/fixture' } }),
+        JSON.stringify({
+          timestamp: '2026-09-21T00:00:05.000Z',
+          type: 'response_item',
+          payload: { type: 'message', extra: 'FIXTURE_RESPONSE_ITEM_EXTRA' },
+        }),
+        JSON.stringify({ timestamp: '2026-09-21T00:00:06.000Z', type: 'future_record', payload: { extra: 'FIXTURE_UNKNOWN_EXTRA' } }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-assistant', role: 'assistant', text: 'fixture-assistant-text' }),
+      ];
+      await writeTranscript(transcript, lines);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      });
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.sequence_no]),
+        [
+          ['item-user', 1],
+          ['item-assistant', 2],
+        ],
+      );
+      const state = openCollectorState(fixture.stateDir);
+      const diagnostics = listCollectorDiagnostics(state);
+      closeCollectorState(state);
+      assert.deepEqual(diagnostics, [{ code: 'transcript_unknown_record', byteOffset: lineByteOffset(lines, 6) }]);
+      assert.ok(!JSON.stringify(mock.requests.map((request) => request.body)).includes('FIXTURE_RESPONSE_ITEM_EXTRA'));
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('未知版Codexへ切り替わるscanは送信・cursor・message/outbox/sequenceをrollbackし、診断だけ残す', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const prefix = [
+        codexSessionLine('session-1', OLD_CODEX_CLI_VERSION),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'fixture-user-text' }),
+      ];
+      await writeTranscript(transcript, prefix);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-1', 1]],
+      );
+
+      // 同一scanに確認済み版の切替後発言と未知版metadataを置き、切替前の確定分だけが残ることを見る。
+      const switched = codexSessionLine('session-1', NEW_CODEX_CLI_VERSION);
+      const nextMessage = codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'user', text: 'fixture-user-text-2' });
+      const unknown = codexSessionLine('session-1', '0.155.0-alpha.16.5');
+      const laterMessage = codexMessageLine({ sessionId: 'session-1', messageId: 'item-3', role: 'assistant', text: 'fixture-assistant-text' });
+      assert.equal(Buffer.byteLength(unknown, 'utf8'), Buffer.byteLength(switched, 'utf8'));
+      const lines = [...prefix, switched, nextMessage, unknown, laterMessage];
+      await writeTranscript(transcript, lines);
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 1, '未知版scanの後続発言を送信している');
+
+      const namespace = collectorNamespace(fixture.config.api_url, 'token-a');
+      const state = openCollectorState(fixture.stateDir);
+      const diagnostics = listCollectorDiagnostics(state);
+      const cursor = getCursor(state, namespace, 'codex', 'session-1', transcript);
+      const session = getSession(state, namespace, 'codex', 'session-1');
+      const stored = state.db
+        .prepare('SELECT source_message_id, sequence_no FROM stored_messages WHERE namespace = ? AND source = ? AND source_session_id = ? ORDER BY sequence_no')
+        .all(namespace, 'codex', 'session-1')
+        .map((row) => [String(row.source_message_id), Number(row.sequence_no)]);
+      const outboxCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM outbox WHERE namespace = ?').get(namespace) as { count: number }).count);
+      closeCollectorState(state);
+      assert.deepEqual(diagnostics, [{ code: 'transcript_unknown_version', byteOffset: lineByteOffset(lines, 4) }]);
+      assert.equal(cursor?.byte_offset, lineByteOffset(lines, 2), '保留scanでcursorが進んでいる');
+      assert.equal(session?.next_sequence, 2, '保留scanでsequenceが進んでいる');
+      assert.deepEqual(stored, [['item-1', 1]], '保留scanのmessageが残っている');
+      assert.equal(outboxCount, 0, '保留scanのoutboxが残っている');
+
+      // 未知版行だけを対応版へ書き換えると、保留していた発言を同じsequence順で回収する。
+      await writeTranscript(transcript, [...prefix, switched, nextMessage, codexSessionLine('session-1', NEW_CODEX_CLI_VERSION), laterMessage]);
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.sequence_no]),
+        [
+          ['item-2', 2],
+          ['item-3', 3],
+        ],
+      );
+      assert.equal(mock.requests.length, 2);
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('同じsession IDで旧確認版から新確認版へsession_metaが切り替わってもidentityとsequenceを維持する', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const oldSession = codexSessionLine('session-1', OLD_CODEX_CLI_VERSION);
+      const newSession = codexSessionLine('session-1', NEW_CODEX_CLI_VERSION);
+      await writeTranscript(transcript, [
+        oldSession,
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'fixture-user-text' }),
+      ]);
+      const options = {
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.sequence_no]),
+        [['item-1', 1]],
+      );
+
+      // 旧版session_metaから新版へ切り替わっても同一sessionとしてsequenceを継続する。
+      await appendTranscript(transcript, `${newSession}\n${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: 'fixture-assistant-text' })}\n`);
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.source_session_id, event.sequence_no]),
+        [['item-2', 'session-1', 2]],
+      );
+
+      // 逆方向の切替でも同じidentity・sequenceを維持する。
+      await appendTranscript(transcript, `${oldSession}\n${codexMessageLine({ sessionId: 'session-1', messageId: 'item-3', role: 'user', text: 'fixture-user-text-2' })}\n`);
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(2)).map((event) => [event.source_message_id, event.source_session_id, event.sequence_no]),
+        [['item-3', 'session-1', 3]],
+      );
+
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 3, '再読込で再送している');
+      const events = sentEvents(mock.requests);
+      assert.deepEqual([...new Set(events.map((event) => event.source_session_id))], ['session-1']);
+      assert.deepEqual(events.map((event) => event.sequence_no), [1, 2, 3]);
+
+      const state = openCollectorState(fixture.stateDir);
+      const session = getSession(state, collectorNamespace(fixture.config.api_url, 'token-a'), 'codex', 'session-1');
+      closeCollectorState(state);
+      assert.equal(session?.next_sequence, 4, '切替でsequenceが巻き戻っている');
     } finally {
       mock.restore();
       await fixture.cleanup();
