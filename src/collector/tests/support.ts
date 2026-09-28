@@ -9,7 +9,7 @@ import { v7 as uuidv7 } from 'uuid';
 import type { EventInput } from '../../api/contract.js';
 import { eventsRequestSchema, type EventsRequest } from '../../api/schema.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION } from '../adapters/claude.js';
-import { SUPPORTED_CODEX_CLI_VERSION } from '../adapters/codex.js';
+import { SUPPORTED_CODEX_CLI_VERSIONS } from '../adapters/codex.js';
 import type { CollectorHookInput } from '../collect.js';
 import type { CollectorConfig, CollectorProject } from '../config.js';
 
@@ -154,7 +154,10 @@ export function lineByteOffset(lines: string[], index: number): number {
   return Buffer.byteLength(`${lines.slice(0, index).join('\n')}\n`, 'utf8');
 }
 
-export function codexSessionLine(sessionId: string, cliVersion: string = SUPPORTED_CODEX_CLI_VERSION): string {
+// fixtureの既定はallowlist末尾の最新確認版。旧確認版を使うtestはliteralを明示する。
+const DEFAULT_CODEX_CLI_VERSION = SUPPORTED_CODEX_CLI_VERSIONS[SUPPORTED_CODEX_CLI_VERSIONS.length - 1];
+
+export function codexSessionLine(sessionId: string, cliVersion: string = DEFAULT_CODEX_CLI_VERSION): string {
   return JSON.stringify({
     timestamp: '2026-09-21T00:00:00.000Z',
     type: 'session_meta',
