@@ -102,7 +102,7 @@ describe('POST /v1/events のcustom伏せ字適用', () => {
     assert.equal(await readCurrentRevisionText(existingMessageId), existing.text);
 
     await savePolicy(workspace.companyId, 1, ['AcmeSecret']);
-    const fresh = buildEventInput({ idempotency_key: 'after-policy-1', text: 'AcmeSecret を含む新規本文' });
+    const fresh = buildEventInput({ idempotency_key: 'after-policy-1', sequence_no: 2, text: 'AcmeSecret を含む新規本文' });
     const freshResponse = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [fresh]) });
     assert.equal(freshResponse.statusCode, 202, `新規本文の受付に失敗: ${freshResponse.statusCode} ${freshResponse.body}`);
     const freshMessageId = freshResponse.json<EventsResponse>().results[0]!.message_id;
