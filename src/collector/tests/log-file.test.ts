@@ -334,7 +334,7 @@ describe('transcript差分と診断', () => {
       const transcript = path.join(fixture.root, 'codex.jsonl');
       const message = codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '対応版の本文' });
       const unknownVersion = codexSessionLine('session-1', '0.155.0-alpha.9.3');
-      const supportedVersion = codexSessionLine('session-1');
+      const supportedVersion = codexSessionLine('session-1', '0.155.0-alpha.9.2');
       assert.equal(Buffer.byteLength(unknownVersion, 'utf8'), Buffer.byteLength(supportedVersion, 'utf8'));
       await writeTranscript(transcript, [unknownVersion, message]);
       const options = {
