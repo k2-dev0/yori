@@ -76,7 +76,7 @@ sudo vi /etc/yori/yori.env
 ```
 
 - 書式は`.env.example`と同じ`KEY=VALUE`。placeholderを実値へ置き換える。
-- 実secretを`docker compose`や`node`のcommand line引数へ書かず、`--env-file /etc/yori/yori.env`で渡す。
+- 実secretを`docker compose`や`node`のcommand line引数へ書かず、`--env-file /etc/yori/yori.env`で渡す。env fileはroot:root 0600なので、これを読む`docker compose`・`node`の各CLI commandは`sudo`で実行する。
 - `YORI_POSTGRES_PASSWORD`は`openssl rand -hex 32`が出力する小文字64桁hexを使う（`@`等のURL予約文字を含まない）。
 
 ### 2. 設定を検査する
@@ -84,12 +84,12 @@ sudo vi /etc/yori/yori.env
 ```sh
 cd <repository>
 sudo node --env-file=/etc/yori/yori.env deployment/check-production-config.mjs
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools config > /dev/null
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools config > /dev/null
 ```
 
 - `node --env-file=/etc/yori/yori.env`はNode 24がenv fileを読み、env fileをshのsourceとして評価しない。`/etc/yori/yori.env`はroot:root 0600のため読み取る`node` commandへ`sudo`を付ける。値はcommand lineへ書かない。
 - `deployment/check-production-config.mjs`はprocess.envの10キーの未設定・空と、`YORI_POSTGRES_PASSWORD`が小文字64桁hexであることを検査する。成功0・失敗非0で、検査値は出力しない。
-- Compose側の検査は`docker compose ... config`で行う。`--env-file`を省いたり値をcommand lineへ渡したりしない。
+- Compose CLIも`--env-file /etc/yori/yori.env`を自身で読むため、productionの`docker compose` commandはすべて`sudo docker compose --env-file /etc/yori/yori.env ...`で実行する。一般ユーザーではroot:root 0600のenv fileを読めずpermission deniedになる。`--env-file`を省いたり値をcommand lineへ渡したりしない。
 
 ### 3. 初期構築順序
 
@@ -101,14 +101,14 @@ docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml 
 6. health・TLS・job・metricsを確認する。
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
 # yori-cli bootstrap（下記のexternal network接続）
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm --no-deps worker npm run provider:approve -- /path/to/approval.json
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm --no-deps worker npm run provider:approve -- /path/to/approval.json
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d
 curl -sS https://<YORI_DOMAIN>/health/live
 curl -sS https://<YORI_DOMAIN>/health/ready
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml ps
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml ps
 ```
 
 - `provider:approve`は`run --rm --no-deps worker`で実行する。`--no-deps`はapi/workerを起動せず、手順1で起動済みのdbへ同一networkで接続する前提。承認JSONはcredentialを含めない。順序の詳細は[docs/worker.md](../docs/worker.md)を参照する。
@@ -121,7 +121,7 @@ docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml 
 ### 5. 手動DB操作
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
 ### 6. 更新とrollback
@@ -129,8 +129,8 @@ docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml 
 更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy
 ```
 
 - migrationはforward-onlyで、down migrationは提供しない。適用済みschemaは旧migration fileや旧base imageへ戻しても戻らない。
@@ -215,9 +215,9 @@ M8実装済み: 世代別再索引（`worker:reindex`）、明示的な世代削
 
 ```sh
 # migration適用後、通常serviceを起動する（caddyは含まれない）
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d api worker
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:reindex -- <project-uuid>
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d api worker
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:reindex -- <project-uuid>
 ```
 
 - 再索引中も旧generationのactive検索を継続する。cutoverは `projects` 行を `FOR UPDATE` し、全current searchable desired revisionのtarget embedding・publication・stale=false・input_hash一致を再確認してから、`projects.active_generation_id` をtargetへ変更する。
@@ -226,7 +226,7 @@ docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml 
 - 旧generationの削除は明示CLIだけが行う。active project、未完了reindex runのsource/target、pending/runningのsearch requestが参照する世代は削除を拒否する。
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:generation-delete -- <generation-uuid>
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:generation-delete -- <generation-uuid>
 ```
 
 ## M8の運用metricsと性能手順
@@ -234,7 +234,7 @@ docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml 
 `worker:metrics <project-uuid>` はproject scopeのJSONだけをstdoutへ返し、本文・credential・検索条件を含めない。
 
 ```sh
-docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:metrics -- <project-uuid>
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm worker npm run worker:metrics -- <project-uuid>
 ```
 
 - `generations`：generation別の `documents`（searchableかつpublicationあり）、`vectors`（embedding件数）、`estimated_vector_bytes`（`vectors × (4×dimensions+8)`）。
@@ -247,9 +247,9 @@ Lightsail等のLinux VMへ配置する手順の出発点（詳細は「本番設
 1. VM上で`/etc/yori/yori.env`をroot:root 0600で作成し、`sudo node --env-file=/etc/yori/yori.env deployment/check-production-config.mjs`で10キーとpassword形式を検査する。
 2. VMは2 GBから開始する。Docker EngineとComposeを導入し、22/tcp（管理・通常は送信元IP制限）、80/tcp、443/tcp・443/udpだけをfirewallで許可する。DB portは公開しない。
 3. DNSで `YORI_DOMAIN` をVMの公開IPへ向ける。`YORI_DOMAIN` を実domainにしてproduction profileを起動すると、Caddyがautomatic HTTPSで証明書を取得する。80はACMEとHTTPS redirectに使う。
-4. `docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db` でdbを起動し、`docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用する。yori-cli bootstrapと`run --rm --no-deps worker npm run provider:approve -- ...`の後、`docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d` でapi・worker・db・caddyを起動する。apiのhost公開はloopbackのみ、caddy data/configとPostgreSQLはnamed volumeへ永続化される。
-5. `curl -sS https://<YORI_DOMAIN>/health/live` と `/health/ready`、`docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml ps` でhealthを確認する。
-6. 更新・rollback: このComposeのnode serviceはホストのsource treeを `/app` へbind mountするため、Node imageのdigestは**アプリ版を固定しない**（依存導入と実行環境の版）。アプリ版はGit commitで管理する。更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。`docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用し、`docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy` のようにserviceを明示再作成して新しいsourceを読み直させる。`down -v` は実行しない（volumeを保持する）。
+4. `sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db` でdbを起動し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用する。yori-cli bootstrapと`run --rm --no-deps worker npm run provider:approve -- ...`の後、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d` でapi・worker・db・caddyを起動する。apiのhost公開はloopbackのみ、caddy data/configとPostgreSQLはnamed volumeへ永続化される。
+5. `curl -sS https://<YORI_DOMAIN>/health/live` と `/health/ready`、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml ps` でhealthを確認する。
+6. 更新・rollback: このComposeのnode serviceはホストのsource treeを `/app` へbind mountするため、Node imageのdigestは**アプリ版を固定しない**（依存導入と実行環境の版）。アプリ版はGit commitで管理する。更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy` のようにserviceを明示再作成して新しいsourceを読み直させる。`down -v` は実行しない（volumeを保持する）。
    - migrationはforward-onlyで、down migrationは提供しない。適用済みschemaは旧migration fileや旧base imageへ戻しても戻らない。
    - rollbackできるのは、適用済みschemaと後方互換な旧sourceへ戻し、依存を復元し、api/worker/caddyを同じく明示再作成する場合だけ。非互換なschema変更後はこの手順だけではrollbackできず、事前に取得した管理者snapshotからのrestoreまたはforward fixが必要。自動backupは今回の実装対象外で、単一VM・バックアップなしのため保証範囲はこのVM内に限る。
 7. 資源は `docker stats`、`df -h`、`docker system df`、composeのjson-file log rotation（max-size 10m / max-file 3）で監視する。metricsの `search_duration_ms.p50/p95` と `reindex.pending_documents`、job滞留を確認する。
