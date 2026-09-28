@@ -738,7 +738,7 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 |---|---|
 | M0 | API受付契約とM2のフック仕様・実ログ構造を確認。Jev/Voyage/MCPのSDK・外部仕様確認は各工程で継続 |
 | M1 | 実装済み。イベント受付・認証・冪等保存・revision・永続ジョブ・自動検索受付・Compose・原文永続化 |
-| M2 | ローカル実装済み。両アダプター・登録案件の判定・SQLite未送信キューと読取位置・再送・診断CLI。合成fixtureから既存API/DBまで検証。導入は[収集手順](docs/collector.md)、確定仕様は[実装契約](docs/collector-design.md) |
+| M2 | ローカル実装済み。両アダプター・登録案件の判定・SQLite未送信キューと読取位置・再送・診断CLI。Codex Desktopは確認済み2版の明示allowlistで収集し、未知版を保留する。合成fixtureから既存API/DBまで検証。導入は[収集手順](docs/collector.md)、確定仕様は[実装契約](docs/collector-design.md) |
 | M3 | ローカル実装済み。Jev分類・選別・関係保存、new_search/reuse/skip振り分け、評価cache、送信承認、2 lane worker・再試行CLI。合成HTTPと実PostgreSQLで検証。運用は[worker手順](docs/worker.md)、確定仕様は[実装契約](docs/m3-design.md) |
 | M4 | ローカル実装済み。決定的文書分割、VoyageEmbeddingProvider、送信ゲート、世代・公開revision・原文対応・cache。確定仕様は[実装契約](docs/m4-design.md) |
 | M5 | ローカル実装済み。案件内の厳密vector検索、明示識別子完全一致、RRF、Jev候補判定、原文根拠付き結果保存、世代・revision・lease競合制御。確定仕様は[実装契約](docs/m5-design.md) |
@@ -747,6 +747,8 @@ MCPアダプターはローカルstdioを基本とし、共通HTTPS APIを呼ぶ
 | M8 | ローカル実装済み。旧世代を維持する再索引・原子的世代切替、検索要求の世代固定、明示世代削除、案件別metrics、Caddy HTTPS production profile、VM運用・増設手順。確定仕様は[実装契約](docs/m8-design.md)。実Lightsail/domain/証明書・高負荷性能検証は未実施 |
 
 検証: 収集単独63件、既存API/DBと収集を含む130件が成功。配置・永続化7件、typecheck/lint/buildも成功。外部AIへ実データ送信なし。対応確認版はCodex Desktop `0.155.0-alpha.9.2`とClaude Code `2.1.220`。未知版は保留。実Gitの既存repository解決は確認したが、実worktree作成のスモークは環境の`.git`保護により未確認。Stop時点でまだログにない発言は次のhookまたは明示flushで回収するため、M6の即時検索完了とは扱わない。
+
+2026-09-28のCodex Desktop互換性追加では、対応確認版を`0.155.0-alpha.9.2`と`0.155.0-alpha.16.4`の明示allowlistへ更新した。外部Codex CLI `0.156.1`はDesktop transcriptとしての確認根拠がないため対象外。collector単独87件とrepository全体の`npm test`（src/API/DB/worker/MCPおよび配置・永続化22件）、typecheck、lint、buildが成功した。実ログ本文・社員会話・command・tool output・reasoning・秘密はfixtureへ持ち込まず、record typeとkeyだけを合成fixtureで検証した。
 
 ユーザー選択に基づき、リポジトリ識別子上限、不正UTF-8の非送信、元worktree消失後の保存済みキュー再送を修正。同一発言IDの過去本文を含むログの再読込による改訂増殖は、通常運用での発生条件が未確認のため修正保留。詳細は収集手順の既知の制限を参照する。
 
