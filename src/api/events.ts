@@ -3,7 +3,8 @@ import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
 import { CLASSIFY_MESSAGE_PRIORITY, ROUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
-import { redactConversationText } from './redaction.js';
+import { loadCompanyRedactionPolicy } from './redaction-policy.js';
+import { redactConversationTextWithPolicy } from './redaction.js';
 import type { EventsRequest, ParsedEvent } from './schema.js';
 
 export interface AuthContext {
@@ -56,11 +57,15 @@ export async function ingestEvents(pool: Pool, auth: AuthContext, request: Event
       EVENT_WRITE_LOCK_NAMESPACE,
       `${auth.companyId}:${auth.employeeId}`,
     ]);
+    // 認証会社のcurrent policyをbatch単位で1回読み、全eventへ同じ規則を適用する。
+    const policy = await loadCompanyRedactionPolicy(client, auth.companyId);
     const results: EventResult[] = [];
     for (const event of request.events) {
       // 受付境界でも同じ置換を通し、collectorを経ない直接送信でも生値を保存しない。
       // receipt hash・revision比較・保存はすべて置換後の本文を使う。
-      results.push(await applyEvent(client, auth, request.project_id, { ...event, text: redactConversationText(event.text) }));
+      results.push(
+        await applyEvent(client, auth, request.project_id, { ...event, text: redactConversationTextWithPolicy(event.text, policy) }),
+      );
     }
     await client.query('COMMIT');
     return { results };
