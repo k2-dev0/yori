@@ -4,7 +4,8 @@ import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contract.js';
 import type { AuthContext } from './events.js';
-import { redactConversationText } from './redaction.js';
+import { loadCompanyRedactionPolicy } from './redaction-policy.js';
+import { redactConversationTextWithPolicy } from './redaction.js';
 import type { EvidenceView, NotReceivedView, SearchLookupView, SearchView } from './response-schema.js';
 import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
 import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
@@ -69,7 +70,6 @@ function manualConditionHash(input: ParsedSearchRequest): Buffer {
 // それ以外は冪等キー単位でmanual受付とexecute_search jobを同一TXで作る。
 export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: ParsedSearchRequest): Promise<CreatedSearch> {
   // 質問本文も保存・Jev送信の前に置換し、条件hashと自動受付の再利用判定も置換後の本文で行う。
-  const request: ParsedSearchRequest = { ...rawRequest, query: redactConversationText(rawRequest.query) };
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -78,6 +78,8 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
       EVENT_WRITE_LOCK_NAMESPACE,
       `${auth.companyId}:${auth.employeeId}`,
     ]);
+    const policy = await loadCompanyRedactionPolicy(client, auth.companyId);
+    const request: ParsedSearchRequest = { ...rawRequest, query: redactConversationTextWithPolicy(rawRequest.query, policy) };
     const targetResult = await client.query<InputTargetRow>(
       `SELECT m.id, m.role, m.current_revision, m.sequence_no, m.session_id,
               s.employee_id, s.project_id, p.company_id, r.text
