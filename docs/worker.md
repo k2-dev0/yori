@@ -5,6 +5,7 @@
 ## 前提
 
 - `0005_m5.sql`適用済みのPostgreSQL（M3/M4 migrationを含む）。workerはmigrationを実行しない。
+- 本番は`/etc/yori/yori.env`（root:root 0600）の`YORI_POSTGRES_*`/`JEV_*`/`VOYAGE_*`を使い、起動前に`deployment/check-production-config.mjs`で検査する。詳細は[deployment/README.md](../deployment/README.md)。
 - `JEV_API_KEY`/`JEV_ACCOUNT_REF`と`VOYAGE_API_KEY`/`VOYAGE_ACCOUNT_REF`。未設定・不正なら偽の判定・送信へ進まず`invalid_worker_config`で起動に失敗する。
 - `JEV_API_URL`はHTTPS（開発用loopback HTTPのみ）で、pathは`/v1/systemone`固定。`VOYAGE_API_URL`は`/v1/embeddings`固定。userinfo・query・fragmentは拒否する。3xxは追従せず、承認外endpointへ資格情報や本文を送らない。
 - 実データを送る前に、管理者がTypeSafe/Voyage側のアカウント設定を確認する。この承認記録は設定を変更・証明しない。
@@ -30,15 +31,21 @@
 
 ## 起動
 
-`deployment/compose.yaml`の`worker`はapiのhealthcheck後に起動し、共有node_modules volumeへの同時`npm ci`を避ける。migration適用後に起動する。
+`deployment/compose.yaml`の`worker`はapiのhealthcheck後に起動し、共有node_modules volumeへの同時`npm ci`を避ける。本番のcredentialは`/etc/yori/yori.env`からComposeへ渡し、migration・bootstrap・承認登録の後に起動する。
 
 ```sh
-docker compose -p yori -f deployment/compose.yaml up -d --wait db
-docker compose -p yori -f deployment/compose.yaml --profile tools run --rm migrate
-docker compose -p yori -f deployment/compose.yaml up -d api worker
+docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db
+docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+# 別repositoryの yori-cli bootstrap（会社・社員・案件・所属・token）
+docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml run --rm --no-deps worker npm run provider:approve -- /path/to/approval.json
+docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d api worker
 ```
 
-tsxで直接動かす場合:
+- 起動順序は migration → yori-cli bootstrap → `provider:approve`（Jev／Voyage承認）→ worker起動。`provider:approve`はdb起動後・api/worker本起動前に`run --rm --no-deps worker`で実行し、起動済みのdbへ同一networkで接続する。未承認のまま起動しても外部送信は`blocked_policy`で止まる。
+- 起動前に `sudo node --env-file=/etc/yori/yori.env deployment/check-production-config.mjs` で10キーの未設定・空と`YORI_POSTGRES_PASSWORD`が小文字64桁hexであることを検査する。Node 24がenv fileを読み、shのsourceとして評価しない。root:root 0600を読むため`node` commandへ`sudo`を付け、値は出力しない。
+- `docker compose`へ実secretを渡す場合は`--env-file /etc/yori/yori.env`を使い、command line引数へ書かない。設定・配置の詳細は[deployment/README.md](../deployment/README.md)を参照する。
+
+tsxで直接動かす場合も、事前に`/etc/yori/yori.env`の値を環境へexportする（実値はcommand line引数へ書かない）:
 
 ```sh
 npm run worker:start
