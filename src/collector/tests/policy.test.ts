@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { renameSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { v7 as uuidv7 } from 'uuid';
@@ -342,6 +343,169 @@ describe('collectorのsetup policy適用', () => {
     } finally {
       mock.restore();
       await fixture.cleanup();
+    }
+  });
+
+  it('custom policy変更だけでは過去messageのrevisionを増やさず、source本文の実変更はrevision+1にする', async () => {
+    const fixture = await createCollectorFixture();
+    const projectId = uuidv7();
+    let policy = { version: 1, rules: ['PolicyOne'] };
+    const mock = installFetchMock((request) => (isSetupRequest(request) ? setupResponse(projectId, policy) : ackResponse(request)));
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const originalLines = [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'PolicyOne を再読込' }),
+      ];
+      await writeTranscript(transcript, originalLines);
+      const input = hookInput(fixture, transcript, 'codex', 'session-1');
+      await collectFromHook(input);
+      assert.deepEqual(
+        sentEvents(eventRequests(mock.requests)).map((event) => [event.revision, event.text]),
+        [[1, '[REDACTED:custom] を再読込']],
+      );
+
+      // policy変更後に同内容を別inodeで先頭から読み直してもrevisionを増やさない。
+      policy = { version: 2, rules: ['PolicyTwo'] };
+      const replacement = path.join(fixture.root, 'replacement.jsonl');
+      await writeTranscript(replacement, originalLines);
+      renameSync(replacement, transcript);
+      await collectFromHook(input);
+      assert.deepEqual(
+        sentEvents(eventRequests(mock.requests)).map((event) => [event.revision, event.text]),
+        [[1, '[REDACTED:custom] を再読込']],
+        'policy変更だけでrevisionが増えている',
+      );
+
+      // source本文の実変更は従来どおりrevision+1で新しい本文を保存する。
+      const changed = path.join(fixture.root, 'changed.jsonl');
+      await writeTranscript(changed, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'PolicyTwo に変更' }),
+      ]);
+      renameSync(changed, transcript);
+      await collectFromHook(input);
+      assert.deepEqual(
+        sentEvents(eventRequests(mock.requests)).map((event) => [event.revision, event.text]),
+        [
+          [1, '[REDACTED:custom] を再読込'],
+          [2, '[REDACTED:custom] に変更'],
+        ],
+        'source本文変更がrevision+1になっていない',
+      );
+      await assertStateDoesNotContain(fixture.stateDir, 'PolicyOne');
+      await assertStateDoesNotContain(fixture.stateDir, 'PolicyTwo');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('legacy projects設定でもcurrent policyを毎collect/flush取得し、project一致時だけ適用する', async () => {
+    const fixture = await createCollectorFixture();
+    const projectId = uuidv7();
+    const legacyConfig = {
+      api_url: API_URL,
+      token_env: 'YORI_TEST_TOKEN',
+      state_dir: fixture.stateDir,
+      projects: [{ repository: REPOSITORY, project_id: projectId }],
+    } as CollectorConfig;
+    let policy = { version: 1, rules: ['LegacySecret'] };
+    let setupProjectId = projectId;
+    const mock = installFetchMock((request) =>
+      isSetupRequest(request) ? setupResponse(setupProjectId, policy) : ackResponse(request),
+    );
+    const input = {
+      source: 'codex' as const,
+      hook: buildHook({ session_id: 'session-1', transcript_path: '', cwd: fixture.repoDir }),
+      config: legacyConfig,
+      token: 'token-a',
+    };
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'LegacySecret を legacy で伏せる' }),
+      ]);
+      input.hook = buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir });
+      await collectFromHook(input);
+      assert.equal(mock.requests.filter(isSetupRequest).length, 1, 'legacy collectがsetupを呼んでいない');
+      assert.deepEqual(sentEvents(eventRequests(mock.requests)).map((event) => event.text), [
+        '[REDACTED:custom] を legacy で伏せる',
+      ]);
+
+      // setupで取得した新versionを次のcollectへ反映する。
+      policy = { version: 2, rules: ['LegacySecret', 'ExtraSecret'] };
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'user', text: 'ExtraSecret を追加' })}\n`,
+      );
+      await collectFromHook(input);
+      assert.equal(mock.requests.filter(isSetupRequest).length, 2, 'legacy collectが毎回setupを呼んでいない');
+      assert.deepEqual(sentEvents(eventRequests(mock.requests)).map((event) => event.text), [
+        '[REDACTED:custom] を legacy で伏せる',
+        '[REDACTED:custom] を追加',
+      ]);
+
+      // setupが別projectを返す応答は採用せず、configured projectのlast-known policyで継続する。
+      setupProjectId = uuidv7();
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-3', role: 'user', text: 'LegacySecret 3' })}\n`,
+      );
+      await collectFromHook(input);
+      const batches = parseSentBatches(eventRequests(mock.requests));
+      assert.equal(batches.at(-1)?.project_id, projectId, 'configured project以外へ送信している');
+      assert.equal(batches.at(-1)?.events.at(-1)?.text, '[REDACTED:custom] 3');
+
+      // flushでもsetupを毎回取得し、最新policyを適用する。
+      setupProjectId = projectId;
+      policy = { version: 3, rules: ['LegacySecret', 'FlushSecret'] };
+      await appendTranscript(
+        transcript,
+        `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-4', role: 'user', text: 'FlushSecret を flush' })}\n`,
+      );
+      await flushCollector({ config: legacyConfig, token: 'token-a' });
+      assert.equal(mock.requests.filter(isSetupRequest).length, 4, 'legacy flushがsetupを呼んでいない');
+      assert.equal(parseSentBatches(eventRequests(mock.requests)).at(-1)?.events.at(-1)?.text, '[REDACTED:custom] を flush');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+
+    // cacheなしsetup失敗は本文を読まず送信0件にする（legacy設定でもversion 0送信をしない）。
+    const cold = await createCollectorFixture();
+    const coldProjectId = uuidv7();
+    const coldConfig = {
+      api_url: API_URL,
+      token_env: 'YORI_TEST_TOKEN',
+      state_dir: cold.stateDir,
+      projects: [{ repository: REPOSITORY, project_id: coldProjectId }],
+    } as CollectorConfig;
+    const coldMock = installFetchMock((request) => {
+      if (isSetupRequest(request)) {
+        throw new Error('network down');
+      }
+      return ackResponse(request);
+    });
+    try {
+      const transcript = path.join(cold.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'LegacySecret を読まない' }),
+      ]);
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: cold.repoDir }),
+        config: coldConfig,
+        token: 'token-a',
+      });
+      assert.equal(eventRequests(coldMock.requests).length, 0, 'cacheなしlegacy collectで送信している');
+      assert.equal(outboxCount(cold, 'token-a'), 0, 'cacheなしlegacy collectでoutboxへ積んでいる');
+      await assertStateDoesNotContain(cold.stateDir, 'LegacySecret');
+    } finally {
+      coldMock.restore();
+      await cold.cleanup();
     }
   });
 });
