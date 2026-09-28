@@ -280,6 +280,80 @@
         }
       }
     },
+    "/v1/collector/setup": {
+      "post": {
+        "operationId": "createCollectorSetup",
+        "summary": "canonical repositoryからmember projectとcurrent redaction policyを返す",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CollectorSetupRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollectorSetupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "エラー応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "エラー応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "エラー応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "エラー応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/session-links": {
       "post": {
         "operationId": "createSessionLink",
@@ -885,6 +959,21 @@
         ],
         "additionalProperties": false
       },
+      "CollectorSetupRequest": {
+        "type": "object",
+        "properties": {
+          "repository": {
+            "type": "string",
+            "minLength": 1,
+            "description": "canonical repositoryはUTF-8で1024バイト以内のhost/path",
+            "x-yori-max-utf8-bytes": 1024
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "additionalProperties": false
+      },
       "SearchRequest": {
         "type": "object",
         "properties": {
@@ -1177,6 +1266,48 @@
         },
         "required": [
           "results"
+        ],
+        "additionalProperties": false
+      },
+      "CollectorSetupResponse": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "repository": {
+            "type": "string",
+            "minLength": 1
+          },
+          "redaction_policy": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "rules": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "version",
+              "rules"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "project_id",
+          "repository",
+          "redaction_policy"
         ],
         "additionalProperties": false
       },
