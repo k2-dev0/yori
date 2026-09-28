@@ -149,6 +149,16 @@ const ROUTES: RouteContract[] = [
     queryParams: ['project_id', 'revision'],
     hasBody: false,
   },
+  {
+    path: '/v1/collector/setup',
+    method: 'post',
+    secured: true,
+    success: ['200'],
+    errors: ['400', '401', '404', '500'],
+    pathParams: [],
+    queryParams: [],
+    hasBody: true,
+  },
 ];
 
 const ERROR_CODES = ['invalid_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'payload_too_large', 'internal_error'];
@@ -254,7 +264,7 @@ function effectiveSecurity(document: OpenApiDocument, pathItem: OpenApiPathItem,
 }
 
 describe('OpenAPI 3.1契約の生成', () => {
-  it('OpenAPI 3.1として8 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
+  it('OpenAPI 3.1として9 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
     const { document } = await generatedOpenApi();
     assert.match(String(document.openapi), /^3\.1\.\d+$/, 'OpenAPI 3.1.xではない');
     assert.equal(document.info?.version, '1.0.0', 'API契約版が1.0.0ではない');
