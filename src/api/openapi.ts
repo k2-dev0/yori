@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   MAX_REVISION,
   MAX_WAIT_MS,
+  collectorSetupRequestSchema,
   eventsRequestSchema,
   normalizedUuid,
   revisionSchema,
@@ -11,6 +12,7 @@ import {
   waitMsValueSchema,
 } from './schema.js';
 import {
+  collectorSetupResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -94,7 +96,7 @@ function propertySchemasOf(schema: JsonObject): Record<string, JsonObject> {
   return typeof properties === 'object' && properties !== null ? (properties as Record<string, JsonObject>) : {};
 }
 
-// 8 routeを計画4節のmethod・path・statusで固定する。実装が返さないstatusは追加しない。
+// 9 routeを計画4節のmethod・path・statusで固定する。実装が返さないstatusは追加しない。
 function buildPaths(): JsonObject {
   const uuid = toOpenApiSchema(normalizedUuid, 'input');
   // query parameterはwireが文字列でも、意味上のschemaは整数の範囲として表す。
@@ -169,6 +171,15 @@ function buildPaths(): JsonObject {
         responses: [success('200', 'SearchAcceptedResponse'), success('202', 'SearchAcceptedResponse'), ...errorResponses(['400', '401', '403', '404', '409', '413', '500'])],
       }),
     },
+    '/v1/collector/setup': {
+      post: buildOperation({
+        operationId: 'createCollectorSetup',
+        summary: 'canonical repositoryからmember projectとcurrent redaction policyを返す',
+        secured: true,
+        requestComponent: 'CollectorSetupRequest',
+        responses: [success('200', 'CollectorSetupResponse'), ...errorResponses(['400', '401', '404', '500'])],
+      }),
+    },
     '/v1/session-links': {
       post: buildOperation({
         operationId: 'createSessionLink',
@@ -226,12 +237,14 @@ function buildPaths(): JsonObject {
 export function buildOpenApiDocument(): JsonObject {
   const componentSchemas: JsonObject = {
     EventsRequest: toOpenApiSchema(eventsRequestSchema, 'input'),
+    CollectorSetupRequest: toOpenApiSchema(collectorSetupRequestSchema, 'input'),
     SearchRequest: toOpenApiSchema(searchRequestSchema, 'input'),
     SessionLinkRequest: toOpenApiSchema(sessionLinkRequestSchema, 'input'),
     HealthLiveResponse: toOpenApiSchema(healthLiveResponseSchema, 'output'),
     HealthReadyResponse: toOpenApiSchema(healthReadyResponseSchema, 'output'),
     ErrorResponse: toOpenApiSchema(errorResponseSchema, 'output'),
     EventsResponse: toOpenApiSchema(eventsResponseSchema, 'output'),
+    CollectorSetupResponse: toOpenApiSchema(collectorSetupResponseSchema, 'output'),
     SearchAcceptedResponse: toOpenApiSchema(searchAcceptedResponseSchema, 'output'),
     SearchViewResponse: toOpenApiSchema(searchViewResponseSchema, 'output'),
     SearchLookupResponse: toOpenApiSchema(searchLookupResponseSchema, 'output'),
