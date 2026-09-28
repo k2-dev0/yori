@@ -199,6 +199,59 @@ describe('custom伏せ字policyのschema契約', () => {
       clientB.release();
     }
     assert.equal(await ruleCount(raceCompanyId), 100, '並行insertで上限を越えている');
+
+    // 同会社内のliteral変更は件数を増やさないため許可する。
+    await pool.query("UPDATE company_redaction_rules SET literal = 'rule-100-renamed' WHERE company_id = $1 AND literal = 'rule-100'", [
+      companyId,
+    ]);
+    assert.equal(await ruleCount(companyId), 100, '同会社内UPDATEで件数が変わっている');
+
+    // 別会社のruleをcompany_id UPDATEで満杯の会社へ移すと拒否する。
+    const fullCompanyId = await insertCompany(pool, 'company-rule-full');
+    await insertPolicy(fullCompanyId, 1, Array.from({ length: 100 }, (_, index) => `full-${String(index).padStart(3, '0')}`));
+    const sourceCompanyId = await insertCompany(pool, 'company-rule-source');
+    await insertPolicy(sourceCompanyId, 1, ['move-me']);
+    await expectDbError(
+      pool.query('UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2', [fullCompanyId, sourceCompanyId]),
+      '23514',
+      '満杯会社へのcompany_id UPDATE',
+    );
+    assert.equal(await ruleCount(sourceCompanyId), 1, '拒否後に移動元ruleが消えている');
+
+    // 空きのある会社へはcompany_id UPDATEで移動できる。
+    const roomCompanyId = await insertCompany(pool, 'company-rule-room');
+    await insertPolicy(roomCompanyId, 1, ['room-1']);
+    await pool.query('UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2', [roomCompanyId, sourceCompanyId]);
+    assert.equal(await ruleCount(roomCompanyId), 2, '空き会社へのcompany_id UPDATEが反映されていない');
+    assert.equal(await ruleCount(sourceCompanyId), 0);
+
+    // 並行のcompany_id UPDATEでもtarget policy lockで100件を越えない。
+    const raceTargetId = await insertCompany(pool, 'company-rule-move-race');
+    await insertPolicy(raceTargetId, 1, Array.from({ length: 99 }, (_, index) => `t-${String(index).padStart(3, '0')}`));
+    const moveSourceAId = await insertCompany(pool, 'company-rule-move-a');
+    await insertPolicy(moveSourceAId, 1, ['move-a']);
+    const moveSourceBId = await insertCompany(pool, 'company-rule-move-b');
+    await insertPolicy(moveSourceBId, 1, ['move-b']);
+    const moveSql = 'UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2';
+    const moveClientA = await pool.connect();
+    const moveClientB = await pool.connect();
+    try {
+      await moveClientA.query('BEGIN');
+      await moveClientA.query(moveSql, [raceTargetId, moveSourceAId]);
+      await moveClientB.query('BEGIN');
+      const moveSecond = moveClientB.query(moveSql, [raceTargetId, moveSourceBId]);
+      await moveClientA.query('COMMIT');
+      const moveOutcome = await moveSecond.then(
+        () => 'fulfilled' as const,
+        (error: { code?: string }) => ({ code: error.code }),
+      );
+      assert.deepEqual(moveOutcome, { code: '23514' }, `並行company_id UPDATEが ${JSON.stringify(moveOutcome)} になった`);
+      await moveClientB.query('ROLLBACK');
+    } finally {
+      moveClientA.release();
+      moveClientB.release();
+    }
+    assert.equal(await ruleCount(raceTargetId), 100, '並行UPDATEで上限を越えている');
   });
 });
 
@@ -280,6 +333,40 @@ describe('project repository aliasのschema契約', () => {
       ),
       '23505',
       '他projectのaliasへaliasをUPDATE',
+    );
+
+    // project_repositories UPDATE project_id: primary行を同会社の別projectへ移すと衝突する。
+    const thirdProjectId = uuidv7();
+    await pool.query('INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+      thirdProjectId,
+      workspace.companyId,
+      'repo-c',
+    ]);
+    await expectDbError(
+      pool.query(
+        'UPDATE project_repositories SET project_id = $1 WHERE project_id = $2 AND repository_identifier = $3',
+        [thirdProjectId, workspace.projectId, 'repo-a'],
+      ),
+      '23505',
+      'project_idを別projectへUPDATE',
+    );
+
+    // projects UPDATE company_id: 移動先会社のaliasと同じrepositoryへは移せない。
+    const otherCompanyWithAlias = await insertCompany(pool, 'company-alias-move');
+    await pool.query('INSERT INTO projects (id, company_id, repository_identifier) VALUES ($1, $2, $3)', [
+      uuidv7(),
+      otherCompanyWithAlias,
+      'repo-move',
+    ]);
+    const moveProject = await pool.query<{ id: string }>(
+      'SELECT id FROM projects WHERE company_id = $1',
+      [otherCompanyWithAlias],
+    );
+    await insertAlias(moveProject.rows[0]!.id, otherCompanyWithAlias, 'repo-a');
+    await expectDbError(
+      pool.query('UPDATE projects SET company_id = $1 WHERE id = $2', [otherCompanyWithAlias, workspace.projectId]),
+      '23505',
+      'projects company_id UPDATEで他社aliasと衝突',
     );
 
     // 同一projectのaliasは制限なく登録でき、一意性は他projectとの間だけで保たれる。
