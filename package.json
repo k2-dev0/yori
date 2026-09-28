@@ -13,7 +13,7 @@
     "test:deployment": "node --import tsx --test --test-concurrency=1 \"deployment/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node deployment/build-collector.mjs",
     "migrate": "tsx src/db/migrate-cli.ts",
     "collector:collect": "tsx src/collector/cli.ts collect",
     "collector:notify": "tsx src/collector/cli.ts notify",
@@ -41,6 +41,7 @@
   "devDependencies": {
     "@types/node": "^24.13.6",
     "@types/pg": "^8.23.1",
+    "esbuild": "0.28.2",
     "eslint": "^9.39.5",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
