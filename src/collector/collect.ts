@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, type EventSource } from '../api/contract.js';
 import { redactConversationText } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
-import { SUPPORTED_CODEX_CLI_VERSION, parseCodexTranscriptLine } from './adapters/codex.js';
+import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from './adapters/codex.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending } from './send.js';
 import type { CollectorConfig } from './config.js';
@@ -88,8 +88,9 @@ function isStorableIdentifier(value: string): boolean {
   return Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES;
 }
 
-function supportedVersion(source: EventSource): string {
-  return source === 'codex' ? SUPPORTED_CODEX_CLI_VERSION : SUPPORTED_CLAUDE_CODE_VERSION;
+// sourceごとの確認済みtranscript版。Codexはallowlist membership、Claude Codeは単一確認版との完全一致。
+function isSupportedTranscriptVersion(source: EventSource, version: string): boolean {
+  return source === 'codex' ? SUPPORTED_CODEX_CLI_VERSIONS.includes(version) : version === SUPPORTED_CLAUDE_CODE_VERSION;
 }
 
 function parseLine(source: EventSource, line: string): TranscriptRecord {
@@ -235,7 +236,6 @@ interface IngestContext {
   hook: CollectorHookInput;
   repository: string;
   projectId: string;
-  supportedVersion: string;
   version: string | null;
   nextSequence: number;
   sessionExists: boolean;
@@ -347,7 +347,7 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
       ctx.held = true;
       return;
     }
-    if (record.transcript_version !== ctx.supportedVersion) {
+    if (!isSupportedTranscriptVersion(ctx.source, record.transcript_version)) {
       ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
       ctx.held = true;
       return;
@@ -366,7 +366,7 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
     return;
   }
   const version = record.transcript_version ?? ctx.version;
-  if (version === null || version !== ctx.supportedVersion) {
+  if (version === null || !isSupportedTranscriptVersion(ctx.source, version)) {
     // 未知版は本文を取り込まず、cursorも進めず保留する。
     ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
     ctx.held = true;
@@ -449,7 +449,6 @@ export function ingestTranscript(
         hook: input.hook,
         repository: input.repository,
         projectId: input.projectId,
-        supportedVersion: supportedVersion(input.source),
         version: session?.transcript_version ?? null,
         nextSequence: session?.next_sequence ?? 1,
         sessionExists: session !== undefined,
