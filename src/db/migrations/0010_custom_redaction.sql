@@ -41,11 +41,15 @@ CREATE TABLE company_redaction_rules (
   CONSTRAINT company_redaction_rules_literal_length CHECK (char_length(literal) <= 4096)
 );
 
--- literalは最大100件。policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
+-- literalは最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
+-- 同会社内のliteral変更は件数を増やさないため、limitの対象にしない。
 CREATE FUNCTION company_redaction_rules_enforce_limit() RETURNS trigger AS $$
 DECLARE
   rule_count integer;
 BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.company_id = OLD.company_id THEN
+    RETURN NEW;
+  END IF;
   PERFORM 1 FROM company_redaction_policies WHERE company_id = NEW.company_id FOR UPDATE;
   SELECT count(*) INTO rule_count FROM company_redaction_rules WHERE company_id = NEW.company_id;
   IF rule_count >= 100 THEN
@@ -56,7 +60,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER company_redaction_rules_enforce_limit
-  BEFORE INSERT ON company_redaction_rules
+  BEFORE INSERT OR UPDATE ON company_redaction_rules
   FOR EACH ROW EXECUTE FUNCTION company_redaction_rules_enforce_limit();
 
 CREATE TABLE project_repositories (
@@ -73,9 +77,7 @@ CREATE TABLE project_repositories (
 -- alias行とprimary行は別tableなので、同じ(company, repository)のadvisory lockで相互のcheckを直列化する。
 CREATE FUNCTION project_repositories_enforce_company_repository_unique() RETURNS trigger AS $$
 BEGIN
-  IF TG_OP = 'UPDATE' AND NEW.company_id = OLD.company_id AND NEW.repository_identifier = OLD.repository_identifier THEN
-    RETURN NEW;
-  END IF;
+  -- project_id/repository_identifier/company_idのいずれを変えても、別projectのprimaryと衝突させない。
   PERFORM pg_advisory_xact_lock(hashtext(NEW.company_id::text || '|' || NEW.repository_identifier)::bigint);
   IF EXISTS (
     SELECT 1
