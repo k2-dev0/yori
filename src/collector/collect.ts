@@ -4,7 +4,7 @@ import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } 
 import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, type EventSource } from '../api/contract.js';
 import type { RedactionPolicy } from '../api/redaction.js';
-import { redactConversationTextWithPolicy } from '../api/redaction.js';
+import { redactConversationText, redactConversationTextWithPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
 import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from './adapters/codex.js';
 import { resolveRepositoryFromCwd } from './remote.js';
@@ -269,7 +269,8 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     return;
   }
   const occurredAt = new Date(record.occurred_at).toISOString();
-  const contentHash = sha256Hex(text);
+  // custom policyの変更だけでrevisionを増やさないよう、source変更検知はbuilt-in適用後（custom適用前）で固定する。
+  const contentHash = sha256Hex(redactConversationText(record.text));
   const stored = getStoredMessage(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id);
 
   let sequenceNo: number;
@@ -539,19 +540,35 @@ function recordSourceReference(
     .run(namespace, source, hook.session_id, hook.transcript_path, hook.cwd);
 }
 
-// 旧設定（projects対応表）利用時も、過去にsetupで解決したpolicyがあれば同じ規則を併用する。
-function cachedPolicyOf(
+// setup APIからcurrent policyを毎collect/flush取得し、成功時はcacheを更新して返す。
+// 取得失敗時はlast-known policyへfallbackする。expectedProjectId（旧projects設定）がある場合は
+// setup/cacheのprojectが一致するときだけ採用し、別projectのpolicy適用やversion 0での送信をしない。
+async function resolveServerPolicy(
   input: Pick<CollectFromHookInput | FlushCollectorInput, 'config' | 'token'>,
   state: CollectorState,
   namespace: string,
   repository: string,
-): RedactionPolicy | undefined {
+  expectedProjectId?: string,
+): Promise<{ projectId: string; policy: RedactionPolicy } | null> {
   const cached = getCachedProjectPolicy(state, namespace, repository);
-  if (cached === undefined) {
-    return undefined;
+  const cachedMatches = cached !== undefined && (expectedProjectId === undefined || cached.projectId === expectedProjectId);
+  const cachedRules =
+    cachedMatches && cached !== undefined ? decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules) : undefined;
+
+  const setup = await fetchCollectorSetup({ api_url: input.config.api_url, token: input.token, repository });
+  if (setup !== null && (expectedProjectId === undefined || setup.projectId === expectedProjectId)) {
+    upsertCachedProjectPolicy(state, namespace, repository, {
+      projectId: setup.projectId,
+      version: setup.policy.version,
+      encryptedRules: encryptCachedRules(input.token, input.config.api_url, setup.policy.rules),
+    });
+    return { projectId: setup.projectId, policy: setup.policy };
   }
-  const rules = decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules);
-  return rules === undefined ? undefined : { version: cached.version, rules };
+  if (cachedMatches && cached !== undefined && cachedRules !== undefined) {
+    // cacheありの一時通信失敗はlast-known policyで継続する。
+    return { projectId: cached.projectId, policy: { version: cached.version, rules: cachedRules } };
+  }
+  return null;
 }
 
 // hookを契機にtranscriptの差分を読み、SQLiteへ保存して未送信分の送信を試みる。
@@ -576,35 +593,30 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
     let projectId: string;
     let policy: RedactionPolicy;
     if (configured !== undefined) {
-      projectId = configured.project_id;
-      policy = cachedPolicyOf(input, state, namespace, repository) ?? { version: 0, rules: [] };
+      // 旧設定はproject解決の正本のまま、current policyだけsetupから毎回取得する。
+      const resolved = await resolveServerPolicy(input, state, namespace, repository, configured.project_id);
+      if (resolved === null) {
+        recordSourceReference(state, namespace, input.source, input.hook);
+        recordDiagnostic(state, namespace, 'policy_unavailable', NO_OFFSET);
+        return { confirmedUserInputs: [] };
+      }
+      projectId = resolved.projectId;
+      policy = resolved.policy;
     } else if (input.config.projects.length > 0) {
       // 旧設定は対応表を正本にし、未登録repositoryは従来どおり本文を読まず保留する。
       recordSourceReference(state, namespace, input.source, input.hook);
       await deliverPending({ state, namespace, config: input.config, token: input.token, automatic: true, blockedProjects: new Set() });
       return { confirmedUserInputs: [] };
     } else {
-      const cached = getCachedProjectPolicy(state, namespace, repository);
-      const cachedRules = cached === undefined ? undefined : decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules);
-      const setup = await fetchCollectorSetup({ api_url: input.config.api_url, token: input.token, repository });
-      if (setup !== null) {
-        upsertCachedProjectPolicy(state, namespace, repository, {
-          projectId: setup.projectId,
-          version: setup.policy.version,
-          encryptedRules: encryptCachedRules(input.token, input.config.api_url, setup.policy.rules),
-        });
-        projectId = setup.projectId;
-        policy = setup.policy;
-      } else if (cached !== undefined && cachedRules !== undefined) {
-        // cacheありの一時通信失敗はlast-known policyで継続する。
-        projectId = cached.projectId;
-        policy = { version: cached.version, rules: cachedRules };
-      } else {
+      const resolved = await resolveServerPolicy(input, state, namespace, repository);
+      if (resolved === null) {
         // cacheなしの初回取得失敗はtranscript本文を読まず、送信も0件にする。
         recordSourceReference(state, namespace, input.source, input.hook);
         recordDiagnostic(state, namespace, 'policy_unavailable', NO_OFFSET);
         return { confirmedUserInputs: [] };
       }
+      projectId = resolved.projectId;
+      policy = resolved.policy;
     }
     resolvedTargets.add(resolvedTargetKey(projectId, repository));
     const result = ingestTranscript(state, {
@@ -664,8 +676,17 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
       let projectId: string;
       let policy: RedactionPolicy;
       if (configured !== undefined) {
-        projectId = configured.project_id;
-        policy = cachedPolicyOf(input, state, namespace, repository) ?? { version: 0, rules: [] };
+        // 旧設定でもcurrent policyはsetupから毎flush取得し、projectが一致するときだけ採用する。
+        const resolved = await resolveServerPolicy(input, state, namespace, repository, configured.project_id);
+        if (resolved === null) {
+          const session = getSession(state, namespace, source, sessionId);
+          if (session !== undefined) {
+            blockedProjects.add(session.project_id);
+          }
+          continue;
+        }
+        projectId = resolved.projectId;
+        policy = resolved.policy;
       } else if (input.config.projects.length > 0) {
         // 旧設定は対応表を正本にし、未登録repositoryの保留sourceは再解決しない。
         const session = getSession(state, namespace, source, sessionId);
@@ -675,21 +696,8 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
         continue;
       } else {
         // 明示flushでもsetupを再取得する。成功時はcacheを更新し、失敗時はlast-known policyで継続する。
-        const cached = getCachedProjectPolicy(state, namespace, repository);
-        const cachedRules = cached === undefined ? undefined : decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules);
-        const setup = await fetchCollectorSetup({ api_url: input.config.api_url, token: input.token, repository });
-        if (setup !== null) {
-          upsertCachedProjectPolicy(state, namespace, repository, {
-            projectId: setup.projectId,
-            version: setup.policy.version,
-            encryptedRules: encryptCachedRules(input.token, input.config.api_url, setup.policy.rules),
-          });
-          projectId = setup.projectId;
-          policy = setup.policy;
-        } else if (cached !== undefined && cachedRules !== undefined) {
-          projectId = cached.projectId;
-          policy = { version: cached.version, rules: cachedRules };
-        } else {
+        const resolved = await resolveServerPolicy(input, state, namespace, repository);
+        if (resolved === null) {
           // cacheなしの失敗では本文を読まず、そのsourceの送信も0件にする。
           const session = getSession(state, namespace, source, sessionId);
           if (session !== undefined) {
@@ -697,6 +705,8 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
           }
           continue;
         }
+        projectId = resolved.projectId;
+        policy = resolved.policy;
       }
       resolvedTargets.add(resolvedTargetKey(projectId, repository));
       const result = ingestTranscript(state, {
