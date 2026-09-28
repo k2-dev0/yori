@@ -23,6 +23,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 
 - `api_url`はHTTPSのみ（開発用loopback `http://127.0.0.1`等だけHTTP可）。userinfo/query/fragmentは拒否する。
 - `projects`（`repository`と`project_id`の対応表）は旧設定との後方互換で任意。新しい設定では書かず、hook cwdの`git remote.origin.url`からcanonical repositoryを求めて`POST /v1/collector/setup`でprojectとcurrent伏せ字policyを解決する。ディレクトリ名から案件を推定しない。
+- `projects`ありの旧設定ではcustom policyはAPI受付側で適用されてclient側の自動更新は行わず、client側の自動更新は`projects`を省略した新標準設定でのみ有効。
 - 正規化後のrepositoryは既存APIと同じ1024 UTF-8 bytes以内とし、NUL・単独サロゲートを拒否する。収集入口でも確認し、超過値をoutboxへ入れない。
 - setupで解決したprojectとpolicyは`state_dir`のSQLiteへcacheする。rulesはtoken由来の鍵で暗号化し、平文literalをstateへ残さない。collectは毎回setupを試み、cacheなしの失敗は本文を読まず送信0件、cacheありの一時失敗はlast-known policyで継続する。
 
