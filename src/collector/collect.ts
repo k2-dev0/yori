@@ -540,23 +540,33 @@ function recordSourceReference(
     .run(namespace, source, hook.session_id, hook.transcript_path, hook.cwd);
 }
 
+// 過去にsetupで解決したprojectとpolicyのcacheを復号して返す。復号できないcacheは使わない。
+function cachedPolicyOf(
+  input: Pick<CollectFromHookInput | FlushCollectorInput, 'config' | 'token'>,
+  state: CollectorState,
+  namespace: string,
+  repository: string,
+): { projectId: string; policy: RedactionPolicy } | undefined {
+  const cached = getCachedProjectPolicy(state, namespace, repository);
+  if (cached === undefined) {
+    return undefined;
+  }
+  const rules = decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules);
+  return rules === undefined ? undefined : { projectId: cached.projectId, policy: { version: cached.version, rules } };
+}
+
 // setup APIからcurrent policyを毎collect/flush取得し、成功時はcacheを更新して返す。
-// 取得失敗時はlast-known policyへfallbackする。expectedProjectId（旧projects設定）がある場合は
-// setup/cacheのprojectが一致するときだけ採用し、別projectのpolicy適用やversion 0での送信をしない。
+// 取得失敗時はdecryptできるlast-known policyへfallbackし、cacheも無ければnullにして呼出元が本文を読まず保留する。
 async function resolveServerPolicy(
   input: Pick<CollectFromHookInput | FlushCollectorInput, 'config' | 'token'>,
   state: CollectorState,
   namespace: string,
   repository: string,
-  expectedProjectId?: string,
 ): Promise<{ projectId: string; policy: RedactionPolicy } | null> {
-  const cached = getCachedProjectPolicy(state, namespace, repository);
-  const cachedMatches = cached !== undefined && (expectedProjectId === undefined || cached.projectId === expectedProjectId);
-  const cachedRules =
-    cachedMatches && cached !== undefined ? decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules) : undefined;
+  const cached = cachedPolicyOf(input, state, namespace, repository);
 
   const setup = await fetchCollectorSetup({ api_url: input.config.api_url, token: input.token, repository });
-  if (setup !== null && (expectedProjectId === undefined || setup.projectId === expectedProjectId)) {
+  if (setup !== null) {
     upsertCachedProjectPolicy(state, namespace, repository, {
       projectId: setup.projectId,
       version: setup.policy.version,
@@ -564,9 +574,9 @@ async function resolveServerPolicy(
     });
     return { projectId: setup.projectId, policy: setup.policy };
   }
-  if (cachedMatches && cached !== undefined && cachedRules !== undefined) {
+  if (cached !== undefined) {
     // cacheありの一時通信失敗はlast-known policyで継続する。
-    return { projectId: cached.projectId, policy: { version: cached.version, rules: cachedRules } };
+    return cached;
   }
   return null;
 }
@@ -593,15 +603,10 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
     let projectId: string;
     let policy: RedactionPolicy;
     if (configured !== undefined) {
-      // 旧設定はproject解決の正本のまま、current policyだけsetupから毎回取得する。
-      const resolved = await resolveServerPolicy(input, state, namespace, repository, configured.project_id);
-      if (resolved === null) {
-        recordSourceReference(state, namespace, input.source, input.hook);
-        recordDiagnostic(state, namespace, 'policy_unavailable', NO_OFFSET);
-        return { confirmedUserInputs: [] };
-      }
-      projectId = resolved.projectId;
-      policy = resolved.policy;
+      // 旧設定（projects対応表）はproject解決を正本とし、client側からsetup APIを呼ばない。
+      // 過去にsetupで解決したcacheがある場合だけcustom policyを併用し、無ければbuilt-in置換だけで送信する。
+      projectId = configured.project_id;
+      policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? { version: 0, rules: [] };
     } else if (input.config.projects.length > 0) {
       // 旧設定は対応表を正本にし、未登録repositoryは従来どおり本文を読まず保留する。
       recordSourceReference(state, namespace, input.source, input.hook);
@@ -676,17 +681,9 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
       let projectId: string;
       let policy: RedactionPolicy;
       if (configured !== undefined) {
-        // 旧設定でもcurrent policyはsetupから毎flush取得し、projectが一致するときだけ採用する。
-        const resolved = await resolveServerPolicy(input, state, namespace, repository, configured.project_id);
-        if (resolved === null) {
-          const session = getSession(state, namespace, source, sessionId);
-          if (session !== undefined) {
-            blockedProjects.add(session.project_id);
-          }
-          continue;
-        }
-        projectId = resolved.projectId;
-        policy = resolved.policy;
+        // 旧設定（projects対応表）はproject解決を正本とし、client側からsetup APIを呼ばない。
+        projectId = configured.project_id;
+        policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? { version: 0, rules: [] };
       } else if (input.config.projects.length > 0) {
         // 旧設定は対応表を正本にし、未登録repositoryの保留sourceは再解決しない。
         const session = getSession(state, namespace, source, sessionId);
