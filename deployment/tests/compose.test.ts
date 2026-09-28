@@ -168,7 +168,7 @@ function commandOutput(result: CommandResult): string {
 }
 
 describe('deploymentのテスト構成分離', () => {
-  it('通常composeはtest serviceを持たず、開発用volume名を維持する', async () => {
+  it('通常composeはtest serviceを持たず、DB volumeをyori-pgdata固定で維持する', async () => {
     const defaultConfig = await composeConfig(['-f', 'deployment/compose.yaml'], PRODUCTION_ENV);
     assert.equal(
       Object.hasOwn(defaultConfig.services, 'test'),
@@ -184,6 +184,22 @@ describe('deploymentのテスト構成分離', () => {
       `通常composeにworker serviceがない: ${Object.keys(defaultConfig.services).join(', ')}`,
     );
     assert.deepEqual(volumeNames(defaultConfig).sort(), [...DEV_VOLUMES].sort(), '通常composeの開発用volume名が変わっている');
+
+    // 本番DB volumeは外部envで上書きできないyori-pgdata固定。別名を渡しても変えない。
+    const overridden = await composeConfig(['-f', 'deployment/compose.yaml'], {
+      ...PRODUCTION_ENV,
+      YORI_PGDATA_VOLUME: 'yori-unexpected-pgdata',
+    });
+    const overriddenVolumes = volumeNames(overridden);
+    assert.ok(
+      overriddenVolumes.includes('yori-pgdata'),
+      `YORI_PGDATA_VOLUMEを指定してもDB volumeがyori-pgdataでない: ${overriddenVolumes.join(', ')}`,
+    );
+    assert.equal(
+      overriddenVolumes.includes('yori-unexpected-pgdata'),
+      false,
+      `YORI_PGDATA_VOLUMEで本番DB volume名を上書きできてしまう: ${overriddenVolumes.join(', ')}`,
+    );
 
     // profileで隠したtest serviceも残存として検出する。
     const allProfiles = await composeConfig(['--profile', '*', '-f', 'deployment/compose.yaml'], PRODUCTION_ENV);
