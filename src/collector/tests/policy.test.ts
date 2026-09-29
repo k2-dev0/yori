@@ -5,7 +5,8 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { v7 as uuidv7 } from 'uuid';
 import { collectFromHook, flushCollector } from '../collect.js';
-import { decryptCachedRules, encryptCachedRules } from '../policy-cache.js';
+import * as policyCacheModule from '../policy-cache.js';
+import { fetchCollectorSetup } from '../setup.js';
 import { parseCollectorConfig, type CollectorConfig } from '../config.js';
 import { closeCollectorState, collectorNamespace, openCollectorState, upsertCachedProjectPolicy } from '../state.js';
 import {
@@ -32,11 +33,30 @@ import {
 const REPOSITORY = 'github.com/Org/Repo';
 const API_URL = 'https://api.example.test';
 
+type CustomRedactionRule =
+  | { type: 'literal'; value: string }
+  | { type: 'assignment_key'; value: string };
+
+interface PolicyCacheModule {
+  encryptCachedRules(token: string, apiUrl: string, rules: readonly CustomRedactionRule[]): string;
+  decryptCachedRules(token: string, apiUrl: string, value: string): CustomRedactionRule[] | undefined;
+}
+
+const { encryptCachedRules, decryptCachedRules } = policyCacheModule as unknown as PolicyCacheModule;
+
+function literal(value: string): CustomRedactionRule {
+  return { type: 'literal', value };
+}
+
+function assignmentKey(value: string): CustomRedactionRule {
+  return { type: 'assignment_key', value };
+}
+
 function policyConfig(stateDir: string): CollectorConfig {
   return { api_url: API_URL, token_env: 'YORI_TEST_TOKEN', state_dir: stateDir, projects: [] } as CollectorConfig;
 }
 
-function setupResponse(projectId: string, policy: { version: number; rules: string[] }): Response {
+function setupResponse(projectId: string, policy: { version: number; rules: CustomRedactionRule[] }): Response {
   return jsonResponse(200, { project_id: projectId, repository: REPOSITORY, redaction_policy: policy });
 }
 
@@ -81,7 +101,7 @@ describe('collectorのsetup policy適用', () => {
     const fixture = await createCollectorFixture();
     const projectId = uuidv7();
     const mock = installFetchMock((request) =>
-      isSetupRequest(request) ? setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] }) : ackResponse(request),
+      isSetupRequest(request) ? setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret')] }) : ackResponse(request),
     );
     try {
       const transcript = path.join(fixture.root, 'codex.jsonl');
@@ -116,7 +136,7 @@ describe('collectorのsetup policy適用', () => {
     const fixture = await createCollectorFixture();
     const projectId = uuidv7();
     const mock = installFetchMock((request) =>
-      isSetupRequest(request) ? setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] }) : ackResponse(request),
+      isSetupRequest(request) ? setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret')] }) : ackResponse(request),
     );
     try {
       const transcript = path.join(fixture.root, 'claude.jsonl');
@@ -140,10 +160,51 @@ describe('collectorのsetup policy適用', () => {
     }
   });
 
+  it('assignment_key ruleをcodex/claude双方で適用し、生valueをSQLite・送信bodyへ残さない', async () => {
+    for (const source of ['codex', 'claude_code'] as const) {
+      const fixture = await createCollectorFixture();
+      const projectId = uuidv7();
+      const rawSecret = `hogehoge-${source}`;
+      const mock = installFetchMock((request) =>
+        isSetupRequest(request)
+          ? setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret'), assignmentKey('pass')] })
+          : ackResponse(request),
+      );
+      try {
+        const transcript = path.join(fixture.root, `${source}.jsonl`);
+        if (source === 'codex') {
+          await writeTranscript(transcript, [
+            codexSessionLine('session-1'),
+            codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: `pass: ${rawSecret} と AcmeSecret` }),
+          ]);
+        } else {
+          await writeTranscript(transcript, [
+            claudeMessageLine({ sessionId: 'session-claude', uuid: 'item-1', role: 'user', content: `pass: ${rawSecret} と AcmeSecret` }),
+          ]);
+        }
+
+        await collectFromHook(hookInput(fixture, transcript, source, source === 'codex' ? 'session-1' : 'session-claude'));
+
+        assert.deepEqual(
+          sentEvents(eventRequests(mock.requests)).map((event) => event.text),
+          ['pass: [REDACTED:custom] と [REDACTED:custom]'],
+          `${source}でassignment_key ruleが適用されていない`,
+        );
+        const sentBodies = JSON.stringify(mock.requests.map((request) => request.body));
+        assert.ok(!sentBodies.includes(rawSecret), `${source}の送信bodyへ生valueが残っている: ${rawSecret}`);
+        await assertStateDoesNotContain(fixture.stateDir, rawSecret);
+        await assertStateDoesNotContain(fixture.stateDir, 'AcmeSecret');
+      } finally {
+        mock.restore();
+        await fixture.cleanup();
+      }
+    }
+  });
+
   it('取得した新versionは新規messageから適用し、旧ruleを過去本文へ遡及適用しない', async () => {
     const fixture = await createCollectorFixture();
     const projectId = uuidv7();
-    let policy = { version: 1, rules: ['OldSecret'] };
+    let policy: { version: number; rules: CustomRedactionRule[] } = { version: 1, rules: [literal('OldSecret')] };
     const mock = installFetchMock((request) => (isSetupRequest(request) ? setupResponse(projectId, policy) : ackResponse(request)));
     try {
       const transcript = path.join(fixture.root, 'codex.jsonl');
@@ -155,7 +216,7 @@ describe('collectorのsetup policy適用', () => {
       await collectFromHook(input);
       assert.deepEqual(sentEvents(eventRequests(mock.requests)).map((event) => event.text), ['[REDACTED:custom] の確認']);
 
-      policy = { version: 2, rules: ['NewSecret'] };
+      policy = { version: 2, rules: [literal('NewSecret')] };
       await appendTranscript(
         transcript,
         `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'user', text: 'NewSecret と OldSecret' })}\n`,
@@ -183,7 +244,7 @@ describe('collectorのsetup policy適用', () => {
         if (!online) {
           throw new Error('network down');
         }
-        return setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] });
+        return setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret')] });
       }
       return ackResponse(request);
     });
@@ -223,7 +284,7 @@ describe('collectorのsetup policy適用', () => {
         if (!online) {
           throw new Error('network down');
         }
-        return setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] });
+        return setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret')] });
       }
       return ackResponse(request);
     });
@@ -263,7 +324,7 @@ describe('collectorのsetup policy適用', () => {
         if (!online) {
           throw new Error('network down');
         }
-        return setupResponse(projectId, { version: 1, rules: ['AcmeSecret'] });
+        return setupResponse(projectId, { version: 1, rules: [literal('AcmeSecret')] });
       }
       return ackResponse(request);
     });
@@ -351,7 +412,7 @@ describe('collectorのsetup policy適用', () => {
   it('custom policy変更だけでは過去messageのrevisionを増やさず、source本文の実変更はrevision+1にする', async () => {
     const fixture = await createCollectorFixture();
     const projectId = uuidv7();
-    let policy = { version: 1, rules: ['PolicyOne'] };
+    let policy: { version: number; rules: CustomRedactionRule[] } = { version: 1, rules: [literal('PolicyOne')] };
     const mock = installFetchMock((request) => (isSetupRequest(request) ? setupResponse(projectId, policy) : ackResponse(request)));
     try {
       const transcript = path.join(fixture.root, 'codex.jsonl');
@@ -368,7 +429,7 @@ describe('collectorのsetup policy適用', () => {
       );
 
       // policy変更後に同内容を別inodeで先頭から読み直してもrevisionを増やさない。
-      policy = { version: 2, rules: ['PolicyTwo'] };
+      policy = { version: 2, rules: [literal('PolicyTwo')] };
       const replacement = path.join(fixture.root, 'replacement.jsonl');
       await writeTranscript(replacement, originalLines);
       renameSync(replacement, transcript);
@@ -406,7 +467,7 @@ describe('collectorのsetup policy適用', () => {
 
 // 復号鍵はtoken本体をKDF入力に含め、SQLiteへ保存されるnamespaceだけからは再現できない。
 describe('collectorのpolicy cache暗号化', () => {
-  const RULES = ['AcmeSecret', 'ProjectCodename'];
+  const RULES: CustomRedactionRule[] = [literal('AcmeSecret'), assignmentKey('ProjectCodename')];
 
   // 漏えいしたDBコピーから鍵を再現する攻撃を模し、指定鍵での復号を試みる。
   function decryptWithKey(key: Buffer, value: string): string {
@@ -453,6 +514,57 @@ describe('collectorのpolicy cache暗号化', () => {
       await assertStateDoesNotContain(fixture.stateDir, token);
     } finally {
       await fixture.cleanup();
+    }
+  });
+});
+
+// setup応答のstructured rule検証。validは受理し、不正ruleはfetchCollectorSetupのnull契約で拒否する。
+describe('collector setup応答のstructured rule検証', () => {
+  async function fetchRules(policy: unknown): Promise<CustomRedactionRule[] | null> {
+    const mock = installFetchMock(() =>
+      jsonResponse(200, { project_id: uuidv7(), repository: REPOSITORY, redaction_policy: policy }),
+    );
+    try {
+      const setup = await fetchCollectorSetup({ api_url: API_URL, token: 'token-a', repository: REPOSITORY });
+      if (setup === null) {
+        return null;
+      }
+      return [...(setup.policy.rules as unknown as CustomRedactionRule[])];
+    } finally {
+      mock.restore();
+    }
+  }
+
+  it('literal/assignment_keyのobject unionとversionを受理する', async () => {
+    const rules = [literal('AcmeSecret'), assignmentKey('pass')];
+    assert.deepEqual(await fetchRules({ version: 4, rules }), rules);
+  });
+
+  it('unknown type・field欠落・unknown field・string ruleを受理しない', async () => {
+    const invalidPolicies: unknown[] = [
+      { version: 1, rules: [{ type: 'regex', value: 'x' }] },
+      { version: 1, rules: [{ type: 'literal' }] },
+      { version: 1, rules: [{ value: 'x' }] },
+      { version: 1, rules: [{ type: 'literal', value: 'x', extra: true }] },
+      { version: 1, rules: ['AcmeSecret'] },
+      { version: 1, rules: [literal('AcmeSecret'), { type: 'literal' }] },
+    ];
+    for (const policy of invalidPolicies) {
+      assert.equal(await fetchRules(policy), null, `不正policyを受理している: ${JSON.stringify(policy)}`);
+    }
+  });
+
+  it('assignment_keyの不正identifier・大小文字重複・REDACTEDを受理しない', async () => {
+    const invalidPolicies: unknown[] = [
+      { version: 1, rules: [assignmentKey('1pass')] },
+      { version: 1, rules: [assignmentKey('pass key')] },
+      { version: 1, rules: [assignmentKey('pass:key')] },
+      { version: 1, rules: [assignmentKey('a'.repeat(129))] },
+      { version: 1, rules: [assignmentKey('REDACTED')] },
+      { version: 1, rules: [assignmentKey('pass'), assignmentKey('PASS')] },
+    ];
+    for (const policy of invalidPolicies) {
+      assert.equal(await fetchRules(policy), null, `不正policyを受理している: ${JSON.stringify(policy)}`);
     }
   });
 });
