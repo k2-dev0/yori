@@ -560,9 +560,10 @@ describe('collectorのpolicy cache暗号化', () => {
     const mock = installFetchMock((request) => (isSetupRequest(request) ? setupResponse(projectId, POLICY) : ackResponse(request)));
     try {
       const transcript = path.join(fixture.root, 'codex.jsonl');
+      // policyのfield keyを本文へ出さず、cache暗号化だけを検査する。
       await writeTranscript(transcript, [
         codexSessionLine('session-1'),
-        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: 'ProjectCodename を使う' }),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '通常の本文を使う' }),
       ]);
       await collectFromHook(hookInput(fixture, transcript, 'codex', 'session-1'));
 
