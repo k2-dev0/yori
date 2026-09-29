@@ -73,7 +73,8 @@ describe('suspected-secret gate', () => {
     assert.equal(result.action, 'send');
     assert.equal((result as { text: string }).text, text, 'observeで本文を変更している');
     assert.deepEqual((result as { findings: string[] }).findings, [OBSERVED], 'observeのfindingsが固定codeだけではない');
-    assert.ok(!JSON.stringify(result).includes(SUSPECTED_32), 'findings/結果へ候補値が漏れている');
+    // observeは本文へ候補を残す契約のため、漏えい判定はfindingsだけを対象にする。
+    assert.ok(!JSON.stringify((result as { findings: string[] }).findings).includes(SUSPECTED_32), 'findingsへ候補値が漏れている');
   });
 
   it('blockはmessage全体を拒否し、textを返さずcode suspected_secretだけを返す', () => {
