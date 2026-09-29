@@ -1,90 +1,102 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import * as redactionModule from '../redaction.js';
-import { redactConversationText } from '../redaction.js';
 
-// 会社単位のcustom伏せ字policy。ruleはliteral/assignment_keyのdiscriminated unionで、
-// APIとcollectorが同じ純粋関数でbuilt-inとcustomを併用する。
-// 未実装exportはundefinedのままassertで失敗させ、Red理由を「policy関数未実装」に固定する。
-// 上限値は本testで固定する: literal 512 code points、assignment_key 128 code points、会社ごとに100件。
+// 会社単位のbusiness伏せ字policy。fields/termsを純粋関数で適用し、APIとcollectorが同じ関数を使う。
+// 未実装exportはundefinedのままassertで失敗させ、Red理由を「sanitize API未実装」に固定する。
+// 上限値は本testで固定する: term 512 code points、field 128 code points、合算100件。
 
-type CustomRedactionRule =
-  | { type: 'literal'; value: string }
-  | { type: 'assignment_key'; value: string };
+type Policy = {
+  version: number;
+  fields: readonly string[];
+  terms: readonly string[];
+  suspicion_mode: 'observe' | 'block';
+  detector_version: 'initial-v1';
+};
 
-interface PolicyRedactionModule {
-  redactConversationTextWithPolicy?: (text: string, policy: { version: number; rules: readonly CustomRedactionRule[] }) => string;
+type SanitizationResult =
+  | { action: 'send'; text: string; findings: string[] }
+  | { action: 'block'; code: 'suspected_secret' };
+
+interface RedactionModule {
+  sanitizeConversationText?: (text: string, policy: Policy, knownSecrets?: readonly string[]) => SanitizationResult;
 }
 
-const policyFunction = (redactionModule as unknown as PolicyRedactionModule).redactConversationTextWithPolicy;
+const sanitizeFunction = (redactionModule as unknown as RedactionModule).sanitizeConversationText;
 
-const MAX_LITERAL_CODE_POINTS = 512;
-const MAX_ASSIGNMENT_KEY_CODE_POINTS = 128;
+const MAX_TERM_CODE_POINTS = 512;
+const MAX_FIELD_CODE_POINTS = 128;
 const MAX_CUSTOM_RULES = 100;
 
-function literal(value: string): CustomRedactionRule {
-  return { type: 'literal', value };
+function policy(overrides: Partial<Policy> = {}): Policy {
+  return { version: 1, fields: [], terms: [], suspicion_mode: 'observe', detector_version: 'initial-v1', ...overrides };
 }
 
-function assignmentKey(value: string): CustomRedactionRule {
-  return { type: 'assignment_key', value };
+function sanitize(text: string, value: Policy, knownSecrets?: readonly string[]): SanitizationResult {
+  assert.equal(typeof sanitizeFunction, 'function', 'sanitizeConversationText が未実装');
+  return sanitizeFunction!(text, value, knownSecrets);
 }
 
-function applyPolicy(text: string, rules: readonly CustomRedactionRule[]): string {
-  assert.equal(typeof policyFunction, 'function', 'redactConversationTextWithPolicy が未実装');
-  return policyFunction!(text, { version: 1, rules });
+// send結果の本文を取り出す。blockされた場合は本文が存在しないことを明示して失敗させる。
+function sentText(result: SanitizationResult): string {
+  assert.equal(result.action, 'send', `sanitizeがblockした: ${JSON.stringify(result)}`);
+  if (result.action !== 'send') {
+    throw new Error('unreachable');
+  }
+  return result.text;
 }
 
-describe('custom伏せ字policyの純粋関数', () => {
-  it('literalはexact・case-sensitiveでregex特殊文字もliteralとして扱い、longest-firstで置換する', () => {
-    assert.equal(applyPolicy('AcmeSecret と acmesecret', [literal('AcmeSecret')]), '[REDACTED:custom] と acmesecret');
-    assert.equal(applyPolicy('前AcmeSecret後', [literal('AcmeSecret')]), '前[REDACTED:custom]後');
-    assert.equal(applyPolicy('abc a.c', [literal('a.c')]), 'abc [REDACTED:custom]', 'regexとして解釈されている');
-    assert.equal(applyPolicy('対象なし', [literal('AcmeSecret')]), '対象なし');
+describe('business伏せ字policyの純粋関数', () => {
+  it('termはexact・case-sensitiveでregex特殊文字もliteralとして扱い、longest-firstで置換する', () => {
+    assert.equal(sentText(sanitize('AcmeSecret と acmesecret', policy({ terms: ['AcmeSecret'] }))), '[REDACTED:business_term] と acmesecret');
+    assert.equal(sentText(sanitize('前AcmeSecret後', policy({ terms: ['AcmeSecret'] }))), '前[REDACTED:business_term]後');
+    assert.equal(sentText(sanitize('abc a.c', policy({ terms: ['a.c'] }))), 'abc [REDACTED:business_term]', 'regexとして解釈されている');
+    assert.equal(sentText(sanitize('対象なし', policy({ terms: ['AcmeSecret'] }))), '対象なし');
 
-    const rules = [literal('secret'), literal('super-secret')];
-    const once = applyPolicy('super-secret と secret', rules);
-    assert.equal(once, '[REDACTED:custom] と [REDACTED:custom]');
-    assert.equal(applyPolicy('aab', [literal('ab'), literal('aab')]), '[REDACTED:custom]', '短いliteralを先に採用している');
-    assert.equal(applyPolicy('super-secret と secret', [...rules].reverse()), once, 'rulesの並び順で結果が変わる');
-    assert.equal(applyPolicy(once, rules), once, '再適用で結果が変わっている');
+    const terms = ['secret', 'super-secret'];
+    const once = sentText(sanitize('super-secret と secret', policy({ terms })));
+    assert.equal(once, '[REDACTED:business_term] と [REDACTED:business_term]');
+    assert.equal(sentText(sanitize('aab', policy({ terms: ['ab', 'aab'] }))), '[REDACTED:business_term]', '短いtermを先に採用している');
+    assert.equal(sentText(sanitize('super-secret と secret', policy({ terms: [...terms].reverse() }))), once, 'termsの並び順で結果が変わる');
+    assert.equal(sentText(sanitize(once, policy({ terms }))), once, '再適用で結果が変わっている');
   });
 
-  it('置換済みbuilt-in/custom placeholderを再適用してもbyte一致を維持する', () => {
+  it('置換済みbuilt-in/business placeholderを再適用してもbyte一致を維持する', () => {
     const placeholders =
-      '[REDACTED:custom] と [REDACTED:aws_access_key] と [REDACTED:env_value] と [REDACTED:authorization] と [REDACTED:private_key]';
-    const rules = [literal('AcmeSecret')];
-    assert.equal(applyPolicy(placeholders, rules), placeholders, 'placeholder自体を置換している');
+      '[REDACTED:business_term] と [REDACTED:business_value] と [REDACTED:known_secret] と [REDACTED:aws_access_key] と [REDACTED:env_value] と [REDACTED:authorization] と [REDACTED:private_key]';
+    const value = policy({ terms: ['AcmeSecret'] });
+    assert.equal(sentText(sanitize(placeholders, value)), placeholders, 'placeholder自体を置換している');
 
-    const once = applyPolicy(`AcmeSecret と ${placeholders}`, rules);
-    assert.equal(applyPolicy(once, rules), once, 'placeholderを含む置換済み本文が再適用で変化している');
-    assert.equal(applyPolicy(applyPolicy(once, rules), rules), once, '2回目以降の再適用で変化している');
+    const once = sentText(sanitize(`AcmeSecret と ${placeholders}`, value));
+    assert.equal(sentText(sanitize(once, value)), once, 'placeholderを含む置換済み本文が再適用で変化している');
+    assert.equal(sentText(sanitize(sentText(sanitize(once, value)), value)), once, '2回目以降の再適用で変化している');
 
-    const builtIn = applyPolicy('PASSWORD=hunter2 と AKIAIOSFODNN7EXAMPLE', [literal('hunter2')]);
-    assert.equal(applyPolicy(builtIn, [literal('hunter2')]), builtIn, 'built-in placeholderが再適用で壊れている');
+    const builtIn = sentText(sanitize('PASSWORD=hunter2 と AKIAIOSFODNN7EXAMPLE', policy({ terms: ['hunter2'] })));
+    assert.equal(builtIn, 'PASSWORD=[REDACTED:env_value] と [REDACTED:aws_access_key]', 'built-in置換がterm適用で壊れている');
+    assert.equal(sentText(sanitize(builtIn, policy({ terms: ['hunter2'] }))), builtIn, 'built-in placeholderが再適用で壊れている');
   });
 
-  it('assignment_keyはkeyの表記・空白・区切りを保持してvalueだけをplaceholderへ置換する', () => {
-    const rules = [assignmentKey('pass')];
-    assert.equal(applyPolicy('pass: hogehoge', rules), 'pass: [REDACTED:custom]');
-    assert.equal(applyPolicy('PASS: hogehoge', rules), 'PASS: [REDACTED:custom]', 'case-insensitiveでない、またはkey表記が変わっている');
-    assert.equal(applyPolicy('Pass = hogehoge', rules), 'Pass = [REDACTED:custom]', '空白・区切り・key表記を保持していない');
-    assert.equal(applyPolicy('PASS=hogehoge', rules), 'PASS=[REDACTED:custom]', 'equals区切りの大文字keyへ反応していない');
-    assert.equal(applyPolicy('pass : hogehoge', rules), 'pass : [REDACTED:custom]');
-    assert.equal(applyPolicy('pass：hogehoge', rules), 'pass：[REDACTED:custom]', '全角colonを代入として扱っていない');
-    assert.equal(applyPolicy('PASS：hogehoge', rules), 'PASS：[REDACTED:custom]', '大文字keyの全角colonへ反応していない');
-    assert.equal(applyPolicy('pass ： hogehoge', rules), 'pass ： [REDACTED:custom]');
-    assert.equal(applyPolicy('pass: "hoge hoge"', rules), 'pass: [REDACTED:custom]', 'quoted valueを置換していない');
-    assert.equal(applyPolicy("pass: 'hoge hoge'", rules), 'pass: [REDACTED:custom]', 'single quoted valueを置換していない');
-    assert.equal(applyPolicy('pass: a-b_c.1', rules), 'pass: [REDACTED:custom]');
-    assert.equal(applyPolicy('pass: hoge\nnext', rules), 'pass: [REDACTED:custom]\nnext');
+  it('fieldはkeyの表記・空白・区切りを保持してvalueだけbusiness_valueへ置換する', () => {
+    const value = policy({ fields: ['pass'] });
+    assert.equal(sentText(sanitize('pass: hogehoge', value)), 'pass: [REDACTED:business_value]');
+    assert.equal(sentText(sanitize('PASS: hogehoge', value)), 'PASS: [REDACTED:business_value]', 'case-insensitiveでない、またはkey表記が変わっている');
+    assert.equal(sentText(sanitize('Pass = hogehoge', value)), 'Pass = [REDACTED:business_value]', '空白・区切り・key表記を保持していない');
+    assert.equal(sentText(sanitize('PASS=hogehoge', value)), 'PASS=[REDACTED:business_value]', 'equals区切りの大文字keyへ反応していない');
+    assert.equal(sentText(sanitize('pass : hogehoge', value)), 'pass : [REDACTED:business_value]');
+    assert.equal(sentText(sanitize('pass：hogehoge', value)), 'pass：[REDACTED:business_value]', '全角colonを代入として扱っていない');
+    assert.equal(sentText(sanitize('PASS：hogehoge', value)), 'PASS：[REDACTED:business_value]', '大文字keyの全角colonへ反応していない');
+    assert.equal(sentText(sanitize('pass ： hogehoge', value)), 'pass ： [REDACTED:business_value]');
+    assert.equal(sentText(sanitize('pass: "hoge hoge"', value)), 'pass: [REDACTED:business_value]', 'quoted valueを置換していない');
+    assert.equal(sentText(sanitize("pass: 'hoge hoge'", value)), 'pass: [REDACTED:business_value]', 'single quoted valueを置換していない');
+    assert.equal(sentText(sanitize('pass: a-b_c.1', value)), 'pass: [REDACTED:business_value]');
+    assert.equal(sentText(sanitize('pass: hoge\nnext', value)), 'pass: [REDACTED:business_value]\nnext');
     const maxValue = 'v'.repeat(4096);
-    assert.equal(applyPolicy(`pass: ${maxValue}`, rules), 'pass: [REDACTED:custom]', '上限4096のvalueを置換していない');
-    assert.equal(applyPolicy(`pass: "${maxValue}"`, rules), 'pass: [REDACTED:custom]', '上限4096のquoted valueを置換していない');
+    assert.equal(sentText(sanitize(`pass: ${maxValue}`, value)), 'pass: [REDACTED:business_value]', '上限4096のvalueを置換していない');
+    assert.equal(sentText(sanitize(`pass: "${maxValue}"`, value)), 'pass: [REDACTED:business_value]', '上限4096のquoted valueを置換していない');
   });
 
-  it('assignment_keyはkeyだけ・空value・改行越境・比較・名前空間・別identifierを変更しない', () => {
-    const rules = [assignmentKey('pass')];
+  it('fieldはkeyだけ・空value・改行越境・比較・名前空間・別identifierを変更しない', () => {
+    const value = policy({ fields: ['pass'] });
     for (const unchanged of [
       'pass',
       'pass:',
@@ -97,119 +109,156 @@ describe('custom伏せ字policyの純粋関数', () => {
       'bypass=hogehoge',
       'DB_PASS: hogehoge',
     ]) {
-      assert.equal(applyPolicy(unchanged, rules), unchanged, `変更してはいけない入力: ${JSON.stringify(unchanged)}`);
+      assert.equal(sentText(sanitize(unchanged, value)), unchanged, `変更してはいけない入力: ${JSON.stringify(unchanged)}`);
     }
-    // passkeyはcustom rule `pass`とは別identifierのためcustom置換は起きない。KEY suffixとしての
+    // passkeyはcustom rule `pass`とは別identifierのためfield置換は起きない。KEY suffixとしての
     // built-in置換だけが従来どおりvalueを伏せる。
-    assert.equal(applyPolicy('passkey: hogehoge', rules), 'passkey: [REDACTED:env_value]');
+    assert.equal(sentText(sanitize('passkey: hogehoge', value)), 'passkey: [REDACTED:env_value]');
   });
 
-  it('assignment_keyはenvironment variable参照とplaceholderを変更せず、再適用してもbyte一致する', () => {
-    const rules = [assignmentKey('my_var'), literal('AcmeSecret')];
+  it('field/termはenvironment variable参照とplaceholderを変更せず、再適用してもbyte一致する', () => {
+    const value = policy({ fields: ['my_var'], terms: ['AcmeSecret'] });
     for (const unchanged of [
       'my_var: $MY_VAR',
       'my_var: ${MY_VAR}',
-      'my_var: [REDACTED:custom]',
+      'my_var: [REDACTED:business_value]',
       'my_var: [REDACTED:env_value]',
+      '[REDACTED:known_secret]',
     ]) {
-      assert.equal(applyPolicy(unchanged, rules), unchanged, `変更してはいけない入力: ${JSON.stringify(unchanged)}`);
+      assert.equal(sentText(sanitize(unchanged, value)), unchanged, `変更してはいけない入力: ${JSON.stringify(unchanged)}`);
     }
 
     const text = 'my_var: hogehoge と AcmeSecret と my_var: $MY_VAR';
-    const once = applyPolicy(text, rules);
-    assert.equal(once, 'my_var: [REDACTED:custom] と [REDACTED:custom] と my_var: $MY_VAR');
-    assert.equal(applyPolicy(once, rules), once, '再適用でplaceholderやenv参照が変化している');
-    assert.equal(applyPolicy(applyPolicy(once, rules), rules), once, '3回目の再適用で変化している');
+    const once = sentText(sanitize(text, value));
+    assert.equal(once, 'my_var: [REDACTED:business_value] と [REDACTED:business_term] と my_var: $MY_VAR');
+    assert.equal(sentText(sanitize(once, value)), once, '再適用でplaceholderやenv参照が変化している');
+    assert.equal(sentText(sanitize(sentText(sanitize(once, value)), value)), once, '3回目の再適用で変化している');
   });
 
-  it('custom assignment_keyはbuilt-in置換と併用し、literalはbuilt-in適用後の本文へ適用する', () => {
-    const rules = [assignmentKey('my_var')];
+  it('fieldとbuilt-inを併用し、termはbuilt-in適用後の本文へ適用する', () => {
     assert.equal(
-      applyPolicy('pass: hogehoge と my_var: other', rules),
-      'pass: [REDACTED:env_value] と my_var: [REDACTED:custom]',
-      'custom assignment_keyとbuilt-in PASSの優先順位が確定契約と異なる',
+      sentText(sanitize('pass: hogehoge と my_var: other', policy({ fields: ['my_var'] }))),
+      'pass: [REDACTED:env_value] と my_var: [REDACTED:business_value]',
+      'fieldとbuilt-in PASSの優先順位が確定契約と異なる',
     );
-    const literalRules = [literal('hunter2'), literal('AcmeSecret')];
     assert.equal(
-      applyPolicy('PASSWORD=hunter2 と hunter2 と AcmeSecret と AKIAIOSFODNN7EXAMPLE', literalRules),
-      'PASSWORD=[REDACTED:env_value] と [REDACTED:custom] と [REDACTED:custom] と [REDACTED:aws_access_key]',
+      sentText(sanitize('PASSWORD=hunter2 と hunter2 と AcmeSecret と AKIAIOSFODNN7EXAMPLE', policy({ terms: ['hunter2', 'AcmeSecret'] }))),
+      'PASSWORD=[REDACTED:env_value] と [REDACTED:business_term] と [REDACTED:business_term] と [REDACTED:aws_access_key]',
     );
-    assert.equal(applyPolicy('PASSWORD=hunter2', []), redactConversationText('PASSWORD=hunter2'), 'rule無しでbuilt-inが弱まっている');
+    assert.equal(
+      sentText(sanitize('PASSWORD=hunter2', policy())),
+      sentText(sanitize('PASSWORD=hunter2', policy({ terms: ['unknown'] }))),
+      'policy無しでbuilt-inが弱まっている',
+    );
   });
 
-  it('invalid ruleを拒否し、literal/assignment_keyの境界値とtype別の重複規則を受理する', () => {
+  it('作用のない本文ではfindingsを値なしで返し、空policyはbyte一致で送る', () => {
+    const result = sanitize('変更対象のない本文', policy());
+    assert.deepEqual(result, { action: 'send', text: '変更対象のない本文', findings: [] }, '空policyのsend結果が契約と異なる');
+  });
+
+  it('invalid policyを拒否し、field/termの境界値と重複規則を受理する', () => {
     for (const invalid of [
-      { type: 'regex', value: 'x' },
-      { type: 'literal' },
-      { value: 'x' },
-      { type: 'literal', value: 'x', extra: true },
-      { type: 'literal', value: 42 },
-      { type: 'assignment_key', value: '' },
-      'AcmeSecret',
-      42,
-      null,
+      { version: -1 },
+      { version: 1.5 },
+      { fields: 'AcmeSecret' },
+      { terms: 'AcmeSecret' },
+      { suspicion_mode: 'warn' },
+      { detector_version: 'latest' },
+      { fields: [1] },
+      { terms: [null] },
     ]) {
       assert.throws(
-        () => applyPolicy('x', [invalid as unknown as CustomRedactionRule]),
-        `不正ruleを拒否していない: ${JSON.stringify(invalid)}`,
+        () => sanitize('x', policy(invalid as Partial<Policy>)),
+        `不正policyを拒否していない: ${JSON.stringify(invalid)}`,
       );
     }
 
-    assert.throws(() => applyPolicy('x', [literal('')]), '空literalを拒否していない');
-    assert.throws(() => applyPolicy('x', [literal('[REDACTED:custom]')]), 'placeholderそのものを拒否していない');
-    for (const fragment of ['REDACTED', 'custom', '[REDACTED', 'ED:custom]', 'env_value', 'authorization', ':']) {
-      assert.throws(() => applyPolicy('x', [literal(fragment)]), `literalのplaceholder部分文字列 ${fragment} を受理している`);
+    assert.throws(() => sanitize('x', policy({ terms: [''] })), '空termを拒否していない');
+    assert.throws(() => sanitize('x', policy({ terms: ['[REDACTED:business_term]'] })), 'placeholderそのものを拒否していない');
+    for (const fragment of ['REDACTED', 'business_term', 'business_value', 'known_secret', '[REDACTED', 'env_value', 'authorization', ':']) {
+      assert.throws(() => sanitize('x', policy({ terms: [fragment] })), `termのplaceholder部分文字列 ${fragment} を受理している`);
     }
-    assert.throws(() => applyPolicy('x', [literal('dup'), literal('dup')]), '重複literalを拒否していない');
-    assert.throws(() => applyPolicy('x', [literal('x'.repeat(MAX_LITERAL_CODE_POINTS + 1))]), '上限超過literalを拒否していない');
+    assert.throws(() => sanitize('x', policy({ terms: ['dup', 'dup'] })), '重複termを拒否していない');
+    assert.throws(() => sanitize('x', policy({ terms: ['x'.repeat(MAX_TERM_CODE_POINTS + 1)] })), '上限超過termを拒否していない');
 
-    for (const invalidKey of ['1pass', '-pass', '.pass', 'pass key', 'pass:key', 'ぱす', 'pass!', 'REDACTED', 'redacted', 'Redacted']) {
+    for (const invalidField of ['1pass', '-pass', '.pass', 'pass key', 'pass:key', 'ぱす', 'pass!', 'REDACTED', 'redacted', 'Redacted']) {
       assert.throws(
-        () => applyPolicy('x', [assignmentKey(invalidKey)]),
-        `不正なassignment_keyを受理している: ${JSON.stringify(invalidKey)}`,
+        () => sanitize('x', policy({ fields: [invalidField] })),
+        `不正なfieldを受理している: ${JSON.stringify(invalidField)}`,
       );
     }
+    assert.throws(() => sanitize('x', policy({ fields: ['a'.repeat(MAX_FIELD_CODE_POINTS + 1)] })), '上限超過fieldを拒否していない');
+    assert.doesNotThrow(() => sanitize('x', policy({ fields: ['pass'] })), '妥当なfieldを拒否している');
     assert.throws(
-      () => applyPolicy('x', [assignmentKey('a'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS + 1))]),
-      '上限超過assignment_keyを拒否していない',
-    );
-    assert.throws(
-      () => applyPolicy('x', [assignmentKey('pass'), assignmentKey('PASS')]),
-      'assignment_keyの大文字小文字違い重複を拒否していない',
+      () => sanitize('x', policy({ fields: ['pass', 'PASS'] })),
+      'fieldの大文字小文字違い重複を拒否していない',
     );
 
-    const maxLiteral = 'y'.repeat(MAX_LITERAL_CODE_POINTS);
-    assert.equal(applyPolicy(maxLiteral, [literal(maxLiteral)]), '[REDACTED:custom]');
-    const maxKey = 'a'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS);
+    const maxTerm = 'y'.repeat(MAX_TERM_CODE_POINTS);
+    assert.equal(sentText(sanitize(maxTerm, policy({ terms: [maxTerm] }))), '[REDACTED:business_term]');
+    const maxField = 'a'.repeat(MAX_FIELD_CODE_POINTS);
     assert.equal(
-      applyPolicy(`${'A'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS)}: v`, [assignmentKey(maxKey)]),
-      `${'A'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS)}: [REDACTED:custom]`,
-      '128 code pointsのassignment_keyを照合していない',
+      sentText(sanitize(`${'A'.repeat(MAX_FIELD_CODE_POINTS)}: v`, policy({ fields: [maxField] }))),
+      `${'A'.repeat(MAX_FIELD_CODE_POINTS)}: [REDACTED:business_value]`,
+      '128 code pointsのfieldを照合していない',
     );
-    const mixedCaseLiterals = [literal('Pass'), literal('pass')];
-    assert.equal(applyPolicy('Pass pass', mixedCaseLiterals), '[REDACTED:custom] [REDACTED:custom]', 'literalのcase-sensitive重複を誤って拒否している');
-    assert.doesNotThrow(() => applyPolicy('x', [literal('shared'), assignmentKey('shared')]), 'typeが異なる同名ruleを拒否している');
-    const keyedRules = [assignmentKey('deploy.pass-1_2')];
+    assert.doesNotThrow(
+      () => sanitize('x', policy({ terms: ['shared'], fields: ['shared'] })),
+      'typeが異なる同名ruleを拒否している',
+    );
+    const mixedCaseTerms = ['Pass', 'pass'];
     assert.equal(
-      applyPolicy('DEPLOY.PASS-1_2: value', keyedRules),
-      'DEPLOY.PASS-1_2: [REDACTED:custom]',
-      '許容文字を含むassignment_keyを照合していない',
+      sentText(sanitize('Pass pass', policy({ terms: mixedCaseTerms }))),
+      '[REDACTED:business_term] [REDACTED:business_term]',
+      'termのcase-sensitive重複を誤って拒否している',
     );
-    const underscoreKeyRules = [assignmentKey('_pass')];
-    assert.equal(applyPolicy('_pass: value', underscoreKeyRules), '_pass: [REDACTED:custom]', '先頭underscoreのassignment_keyを照合していない');
+    assert.equal(
+      sentText(sanitize('shared_term と shared_field: v', policy({ terms: ['shared_term'], fields: ['shared_field'] }))),
+      '[REDACTED:business_term] と shared_field: [REDACTED:business_value]',
+      'typeが異なるruleを併用できていない、またはfieldがterm適用で壊れている',
+    );
+    const keyedValue = policy({ fields: ['deploy.pass-1_2'] });
+    assert.equal(
+      sentText(sanitize('DEPLOY.PASS-1_2: value', keyedValue)),
+      'DEPLOY.PASS-1_2: [REDACTED:business_value]',
+      '許容文字を含むfieldを照合していない',
+    );
+    assert.equal(
+      sentText(sanitize('_pass: value', policy({ fields: ['_pass'] }))),
+      '_pass: [REDACTED:business_value]',
+      '先頭underscoreのfieldを照合していない',
+    );
   });
 
-  it('literalとassignment_keyを合算したrule総数は100件まで、101件を拒否する', () => {
-    const hundred = [...Array.from({ length: 99 }, (_, index) => literal(`rule-${index}`)), assignmentKey('pass')];
-    assert.equal(applyPolicy('rule-0 と pass: hogehoge', hundred), '[REDACTED:custom] と pass: [REDACTED:custom]');
-    assert.throws(() => applyPolicy('x', [...hundred, literal('extra')]), '101件目を拒否していない');
+  it('fieldとtermを合算したrule総数は100件まで、101件を拒否する', () => {
+    const hundred = policy({
+      fields: ['pass'],
+      terms: Array.from({ length: 99 }, (_, index) => `rule-${index}`),
+    });
+    assert.equal(
+      sentText(sanitize('rule-0 と pass: hogehoge', hundred)),
+      '[REDACTED:business_term] と pass: [REDACTED:business_value]',
+    );
 
-    const fiftyFifty = [
-      ...Array.from({ length: 50 }, (_, index) => literal(`lit-${index}`)),
-      ...Array.from({ length: 50 }, (_, index) => assignmentKey(`key_${index}`)),
-    ];
-    assert.equal(fiftyFifty.length, MAX_CUSTOM_RULES);
-    assert.equal(applyPolicy('lit-0 と key_0: v', fiftyFifty), '[REDACTED:custom] と key_0: [REDACTED:custom]');
-    assert.throws(() => applyPolicy('x', [...fiftyFifty, literal('over')]), 'literal/assignment_key合算101件を拒否していない');
+    const hundredOne = policy({
+      fields: ['pass'],
+      terms: Array.from({ length: 100 }, (_, index) => `rule-${index}`),
+    });
+    assert.throws(() => sanitize('x', hundredOne), 'field/term合算101件を拒否していない');
+
+    const fiftyFifty = policy({
+      terms: Array.from({ length: 50 }, (_, index) => `lit-${index}`),
+      fields: Array.from({ length: 50 }, (_, index) => `key_${index}`),
+    });
+    assert.equal(fiftyFifty.fields.length + fiftyFifty.terms.length, MAX_CUSTOM_RULES);
+    assert.equal(
+      sentText(sanitize('lit-0 と key_0: v', fiftyFifty)),
+      '[REDACTED:business_term] と key_0: [REDACTED:business_value]',
+    );
+    assert.throws(
+      () => sanitize('x', policy({ ...fiftyFifty, terms: [...fiftyFifty.terms, 'over'] })),
+      'field/term合算101件を拒否していない',
+    );
   });
 });
