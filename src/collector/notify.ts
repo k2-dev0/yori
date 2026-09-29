@@ -15,6 +15,8 @@ export interface NotifyFromHookInput {
   hook: CollectorHookInput;
   config: CollectorConfig;
   token: string;
+  // CLIがlocalのYORI_KNOWN_SECRETS_JSONからparseした値。collectと同じsanitize境界へ渡す。
+  knownSecrets?: readonly string[];
 }
 
 interface LatestUserInput {
@@ -211,7 +213,13 @@ function buildNotificationContext(payload: unknown): string | null {
 // user入力だけを通知する。共有stateを前後比較しないため、HTTP待機中に別collectが後続入力を
 // 取り込んでも先行呼出しのidentityは混ざらない。確定差分がなければ無出力で終了する。
 export async function notifyFromHook(input: NotifyFromHookInput): Promise<void> {
-  const result = await collectFromHook({ source: input.source, hook: input.hook, config: input.config, token: input.token });
+  const result = await collectFromHook({
+    source: input.source,
+    hook: input.hook,
+    config: input.config,
+    token: input.token,
+    knownSecrets: input.knownSecrets,
+  });
   if (result.confirmedUserInputs.length === 0) {
     return;
   }
