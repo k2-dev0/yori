@@ -1,5 +1,5 @@
 -- 会社単位のcustom伏せ字policy（version付き）とproject repository alias。
--- yori-cliはこのschemaへ直接literalを登録できるため、重複・空・placeholder・長さ・件数はDB制約でも拒否する。
+-- yori-cliはこのschemaへ直接literal/assignment_keyを登録できるため、rule種別・正規化・重複・空・placeholder・長さ・件数はDB制約でも拒否する。
 
 -- repository aliasはprojectの会社と整合した組だけを受理する。
 ALTER TABLE projects ADD CONSTRAINT projects_id_company_id_unique UNIQUE (id, company_id);
@@ -34,17 +34,37 @@ $$ LANGUAGE sql IMMUTABLE;
 
 CREATE TABLE company_redaction_rules (
   company_id uuid NOT NULL REFERENCES company_redaction_policies(company_id) ON DELETE CASCADE,
-  literal text NOT NULL,
-  PRIMARY KEY (company_id, literal),
-  CONSTRAINT company_redaction_rules_literal_not_empty CHECK (literal <> ''),
-  CONSTRAINT company_redaction_rules_literal_not_placeholder_fragment CHECK (NOT yori_is_redaction_placeholder_fragment(literal)),
-  -- 512 code pointsならUTF-8最大4 bytes/pointでも2048 bytes程度で、
-  -- (company_id, literal)主キーのB-tree index rowの通常上限（約2704 bytes）内に収まる。
-  CONSTRAINT company_redaction_rules_literal_length CHECK (char_length(literal) <= 512)
+  rule_type text NOT NULL,
+  -- valueは入力表記そのまま（literalのcase-sensitive照合とassignment_keyのkey表記保持に使う）。
+  value text NOT NULL,
+  -- literalはvalueそのまま、assignment_keyはcase-insensitive照合のためlower(value)を一意性の正規化に使う。
+  normalized_value text NOT NULL,
+  PRIMARY KEY (company_id, rule_type, normalized_value),
+  CONSTRAINT company_redaction_rules_rule_type CHECK (rule_type IN ('literal', 'assignment_key')),
+  CONSTRAINT company_redaction_rules_value_not_empty CHECK (value <> ''),
+  CONSTRAINT company_redaction_rules_normalized_value CHECK (
+    (rule_type = 'literal' AND normalized_value = value)
+    OR (rule_type = 'assignment_key' AND normalized_value = lower(value))
+  ),
+  -- built-in/customのplaceholderは伏せ字結果そのものなので、literalの部分文字列を拒否する。
+  CONSTRAINT company_redaction_rules_literal_not_placeholder_fragment CHECK (
+    rule_type <> 'literal' OR NOT yori_is_redaction_placeholder_fragment(value)
+  ),
+  -- assignment_keyはASCII identifierに限定し、placeholderを壊すREDACTEDを大文字小文字を問わず拒否する。
+  CONSTRAINT company_redaction_rules_assignment_key_identifier CHECK (
+    rule_type <> 'assignment_key' OR value ~ '^[A-Za-z_][A-Za-z0-9_.-]*$'
+  ),
+  CONSTRAINT company_redaction_rules_assignment_key_not_redacted CHECK (
+    rule_type <> 'assignment_key' OR lower(value) <> 'redacted'
+  ),
+  -- 512/128 code pointsならUTF-8最大4 bytes/pointでも、(company_id, rule_type, normalized_value)主キーの
+  -- B-tree index rowの通常上限（約2704 bytes）内へ格納できる。
+  CONSTRAINT company_redaction_rules_literal_length CHECK (rule_type <> 'literal' OR char_length(value) <= 512),
+  CONSTRAINT company_redaction_rules_assignment_key_length CHECK (rule_type <> 'assignment_key' OR char_length(value) <= 128)
 );
 
--- literalは最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
--- 同会社内のliteral変更は件数を増やさないため、limitの対象にしない。
+-- literal/assignment_key合算で最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
+-- 同会社内のvalue変更は件数を増やさないため、limitの対象にしない。
 CREATE FUNCTION company_redaction_rules_enforce_limit() RETURNS trigger AS $$
 DECLARE
   rule_count integer;
