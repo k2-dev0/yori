@@ -1,5 +1,5 @@
--- 会社単位のcustom伏せ字policy（version付き）とproject repository alias。
--- yori-cliはこのschemaへ直接literal/assignment_keyを登録できるため、rule種別・正規化・重複・空・placeholder・長さ・件数はDB制約でも拒否する。
+-- 会社単位のbusiness伏せ字policy（version付き）とproject repository alias。
+-- yori-cliはこのschemaへ直接field/termを登録できるため、rule種別・正規化・重複・空・placeholder・長さ・件数はDB制約でも拒否する。
 
 -- repository aliasはprojectの会社と整合した組だけを受理する。
 ALTER TABLE projects ADD CONSTRAINT projects_id_company_id_unique UNIQUE (id, company_id);
@@ -7,63 +7,71 @@ ALTER TABLE projects ADD CONSTRAINT projects_id_company_id_unique UNIQUE (id, co
 CREATE TABLE company_redaction_policies (
   company_id uuid PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
   version integer NOT NULL CHECK (version >= 1),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  -- observeは送信継続、blockはmessage全体を保存させないsuspected-secret gateのmode。
+  suspicion_mode text NOT NULL DEFAULT 'observe',
+  -- detectorの版。現行はinitial-v1だけで、将来版は別migrationで追加する。
+  detector_version text NOT NULL DEFAULT 'initial-v1',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT company_redaction_policies_suspicion_mode CHECK (suspicion_mode IN ('observe', 'block')),
+  CONSTRAINT company_redaction_policies_detector_version CHECK (detector_version = 'initial-v1')
 );
 
--- built-in/customのplaceholderは伏せ字結果そのものなので、その部分文字列もcustom literalとして拒否する。
--- 再適用でplaceholderが壊れず、byte一致が保たれることをDBでも保証する。
+-- termがplaceholderの構文・種類名そのものなら、置換済みplaceholderを再適用で壊すため拒否する。
+-- 種類名を含む一般語（例: known_secretの部分文字列secret）は、アプリ側でplaceholder外だけを走査して許可する。
 CREATE FUNCTION yori_is_redaction_placeholder_fragment(value text) RETURNS boolean AS $$
-  SELECT EXISTS (
-    SELECT 1
-      FROM unnest(ARRAY[
-        '[REDACTED:custom]',
-        '[REDACTED:private_key]',
-        '[REDACTED:aws_access_key]',
-        '[REDACTED:google_api_key]',
-        '[REDACTED:github_token]',
-        '[REDACTED:slack_token]',
-        '[REDACTED:openai_key]',
-        '[REDACTED:jwt]',
-        '[REDACTED:url_credentials]',
-        '[REDACTED:authorization]',
-        '[REDACTED:env_value]'
-      ]) AS placeholder
-     WHERE position(value in placeholder) > 0
-  );
+  SELECT value = 'REDACTED'
+      OR position('[' in value) > 0
+      OR position(']' in value) > 0
+      OR position(':' in value) > 0
+      OR value IN (
+        'private_key',
+        'aws_access_key',
+        'google_api_key',
+        'github_token',
+        'slack_token',
+        'openai_key',
+        'jwt',
+        'url_credentials',
+        'authorization',
+        'env_value',
+        'business_value',
+        'business_term',
+        'known_secret'
+      );
 $$ LANGUAGE sql IMMUTABLE;
 
 CREATE TABLE company_redaction_rules (
   company_id uuid NOT NULL REFERENCES company_redaction_policies(company_id) ON DELETE CASCADE,
   rule_type text NOT NULL,
-  -- valueは入力表記そのまま（literalのcase-sensitive照合とassignment_keyのkey表記保持に使う）。
+  -- valueは入力表記そのまま（termのcase-sensitive照合とfieldのkey表記保持に使う）。
   value text NOT NULL,
-  -- literalはvalueそのまま、assignment_keyはcase-insensitive照合のためlower(value)を一意性の正規化に使う。
+  -- termはvalueそのまま、fieldはcase-insensitive照合のためlower(value)を一意性の正規化に使う。
   normalized_value text NOT NULL,
   PRIMARY KEY (company_id, rule_type, normalized_value),
-  CONSTRAINT company_redaction_rules_rule_type CHECK (rule_type IN ('literal', 'assignment_key')),
+  CONSTRAINT company_redaction_rules_rule_type CHECK (rule_type IN ('field', 'term')),
   CONSTRAINT company_redaction_rules_value_not_empty CHECK (value <> ''),
   CONSTRAINT company_redaction_rules_normalized_value CHECK (
-    (rule_type = 'literal' AND normalized_value = value)
-    OR (rule_type = 'assignment_key' AND normalized_value = lower(value))
+    (rule_type = 'term' AND normalized_value = value)
+    OR (rule_type = 'field' AND normalized_value = lower(value))
   ),
-  -- built-in/customのplaceholderは伏せ字結果そのものなので、literalの部分文字列を拒否する。
-  CONSTRAINT company_redaction_rules_literal_not_placeholder_fragment CHECK (
-    rule_type <> 'literal' OR NOT yori_is_redaction_placeholder_fragment(value)
+  -- placeholderの構文・種類名そのものはtermとして拒否する。
+  CONSTRAINT company_redaction_rules_term_not_placeholder_fragment CHECK (
+    rule_type <> 'term' OR NOT yori_is_redaction_placeholder_fragment(value)
   ),
-  -- assignment_keyはASCII identifierに限定し、placeholderを壊すREDACTEDを大文字小文字を問わず拒否する。
-  CONSTRAINT company_redaction_rules_assignment_key_identifier CHECK (
-    rule_type <> 'assignment_key' OR value ~ '^[A-Za-z_][A-Za-z0-9_.-]*$'
+  -- fieldはASCII identifierに限定し、placeholderを壊すREDACTEDを大文字小文字を問わず拒否する。
+  CONSTRAINT company_redaction_rules_field_identifier CHECK (
+    rule_type <> 'field' OR value ~ '^[A-Za-z_][A-Za-z0-9_.-]*$'
   ),
-  CONSTRAINT company_redaction_rules_assignment_key_not_redacted CHECK (
-    rule_type <> 'assignment_key' OR lower(value) <> 'redacted'
+  CONSTRAINT company_redaction_rules_field_not_redacted CHECK (
+    rule_type <> 'field' OR lower(value) <> 'redacted'
   ),
   -- 512/128 code pointsならUTF-8最大4 bytes/pointでも、(company_id, rule_type, normalized_value)主キーの
   -- B-tree index rowの通常上限（約2704 bytes）内へ格納できる。
-  CONSTRAINT company_redaction_rules_literal_length CHECK (rule_type <> 'literal' OR char_length(value) <= 512),
-  CONSTRAINT company_redaction_rules_assignment_key_length CHECK (rule_type <> 'assignment_key' OR char_length(value) <= 128)
+  CONSTRAINT company_redaction_rules_term_length CHECK (rule_type <> 'term' OR char_length(value) <= 512),
+  CONSTRAINT company_redaction_rules_field_length CHECK (rule_type <> 'field' OR char_length(value) <= 128)
 );
 
--- literal/assignment_key合算で最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
+-- field/term合算で最大100件。target policy行を排他lockしてから数え、並行のatomic replaceでも上限を越えない。
 -- 同会社内のvalue変更は件数を増やさないため、limitの対象にしない。
 CREATE FUNCTION company_redaction_rules_enforce_limit() RETURNS trigger AS $$
 DECLARE
