@@ -64,9 +64,10 @@ export async function ingestEvents(pool: Pool, auth: AuthContext, request: Event
       // receiptの衝突判定はcustom policy変更から独立させる。built-inだけを適用した決定的な本文でhashし、
       // same idempotency_key＋同じ受信bodyはpolicy追加後も同じreceiptとして成功させる。
       const receiptText = redactConversationText(event.text);
-      // 保存本文はcurrent policyのcustom置換まで適用する。異なる受信bodyが同じplaceholderになっても
-      // receiptTextが異なるため、衝突判定はconflictを維持する。
-      const storedEvent = { ...event, text: redactConversationTextWithPolicy(receiptText, policy) };
+      // 保存本文はcurrent policyのcustom置換まで適用する。custom assignment_keyをbuilt-inより先に
+      // 適用してcustom placeholderを維持するため、built-in適用前の受信本文へpolicyを適用する。
+      // 異なる受信bodyが同じplaceholderになってもreceiptTextが異なるため、衝突判定はconflictを維持する。
+      const storedEvent = { ...event, text: redactConversationTextWithPolicy(event.text, policy) };
       results.push(await applyEvent(client, auth, request.project_id, storedEvent, receiptText));
     }
     await client.query('COMMIT');
