@@ -3,7 +3,7 @@ import type { Pool } from 'pg';
 import { z } from 'zod';
 import { MAX_EVENT_BODY_BYTES, type ErrorBody, type ErrorCode } from './contract.js';
 import { resolveCollectorSetup } from './collector-setup.js';
-import { authenticate, EventConflictError, ingestEvents, isProjectMember } from './events.js';
+import { authenticate, EventConflictError, ingestEvents, isProjectMember, SuspectedSecretError } from './events.js';
 import {
   createSearch,
   loadEvidence,
@@ -78,6 +78,9 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
     try {
       return reply.code(202).send(eventsResponseSchema.parse(await ingestEvents(deps.pool, auth, parsed.data)));
     } catch (error) {
+      if (error instanceof SuspectedSecretError) {
+        return reply.code(400).send(errorBody('suspected_secret'));
+      }
       if (error instanceof EventConflictError || isUniqueViolation(error)) {
         return reply.code(409).send(errorBody('conflict'));
       }
@@ -102,6 +105,9 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
       const created = await createSearch(deps.pool, auth, parsed.data);
       return reply.code(created.reused ? 200 : 202).send(searchAcceptedResponseSchema.parse({ request_id: created.requestId }));
     } catch (error) {
+      if (error instanceof SuspectedSecretError) {
+        return reply.code(400).send(errorBody('suspected_secret'));
+      }
       if (error instanceof SearchConflictError || isUniqueViolation(error)) {
         return reply.code(409).send(errorBody('conflict'));
       }
