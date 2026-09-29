@@ -165,7 +165,7 @@ const ROUTES: RouteContract[] = [
   },
 ];
 
-const ERROR_CODES = ['invalid_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'payload_too_large', 'internal_error'];
+const ERROR_CODES = ['invalid_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'payload_too_large', 'internal_error', 'suspected_secret'];
 
 interface GeneratedOpenApi {
   json: string;
@@ -508,7 +508,7 @@ describe('OpenAPI 3.1契約の生成', () => {
     assert.ok(document.paths?.['/openapi.json'] === undefined, '公開OpenAPI endpointをpathsへ追加している');
   });
 
-  it('collector setup応答のrulesをliteral/assignment_keyのobject unionと100件上限で生成する', async () => {
+  it('collector setup応答のpolicyをfields/terms/suspicion_mode/detector_versionで生成する', async () => {
     const { document } = await generatedOpenApi();
     const setupRoute = ROUTES.find((route) => route.path === '/v1/collector/setup');
     assert.ok(setupRoute, 'collector setupのroute契約がない');
@@ -516,27 +516,30 @@ describe('OpenAPI 3.1契約の生成', () => {
     const responseSchema = jsonResponseSchema(document, operation, '200');
     const policySchema = resolveSchema(document, responseSchema?.properties?.redaction_policy);
     assert.ok(policySchema, 'CollectorSetupResponseにredaction_policyがない');
+    assert.equal(policySchema?.properties?.rules, undefined, '旧redaction_policy.rulesが残っている');
+    assert.deepEqual(
+      requiredNames(policySchema).sort(),
+      ['detector_version', 'fields', 'suspicion_mode', 'terms', 'version'],
+      'redaction_policyの必須fieldが新shapeと異なる',
+    );
 
-    const rulesSchema = resolveSchema(document, policySchema?.properties?.rules);
-    assert.equal(rulesSchema?.type, 'array', 'redaction_policy.rulesがarrayでない');
-    assert.equal(rulesSchema?.maxItems, 100, 'redaction_policy.rulesの100件上限がない');
-
-    const itemSchema = resolveSchema(document, rulesSchema?.items);
-    const branches = itemSchema?.anyOf ?? itemSchema?.oneOf;
-    assert.ok(Array.isArray(branches) && branches.length === 2, 'rules itemがliteral/assignment_keyの2分岐unionでない');
-
-    const branchSchemas = branches.map((branch) => resolveSchema(document, branch));
-    const branchTypes = branchSchemas.map((branch) => {
-      const typeSchema = resolveSchema(document, branch?.properties?.type);
-      return typeSchema?.const ?? (Array.isArray(typeSchema?.enum) ? typeSchema.enum[0] : undefined);
-    });
-    assert.deepEqual([...branchTypes].sort(), ['assignment_key', 'literal'], 'rules unionのtypeがliteral/assignment_keyでない');
-
-    for (const branch of branchSchemas) {
-      assert.deepEqual(requiredNames(branch).sort(), ['type', 'value'], 'rule branchの必須fieldがtype/valueでない');
-      assert.equal(resolveSchema(document, branch?.properties?.type)?.type, 'string', 'ruleのtypeがstringでない');
-      assert.equal(resolveSchema(document, branch?.properties?.value)?.type, 'string', 'ruleのvalueがstringでない');
+    const versionSchema = resolveSchema(document, policySchema?.properties?.version);
+    assert.equal(versionSchema?.type, 'integer', 'redaction_policy.versionがintegerでない');
+    for (const name of ['fields', 'terms']) {
+      const arraySchema = resolveSchema(document, policySchema?.properties?.[name]);
+      assert.equal(arraySchema?.type, 'array', `redaction_policy.${name}がarrayでない`);
+      assert.equal(resolveSchema(document, arraySchema?.items)?.type, 'string', `redaction_policy.${name}のitemがstringでない`);
     }
+
+    const modeSchema = resolveSchema(document, policySchema?.properties?.suspicion_mode);
+    const modeValues = modeSchema?.enum ?? (modeSchema?.const === undefined ? undefined : [modeSchema.const]);
+    assert.ok(Array.isArray(modeValues), 'redaction_policy.suspicion_modeのenumがない');
+    assert.deepEqual([...modeValues].sort(), ['block', 'observe'], 'suspicion_modeのenumがobserve/blockでない');
+
+    const detectorSchema = resolveSchema(document, policySchema?.properties?.detector_version);
+    const detectorValues = detectorSchema?.enum ?? (detectorSchema?.const === undefined ? undefined : [detectorSchema.const]);
+    assert.ok(Array.isArray(detectorValues), 'redaction_policy.detector_versionのenumがない');
+    assert.deepEqual([...detectorValues], ['initial-v1'], 'detector_versionがinitial-v1でない');
   });
 
   it('生成・versioning・互換性規則がdocs/api-contract.mdへ文書化されている', async () => {
