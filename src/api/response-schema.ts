@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS, MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS, MAX_CUSTOM_REDACTION_RULES } from './contract.js';
 import { occurredAtSchema, revisionSchema, storableString } from './schema.js';
 
 // HTTP公開応答の実行時正本。サーバーが返す形はstrictに固定し、
@@ -145,10 +146,30 @@ export type SearchLookupView = z.infer<typeof searchLookupResponseSchema>;
 export type EvidenceView = z.infer<typeof evidenceResponseSchema>;
 export type SessionLinkResponse = z.infer<typeof sessionLinkResponseSchema>;
 
+// custom ruleはliteral/assignment_keyのdiscriminated unionで公開し、typeごとの上限を固定する。
+export const redactionRuleResponseSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('literal'),
+    value: storableString
+      .refine((value) => [...value].length <= MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS, {
+        message: `literalは${MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS}コードポイント以内にしてください`,
+      })
+      .meta({ maxLength: MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS }),
+  }),
+  z.strictObject({
+    type: z.literal('assignment_key'),
+    value: storableString
+      .refine((value) => [...value].length <= MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS, {
+        message: `assignment_keyは${MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS}コードポイント以内にしてください`,
+      })
+      .meta({ maxLength: MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS }),
+  }),
+]);
+
 // collector setupは自社projectとcurrent policyのversion/rulesだけを返し、他社・tokenは含めない。
 export const redactionPolicyResponseSchema = z.strictObject({
   version: z.int().min(0),
-  rules: z.array(storableString),
+  rules: z.array(redactionRuleResponseSchema).max(MAX_CUSTOM_REDACTION_RULES),
 });
 
 export const collectorSetupResponseSchema = z.strictObject({
@@ -157,5 +178,6 @@ export const collectorSetupResponseSchema = z.strictObject({
   redaction_policy: redactionPolicyResponseSchema,
 });
 
+export type RedactionRuleView = z.infer<typeof redactionRuleResponseSchema>;
 export type RedactionPolicyView = z.infer<typeof redactionPolicyResponseSchema>;
 export type CollectorSetupResponse = z.infer<typeof collectorSetupResponseSchema>;
