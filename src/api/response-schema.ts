@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS, MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS, MAX_CUSTOM_REDACTION_RULES } from './contract.js';
+import { MAX_BUSINESS_FIELD_CODE_POINTS, MAX_BUSINESS_REDACTION_RULES, MAX_BUSINESS_TERM_CODE_POINTS } from './contract.js';
 import { occurredAtSchema, revisionSchema, storableString } from './schema.js';
 
 // HTTP公開応答の実行時正本。サーバーが返す形はstrictに固定し、
@@ -13,6 +13,7 @@ const errorCodeSchema = z.enum([
   'conflict',
   'payload_too_large',
   'internal_error',
+  'suspected_secret',
 ]);
 
 export const healthLiveResponseSchema = z.strictObject({ status: z.literal('ok') });
@@ -146,30 +147,27 @@ export type SearchLookupView = z.infer<typeof searchLookupResponseSchema>;
 export type EvidenceView = z.infer<typeof evidenceResponseSchema>;
 export type SessionLinkResponse = z.infer<typeof sessionLinkResponseSchema>;
 
-// custom ruleはliteral/assignment_keyのdiscriminated unionで公開し、typeごとの上限を固定する。
-export const redactionRuleResponseSchema = z.discriminatedUnion('type', [
-  z.strictObject({
-    type: z.literal('literal'),
-    value: storableString
-      .refine((value) => [...value].length <= MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS, {
-        message: `literalは${MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS}コードポイント以内にしてください`,
-      })
-      .meta({ maxLength: MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS }),
-  }),
-  z.strictObject({
-    type: z.literal('assignment_key'),
-    value: storableString
-      .refine((value) => [...value].length <= MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS, {
-        message: `assignment_keyは${MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS}コードポイント以内にしてください`,
-      })
-      .meta({ maxLength: MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS }),
-  }),
-]);
+// business fieldはidentifier長、termは一致文字列長の上限を公開schemaでも固定する。
+const businessFieldSchema = storableString
+  .refine((value) => [...value].length <= MAX_BUSINESS_FIELD_CODE_POINTS, {
+    message: `fieldは${MAX_BUSINESS_FIELD_CODE_POINTS}コードポイント以内にしてください`,
+  })
+  .meta({ maxLength: MAX_BUSINESS_FIELD_CODE_POINTS });
 
-// collector setupは自社projectとcurrent policyのversion/rulesだけを返し、他社・tokenは含めない。
+const businessTermSchema = storableString
+  .refine((value) => [...value].length <= MAX_BUSINESS_TERM_CODE_POINTS, {
+    message: `termは${MAX_BUSINESS_TERM_CODE_POINTS}コードポイント以内にしてください`,
+  })
+  .meta({ maxLength: MAX_BUSINESS_TERM_CODE_POINTS });
+
+// collector setupは自社projectとcurrent policyのversion/fields/terms/suspicion_mode/detector_versionだけを返し、
+// 他社・token・known secretを含めない。
 export const redactionPolicyResponseSchema = z.strictObject({
   version: z.int().min(0),
-  rules: z.array(redactionRuleResponseSchema).max(MAX_CUSTOM_REDACTION_RULES),
+  fields: z.array(businessFieldSchema).max(MAX_BUSINESS_REDACTION_RULES),
+  terms: z.array(businessTermSchema).max(MAX_BUSINESS_REDACTION_RULES),
+  suspicion_mode: z.enum(['observe', 'block']),
+  detector_version: z.literal('initial-v1'),
 });
 
 export const collectorSetupResponseSchema = z.strictObject({
@@ -178,6 +176,5 @@ export const collectorSetupResponseSchema = z.strictObject({
   redaction_policy: redactionPolicyResponseSchema,
 });
 
-export type RedactionRuleView = z.infer<typeof redactionRuleResponseSchema>;
 export type RedactionPolicyView = z.infer<typeof redactionPolicyResponseSchema>;
 export type CollectorSetupResponse = z.infer<typeof collectorSetupResponseSchema>;
