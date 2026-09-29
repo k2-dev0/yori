@@ -4,8 +4,10 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { flushCollector } from '../collect.js';
+import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
 import {
   ackResponse,
+  assertStateDoesNotContain,
   buildCollectorConfig,
   codexMessageLine,
   codexSessionLine,
@@ -164,6 +166,87 @@ describe('collector CLI', () => {
         env: { YORI_TEST_TOKEN: 'token-a' },
       });
       assert.notEqual(invalidSource.code, 0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('YORI_KNOWN_SECRETS_JSONをlocal inputとして受理し、生値をstate・CLI出力へ残さない', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const lines = [
+        codexSessionLine('session-1'),
+        codexMessageLine({
+          sessionId: 'session-1',
+          messageId: 'item-1',
+          role: 'user',
+          text: '値は abcd1234efgh5678 と abcd1234 と ABCD1234 です',
+        }),
+      ];
+      await writeTranscript(transcript, lines);
+      const configPath = path.join(fixture.root, 'collector.json');
+      await writeFile(configPath, JSON.stringify(fixture.config), 'utf8');
+      const hook = { session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir };
+
+      const result = await runCollectorCli(['collect', '--source', 'codex', '--config', configPath], {
+        stdin: JSON.stringify(hook),
+        env: { YORI_TEST_TOKEN: 'token-a', YORI_KNOWN_SECRETS_JSON: JSON.stringify(['abcd1234', 'abcd1234efgh5678']) },
+      });
+      assert.equal(result.code, 0, `known secret設定時のCLIが失敗した: ${result.stderr}`);
+
+      const state = openCollectorState(fixture.stateDir);
+      let outboxTexts: string[];
+      try {
+        const rows = state.db
+          .prepare('SELECT text FROM outbox WHERE namespace = ? ORDER BY id')
+          .all(collectorNamespace('https://api.example.test', 'token-a')) as Array<{ text: string }>;
+        outboxTexts = rows.map((row) => row.text);
+      } finally {
+        closeCollectorState(state);
+      }
+      assert.deepEqual(outboxTexts, ['値は [REDACTED:known_secret] と [REDACTED:known_secret] と ABCD1234 です']);
+
+      for (const secret of ['abcd1234efgh5678', 'abcd1234']) {
+        assert.ok(!result.stdout.includes(secret), `stdoutへknown secretが漏れている: ${secret}`);
+        assert.ok(!result.stderr.includes(secret), `stderrへknown secretが漏れている: ${secret}`);
+        await assertStateDoesNotContain(fixture.stateDir, secret);
+      }
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('YORI_KNOWN_SECRETS_JSONが不正ならfixed codeでfail-closedし、message/outboxを保存しない', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      await writeTranscript(transcript, [
+        codexSessionLine('session-1'),
+        codexMessageLine({ sessionId: 'session-1', messageId: 'item-1', role: 'user', text: '本文を読まない' }),
+      ]);
+      const configPath = path.join(fixture.root, 'collector.json');
+      await writeFile(configPath, JSON.stringify(fixture.config), 'utf8');
+      const hook = { session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir };
+
+      const result = await runCollectorCli(['collect', '--source', 'codex', '--config', configPath], {
+        stdin: JSON.stringify(hook),
+        env: { YORI_TEST_TOKEN: 'token-a', YORI_KNOWN_SECRETS_JSON: '["short"]' },
+      });
+      assert.notEqual(result.code, 0, '不正なknown secretを受理している');
+      assert.ok(result.stderr.includes('invalid_known_secrets'), `fixed codeが返っていない: ${result.stderr}`);
+      assert.ok(!result.stderr.includes('short'), 'stderrへknown secretが漏れている');
+
+      const state = openCollectorState(fixture.stateDir);
+      try {
+        const namespace = collectorNamespace('https://api.example.test', 'token-a');
+        const messages = state.db.prepare('SELECT count(*) AS count FROM stored_messages WHERE namespace = ?').get(namespace) as { count: number };
+        const outbox = state.db.prepare('SELECT count(*) AS count FROM outbox WHERE namespace = ?').get(namespace) as { count: number };
+        assert.equal(Number(messages.count), 0, 'fail-closed後にmessageを保存している');
+        assert.equal(Number(outbox.count), 0, 'fail-closed後にoutboxへ積んでいる');
+      } finally {
+        closeCollectorState(state);
+      }
     } finally {
       await fixture.cleanup();
     }
