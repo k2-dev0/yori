@@ -4,6 +4,7 @@ import { EVENT_SOURCES, type EventSource } from '../api/contract.js';
 import { collectFromHook, flushCollector } from './collect.js';
 import { notifyFromHook } from './notify.js';
 import { loadCollectorConfig, type CollectorConfig } from './config.js';
+import { parseKnownSecretsEnv } from './known-secrets.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from './state.js';
 
 const hookSchema = z.object({
@@ -66,7 +67,19 @@ async function main(): Promise<void> {
   }
   const token = readToken(config);
 
-  if (command === 'collect' || command === 'notify') {
+  if (command === 'collect' || command === 'notify' || command === 'flush') {
+    // known secretは本文を読む前にlocal envから検証し、不正時はfixed codeでfail-closedにする。
+    // parseに成功するとenvから削除され、SQLite・outbox・log・送信bodyへ生値を残さない。
+    let knownSecrets: string[];
+    try {
+      knownSecrets = parseKnownSecretsEnv(process.env);
+    } catch {
+      fail('invalid_known_secrets');
+    }
+    if (command === 'flush') {
+      await flushCollector({ config, token, knownSecrets });
+      return;
+    }
     let hookInput: unknown;
     try {
       hookInput = JSON.parse(readFileSync(0, 'utf8'));
@@ -78,14 +91,10 @@ async function main(): Promise<void> {
       fail('invalid_hook_input');
     }
     if (command === 'collect') {
-      await collectFromHook({ source: source as EventSource, hook: hook.data, config, token });
+      await collectFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     } else {
-      await notifyFromHook({ source: source as EventSource, hook: hook.data, config, token });
+      await notifyFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     }
-    return;
-  }
-  if (command === 'flush') {
-    await flushCollector({ config, token });
     return;
   }
 
