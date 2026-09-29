@@ -446,11 +446,11 @@ export function updateSessionNextSequence(
     .run(nextSequence, namespace, source, sessionId);
 }
 
-// setup APIで解決したprojectとpolicyのlast-known cache。rulesはtoken由来の鍵で暗号化した文字列として保持する。
+// setup APIで解決したprojectとpolicyのlast-known cache。policy全体はtoken由来の鍵で暗号化した文字列として保持する。
 export interface CachedProjectPolicy {
   projectId: string;
   version: number;
-  encryptedRules: string;
+  encryptedPolicy: string;
 }
 
 export function getCachedProjectPolicy(
@@ -464,7 +464,7 @@ export function getCachedProjectPolicy(
   if (row === undefined) {
     return undefined;
   }
-  return { projectId: String(row.project_id), version: Number(row.version), encryptedRules: String(row.rules) };
+  return { projectId: String(row.project_id), version: Number(row.version), encryptedPolicy: String(row.rules) };
 }
 
 export function upsertCachedProjectPolicy(
@@ -479,5 +479,5 @@ export function upsertCachedProjectPolicy(
        ON CONFLICT (namespace, repository)
        DO UPDATE SET project_id = excluded.project_id, version = excluded.version, rules = excluded.rules`,
     )
-    .run(namespace, repository, policy.projectId, policy.version, policy.encryptedRules);
+    .run(namespace, repository, policy.projectId, policy.version, policy.encryptedPolicy);
 }
