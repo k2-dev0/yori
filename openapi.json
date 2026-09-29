@@ -1202,7 +1202,8 @@
                   "not_found",
                   "conflict",
                   "payload_too_large",
-                  "internal_error"
+                  "internal_error",
+                  "suspected_secret"
                 ]
               }
             },
@@ -1289,56 +1290,42 @@
                 "minimum": 0,
                 "maximum": 9007199254740991
               },
-              "rules": {
+              "fields": {
                 "maxItems": 100,
                 "type": "array",
                 "items": {
-                  "oneOf": [
-                    {
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "literal"
-                        },
-                        "value": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 512
-                        }
-                      },
-                      "required": [
-                        "type",
-                        "value"
-                      ],
-                      "additionalProperties": false
-                    },
-                    {
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "assignment_key"
-                        },
-                        "value": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128
-                        }
-                      },
-                      "required": [
-                        "type",
-                        "value"
-                      ],
-                      "additionalProperties": false
-                    }
-                  ]
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
                 }
+              },
+              "terms": {
+                "maxItems": 100,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                }
+              },
+              "suspicion_mode": {
+                "type": "string",
+                "enum": [
+                  "observe",
+                  "block"
+                ]
+              },
+              "detector_version": {
+                "type": "string",
+                "const": "initial-v1"
               }
             },
             "required": [
               "version",
-              "rules"
+              "fields",
+              "terms",
+              "suspicion_mode",
+              "detector_version"
             ],
             "additionalProperties": false
           }
