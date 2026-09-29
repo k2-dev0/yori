@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { RedactionPolicy } from '../api/redaction.js';
+import type { CustomRedactionRule, RedactionPolicy } from '../api/redaction.js';
 import { validateCustomRedactionRules } from '../api/redaction.js';
 
 const SETUP_TIMEOUT_MS = 5_000;
@@ -10,7 +10,12 @@ const setupResponseSchema = z.strictObject({
   repository: z.string().min(1),
   redaction_policy: z.strictObject({
     version: z.int().min(0),
-    rules: z.array(z.string()),
+    rules: z.array(
+      z.discriminatedUnion('type', [
+        z.strictObject({ type: z.literal('literal'), value: z.string() }),
+        z.strictObject({ type: z.literal('assignment_key'), value: z.string() }),
+      ]),
+    ),
   }),
 });
 
@@ -52,13 +57,14 @@ export async function fetchCollectorSetup(input: {
   if (!parsed.success || parsed.data.repository !== input.repository) {
     return null;
   }
+  let rules: CustomRedactionRule[];
   try {
-    validateCustomRedactionRules(parsed.data.redaction_policy.rules);
+    rules = validateCustomRedactionRules(parsed.data.redaction_policy.rules);
   } catch {
     return null;
   }
   return {
     projectId: parsed.data.project_id,
-    policy: { version: parsed.data.redaction_policy.version, rules: parsed.data.redaction_policy.rules },
+    policy: { version: parsed.data.redaction_policy.version, rules },
   };
 }
