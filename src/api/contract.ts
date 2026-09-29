@@ -6,13 +6,22 @@ export const MIN_BATCH_SIZE = 1;
 export const MAX_BATCH_SIZE = 100;
 export const MAX_TEXT_LENGTH = 65_536;
 export const MAX_SOURCE_IDENTIFIER_BYTES = 1024;
-export const MAX_CUSTOM_REDACTION_RULES = 100;
-// custom literalは512 code points。UTF-8最大4 bytes/pointでも2048 bytes程度に収まり、
-// (company_id, literal)主キーのB-tree index rowの通常上限（約2704 bytes）内へ格納できる。
-export const MAX_CUSTOM_REDACTION_LITERAL_CODE_POINTS = 512;
-// assignment_keyはASCII identifier。先頭1文字＋残りでB-tree index rowの通常上限内に収まる。
-export const MAX_CUSTOM_REDACTION_ASSIGNMENT_KEY_CODE_POINTS = 128;
-export const CUSTOM_REDACTION_PLACEHOLDER = '[REDACTED:custom]';
+// business伏せ字はfields＋terms合算100件。termは512 code points、fieldは128 code points。
+export const MAX_BUSINESS_REDACTION_RULES = 100;
+export const MAX_BUSINESS_TERM_CODE_POINTS = 512;
+export const MAX_BUSINESS_FIELD_CODE_POINTS = 128;
+export const BUSINESS_FIELD_PLACEHOLDER = '[REDACTED:business_value]';
+export const BUSINESS_TERM_PLACEHOLDER = '[REDACTED:business_term]';
+// known secretはcollector processだけが受け取るlocal input。値そのものは保持先に応じて使い分ける。
+export const KNOWN_SECRET_PLACEHOLDER = '[REDACTED:known_secret]';
+export const KNOWN_SECRETS_ENV = 'YORI_KNOWN_SECRETS_JSON';
+export const MAX_KNOWN_SECRETS = 100;
+export const MIN_KNOWN_SECRET_CODE_POINTS = 8;
+export const MAX_KNOWN_SECRET_CODE_POINTS = 4096;
+// suspected-secret gateの固定code/detector版。候補値や周辺文字列はcodeへ含めない。
+export const SUSPECTED_SECRET_CODE = 'suspected_secret';
+export const SUSPECTED_SECRET_OBSERVED = 'suspected_secret_observed';
+export const SUSPECTED_SECRET_DETECTOR_VERSION = 'initial-v1';
 export const AUTO_SEARCH_POLICY_VERSION = 'initial-v1';
 
 // 同一社員のイベント保存と再利用確定を直列化するtransaction advisory lockの名前空間。
