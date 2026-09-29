@@ -1,21 +1,19 @@
 import { z } from 'zod';
-import type { CustomRedactionRule, RedactionPolicy } from '../api/redaction.js';
-import { validateCustomRedactionRules } from '../api/redaction.js';
+import type { RedactionPolicy } from '../api/redaction.js';
+import { validateRedactionPolicy } from '../api/redaction.js';
 
 const SETUP_TIMEOUT_MS = 5_000;
 
-// setup応答はstrictに検証し、token・raw HTTP error・rules適用前本文は呼出元のstateへ渡さない。
+// setup応答はstrictに検証し、token・raw HTTP error・policy適用前本文は呼出元のstateへ渡さない。
 const setupResponseSchema = z.strictObject({
   project_id: z.uuid(),
   repository: z.string().min(1),
   redaction_policy: z.strictObject({
     version: z.int().min(0),
-    rules: z.array(
-      z.discriminatedUnion('type', [
-        z.strictObject({ type: z.literal('literal'), value: z.string() }),
-        z.strictObject({ type: z.literal('assignment_key'), value: z.string() }),
-      ]),
-    ),
+    fields: z.array(z.string()),
+    terms: z.array(z.string()),
+    suspicion_mode: z.enum(['observe', 'block']),
+    detector_version: z.literal('initial-v1'),
   }),
 });
 
@@ -25,7 +23,7 @@ export interface CollectorSetup {
 }
 
 // canonical repositoryのmember projectとcurrent policyをsetup APIから取得する。
-// 通信失敗・非200・不正応答・repository不一致・不正ruleはすべてnullにし、失敗内容を保持しない。
+// 通信失敗・非200・不正応答・repository不一致・不正policyはすべてnullにし、失敗内容を保持しない。
 export async function fetchCollectorSetup(input: {
   api_url: string;
   token: string;
@@ -57,14 +55,14 @@ export async function fetchCollectorSetup(input: {
   if (!parsed.success || parsed.data.repository !== input.repository) {
     return null;
   }
-  let rules: CustomRedactionRule[];
+  let policy: RedactionPolicy;
   try {
-    rules = validateCustomRedactionRules(parsed.data.redaction_policy.rules);
+    policy = validateRedactionPolicy(parsed.data.redaction_policy);
   } catch {
     return null;
   }
   return {
     projectId: parsed.data.project_id,
-    policy: { version: parsed.data.redaction_policy.version, rules },
+    policy,
   };
 }
