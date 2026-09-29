@@ -4,7 +4,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
 import { CLASSIFY_MESSAGE_PRIORITY, ROUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import { loadCompanyRedactionPolicy } from './redaction-policy.js';
-import { redactConversationText, redactConversationTextWithPolicy } from './redaction.js';
+import { redactConversationText, sanitizeConversationText } from './redaction.js';
 import type { EventsRequest, ParsedEvent } from './schema.js';
 
 export interface AuthContext {
@@ -15,6 +15,13 @@ export interface AuthContext {
 export class EventConflictError extends Error {
   constructor() {
     super('受信イベントが保存済みの内容・identityと衝突しました');
+  }
+}
+
+// suspicion_mode=blockで候補を検出した受信。batch全体をrollbackし、固定codeだけをHTTP境界へ返す。
+export class SuspectedSecretError extends Error {
+  constructor() {
+    super('suspected secretを含む受信本文は保存しません');
   }
 }
 
@@ -64,10 +71,14 @@ export async function ingestEvents(pool: Pool, auth: AuthContext, request: Event
       // receiptの衝突判定はcustom policy変更から独立させる。built-inだけを適用した決定的な本文でhashし、
       // same idempotency_key＋同じ受信bodyはpolicy追加後も同じreceiptとして成功させる。
       const receiptText = redactConversationText(event.text);
-      // 保存本文はcurrent policyのcustom置換まで適用する。custom assignment_keyをbuilt-inより先に
-      // 適用してcustom placeholderを維持するため、built-in適用前の受信本文へpolicyを適用する。
-      // 異なる受信bodyが同じplaceholderになってもreceiptTextが異なるため、衝突判定はconflictを維持する。
-      const storedEvent = { ...event, text: redactConversationTextWithPolicy(event.text, policy) };
+      // 保存本文はcurrent policyのbuilt-in＋fields/terms＋suspicion gateまで適用する。
+      // blockは本文を保存せずbatch全体をrollbackし、異なる受信bodyが同じplaceholderになっても
+      // receiptTextが異なるため衝突判定はconflictを維持する。
+      const sanitized = sanitizeConversationText(event.text, policy);
+      if (sanitized.action === 'block') {
+        throw new SuspectedSecretError();
+      }
+      const storedEvent = { ...event, text: sanitized.text };
       results.push(await applyEvent(client, auth, request.project_id, storedEvent, receiptText));
     }
     await client.query('COMMIT');
