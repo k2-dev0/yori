@@ -2,14 +2,13 @@ import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { z } from 'zod';
-import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, type EventSource } from '../api/contract.js';
-import type { RedactionPolicy } from '../api/redaction.js';
-import { redactConversationText, redactConversationTextWithPolicy } from '../api/redaction.js';
+import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, SUSPECTED_SECRET_OBSERVED, type EventSource } from '../api/contract.js';
+import { emptyRedactionPolicy, redactConversationText, sanitizeConversationText, type RedactionPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
 import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from './adapters/codex.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending, resolvedTargetKey } from './send.js';
-import { decryptCachedRules, encryptCachedRules } from './policy-cache.js';
+import { decryptCachedPolicy, encryptCachedPolicy } from './policy-cache.js';
 import { fetchCollectorSetup } from './setup.js';
 import type { CollectorConfig } from './config.js';
 import type { TranscriptMessageRecord, TranscriptRecord } from './transcript.js';
@@ -53,11 +52,14 @@ export interface CollectFromHookInput {
   hook: CollectorHookInput;
   config: CollectorConfig;
   token: string;
+  // CLIがlocalのYORI_KNOWN_SECRETS_JSONからparseした値。process.envへは残さない。
+  knownSecrets?: readonly string[];
 }
 
 export interface FlushCollectorInput {
   config: CollectorConfig;
   token: string;
+  knownSecrets?: readonly string[];
 }
 
 // このcollect呼出しのSQLite commitで新規追加またはrevision更新として確定したuser発言identity。
@@ -242,6 +244,7 @@ interface IngestContext {
   repository: string;
   projectId: string;
   policy: RedactionPolicy;
+  knownSecrets: readonly string[];
   version: string | null;
   nextSequence: number;
   sessionExists: boolean;
@@ -254,8 +257,17 @@ interface IngestContext {
 
 // 1件の発言を検証し、同一message IDは本文一致を無視・本文変更をrevision+1としてoutboxへ積む。
 function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byteOffset: number): void {
-  // 保存・送信の前に秘匿値を置換する。hashとrevision判定も置換後の本文で行い、再読込で増殖させない。
-  const text = redactConversationTextWithPolicy(record.text, ctx.policy);
+  // transcript messageのparse直後、hash/revision/SQLite/outboxより前にsanitizeする。
+  // blockはmessage/outboxを保存せず固定codeとoffsetだけを残し、cursorはそのまま進める。
+  const sanitized = sanitizeConversationText(record.text, ctx.policy, ctx.knownSecrets);
+  if (sanitized.action === 'block') {
+    recordDiagnostic(ctx.state, ctx.namespace, 'message_blocked_suspected_secret', byteOffset);
+    return;
+  }
+  const text = sanitized.text;
+  if (sanitized.findings.includes(SUSPECTED_SECRET_OBSERVED)) {
+    recordDiagnostic(ctx.state, ctx.namespace, 'message_suspected_secret', byteOffset);
+  }
   if (!isStorableText(text)) {
     recordDiagnostic(ctx.state, ctx.namespace, 'message_invalid_text', byteOffset);
     return;
@@ -399,8 +411,9 @@ export function ingestTranscript(
     hook: CollectorHookInput;
     repository: string;
     projectId: string;
-    // 未指定はcustom rule無し。公開ingestTranscriptの既存callerと後方互換にする。
+    // 未指定はbusiness rule無し。公開ingestTranscriptの既存callerと後方互換にする。
     policy?: RedactionPolicy;
+    knownSecrets?: readonly string[];
   },
 ): IngestResult {
   if (!isStorableIdentifier(input.hook.session_id)) {
@@ -458,7 +471,8 @@ export function ingestTranscript(
         hook: input.hook,
         repository: input.repository,
         projectId: input.projectId,
-        policy: input.policy ?? { version: 0, rules: [] },
+        policy: input.policy ?? emptyRedactionPolicy(),
+        knownSecrets: input.knownSecrets ?? [],
         version: session?.transcript_version ?? null,
         nextSequence: session?.next_sequence ?? 1,
         sessionExists: session !== undefined,
@@ -551,8 +565,8 @@ function cachedPolicyOf(
   if (cached === undefined) {
     return undefined;
   }
-  const rules = decryptCachedRules(input.token, input.config.api_url, cached.encryptedRules);
-  return rules === undefined ? undefined : { projectId: cached.projectId, policy: { version: cached.version, rules } };
+  const policy = decryptCachedPolicy(input.token, input.config.api_url, cached.encryptedPolicy);
+  return policy === undefined ? undefined : { projectId: cached.projectId, policy };
 }
 
 // setup APIからcurrent policyを毎collect/flush取得し、成功時はcacheを更新して返す。
@@ -570,7 +584,7 @@ async function resolveServerPolicy(
     upsertCachedProjectPolicy(state, namespace, repository, {
       projectId: setup.projectId,
       version: setup.policy.version,
-      encryptedRules: encryptCachedRules(input.token, input.config.api_url, setup.policy.rules),
+      encryptedPolicy: encryptCachedPolicy(input.token, input.config.api_url, setup.policy),
     });
     return { projectId: setup.projectId, policy: setup.policy };
   }
@@ -606,7 +620,7 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
       // 旧設定（projects対応表）はproject解決を正本とし、client側からsetup APIを呼ばない。
       // 過去にsetupで解決したcacheがある場合だけcustom policyを併用し、無ければbuilt-in置換だけで送信する。
       projectId = configured.project_id;
-      policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? { version: 0, rules: [] };
+      policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? emptyRedactionPolicy();
     } else if (input.config.projects.length > 0) {
       // 旧設定は対応表を正本にし、未登録repositoryは従来どおり本文を読まず保留する。
       recordSourceReference(state, namespace, input.source, input.hook);
@@ -631,6 +645,7 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
       repository,
       projectId,
       policy,
+      knownSecrets: input.knownSecrets ?? [],
     });
     if (result.held) {
       return { confirmedUserInputs: [] };
@@ -683,7 +698,7 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
       if (configured !== undefined) {
         // 旧設定（projects対応表）はproject解決を正本とし、client側からsetup APIを呼ばない。
         projectId = configured.project_id;
-        policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? { version: 0, rules: [] };
+        policy = cachedPolicyOf(input, state, namespace, repository)?.policy ?? emptyRedactionPolicy();
       } else if (input.config.projects.length > 0) {
         // 旧設定は対応表を正本にし、未登録repositoryの保留sourceは再解決しない。
         const session = getSession(state, namespace, source, sessionId);
@@ -713,6 +728,7 @@ export async function flushCollector(input: FlushCollectorInput): Promise<void> 
         repository,
         projectId,
         policy,
+        knownSecrets: input.knownSecrets ?? [],
       });
       if (result.held && result.projectId !== undefined) {
         blockedProjects.add(result.projectId);
