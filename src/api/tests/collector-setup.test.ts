@@ -49,10 +49,18 @@ function errorCode(response: { json<T>(): T }): string | undefined {
   return response.json<{ error?: { code?: string } }>().error?.code;
 }
 
-async function savePolicy(companyId: string, version: number, rules: string[]): Promise<void> {
+interface StructuredRule {
+  type: 'literal' | 'assignment_key';
+  value: string;
+}
+
+async function savePolicy(companyId: string, version: number, rules: StructuredRule[]): Promise<void> {
   await pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, $2)', [companyId, version]);
   for (const rule of rules) {
-    await pool.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, rule]);
+    await pool.query(
+      'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)',
+      [companyId, rule.type, rule.value, rule.type === 'literal' ? rule.value : rule.value.toLowerCase()],
+    );
   }
 }
 
@@ -76,18 +84,39 @@ describe('POST /v1/collector/setup', () => {
     assert.ok(!response.body.includes(workspace.token), 'setup応答へtokenが露出している');
   });
 
-  it('追加repository aliasを解決し、current policyのversionとrulesを返す', async () => {
+  it('追加repository aliasを解決し、current policyのversionとstructured rulesを返す', async () => {
     await addAlias(workspace.projectId, workspace.companyId, 'github.com/Org/Alias');
-    await savePolicy(workspace.companyId, 3, ['Beta', 'AcmeSecret']);
+    await savePolicy(workspace.companyId, 3, [
+      { type: 'literal', value: 'AcmeSecret' },
+      { type: 'assignment_key', value: 'pass' },
+    ]);
 
     const response = await postSetup(app, { token: workspace.token, body: { repository: 'github.com/Org/Alias' } });
 
     assert.equal(response.statusCode, 200, `alias解決に失敗: ${response.statusCode} ${response.body}`);
-    const body = response.json<{ project_id: string; repository: string; redaction_policy: { version: number; rules: string[] } }>();
+    const body = response.json<{
+      project_id: string;
+      repository: string;
+      redaction_policy: { version: number; rules: Array<{ type: string; value: string }> };
+    }>();
     assert.equal(body.project_id, workspace.projectId);
     assert.equal(body.repository, 'github.com/Org/Alias');
     assert.equal(body.redaction_policy.version, 3);
-    assert.deepEqual([...body.redaction_policy.rules].sort(), ['AcmeSecret', 'Beta']);
+    const rules = [...body.redaction_policy.rules].sort((left, right) =>
+      `${left.type}:${left.value}`.localeCompare(`${right.type}:${right.value}`),
+    );
+    assert.deepEqual(
+      rules,
+      [
+        { type: 'assignment_key', value: 'pass' },
+        { type: 'literal', value: 'AcmeSecret' },
+      ],
+      'setup応答のrulesがtype/valueのobject unionで返っていない',
+    );
+    for (const rule of rules) {
+      assert.equal(typeof rule, 'object', `ruleがstringのまま返っている: ${JSON.stringify(rule)}`);
+      assert.ok(typeof rule.type === 'string' && typeof rule.value === 'string', 'ruleのtype/valueが欠落している');
+    }
   });
 
   it('別会社・非member・未登録repositoryは存在を開示せず404にする', async () => {
