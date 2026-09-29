@@ -229,7 +229,8 @@ describe('収集時の秘匿値置換', () => {
       assert.deepEqual(diagnosticsOf(fixture.stateDir, collectorNamespace(config.api_url, 'token-a')), [
         { code: 'message_blocked_suspected_secret', byteOffset: lineByteOffset(lines, 1) },
       ]);
-      assert.deepEqual(stateCounts(fixture.stateDir, collectorNamespace(config.api_url, 'token-a')), { messages: 1, outbox: 1 });
+      // 後続messageはack済みのためoutboxは0。blockしたmessageはmessage/outboxのどちらにも入らない。
+      assert.deepEqual(stateCounts(fixture.stateDir, collectorNamespace(config.api_url, 'token-a')), { messages: 1, outbox: 0 });
       await assertStateDoesNotContain(fixture.stateDir, SUSPECTED);
 
       // cursorはblock済み行を越えているため、再collectで再処理・再送しない。
