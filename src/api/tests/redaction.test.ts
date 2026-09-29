@@ -127,6 +127,32 @@ describe('会話本文の秘匿値置換', () => {
     assert.equal(redactConversationText(expected), expected, 'PASS置換済み本文の再適用で結果が変わっている');
   });
 
+  it('全大文字連結prefixのsecret名も従来どおり検出し、compass/bypass/DB_PASSには反応しない', () => {
+    const text = [
+      'MYTOKEN=abc123',
+      'MYSECRET: abc123',
+      'SOMEKEY = abc123',
+      'MYPASSWORD：abc123',
+      'MYAPIKEY: abc123',
+      'compass: hogehoge',
+      'bypass = hogehoge',
+      'DB_PASS: hogehoge',
+    ].join('\n');
+    const expected = [
+      'MYTOKEN=[REDACTED:env_value]',
+      'MYSECRET: [REDACTED:env_value]',
+      'SOMEKEY = [REDACTED:env_value]',
+      'MYPASSWORD：[REDACTED:env_value]',
+      'MYAPIKEY: [REDACTED:env_value]',
+      'compass: hogehoge',
+      'bypass = hogehoge',
+      'DB_PASS: hogehoge',
+    ].join('\n');
+
+    assert.equal(redactConversationText(text), expected, '全大文字連結prefixのsecret名が検出されていない');
+    assert.equal(redactConversationText(expected), expected, '再適用で結果が変わっている');
+  });
+
   it('既存のsecret名patternは全角colonでも値だけを伏せ、camelCase/underscore挙動を維持する', () => {
     const names = [
       'PASSWORD',
