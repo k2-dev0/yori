@@ -83,6 +83,69 @@ describe('会話本文の秘匿値置換', () => {
     assert.equal(redactConversationText(once), once, '再適用で結果が変わっている');
   });
 
+  it('exact PASSの代入値・全角colonの代入値をenv_valueへ置換し、compass/bypass/DB_PASSは変更しない', () => {
+    const text = [
+      'pass: hogehoge',
+      'PASS: hogehoge',
+      'pass=hogehoge',
+      'pass = hogehoge',
+      'Pass：hogehoge',
+      'PASS："hogehoge"',
+      "pass: 'hogehoge'",
+      'compass: hogehoge',
+      'compass：hogehoge',
+      'bypass = hogehoge',
+      'DB_PASS: hogehoge',
+      'PASS は環境変数から読む',
+      'pass:',
+      'pass:   ',
+      'pass == hogehoge',
+      'pass => hogehoge',
+      'pass::hogehoge',
+    ].join('\n');
+    const expected = [
+      'pass: [REDACTED:env_value]',
+      'PASS: [REDACTED:env_value]',
+      'pass=[REDACTED:env_value]',
+      'pass = [REDACTED:env_value]',
+      'Pass：[REDACTED:env_value]',
+      'PASS：[REDACTED:env_value]',
+      "pass: [REDACTED:env_value]",
+      'compass: hogehoge',
+      'compass：hogehoge',
+      'bypass = hogehoge',
+      'DB_PASS: hogehoge',
+      'PASS は環境変数から読む',
+      'pass:',
+      'pass:   ',
+      'pass == hogehoge',
+      'pass => hogehoge',
+      'pass::hogehoge',
+    ].join('\n');
+
+    assert.equal(redactConversationText(text), expected);
+    assert.equal(redactConversationText(expected), expected, 'PASS置換済み本文の再適用で結果が変わっている');
+  });
+
+  it('既存のsecret名patternは全角colonでも値だけを伏せ、camelCase/underscore挙動を維持する', () => {
+    const names = [
+      'PASSWORD',
+      'POSTGRES_PASSWORD',
+      'PASSWD',
+      'SECRET',
+      'TOKEN',
+      'JEV_API_KEY',
+      'secretKey',
+      'APIKEY',
+      'CREDENTIAL',
+    ];
+    const text = names.map((name) => `${name}：hunter2`).join('\n');
+    const expected = names.map((name) => `${name}：[REDACTED:env_value]`).join('\n');
+
+    assert.equal(redactConversationText(text), expected, '既存patternが全角colonへ追随していない');
+    assert.equal(redactConversationText(expected), expected, '全角colon置換済み本文の再適用で結果が変わっている');
+  });
+
   it('NUL・単独サロゲート・絵文字・上限超過の本文でも例外を投げず、同じ入力へ同じ結果を返す', () => {
     const samples = ['', '\u0000', '\uD800\uDC00と\uD800', '😀'.repeat(10), 'a'.repeat(70_000), `PASSWORD=${'あ'.repeat(100)}`];
 
