@@ -10,7 +10,7 @@ import { runMigrations } from '../migrator.js';
 import { insertCompany, resetDatabase, seedWorkspace, type WorkspaceFixture } from './fixtures.js';
 
 // 会社単位の伏せ字policy（version付き）とproject repository aliasのDB契約。
-// 管理者は別repositoryのyori-cliからDBへliteralを更新するため、重複・空・placeholder・長さはDB制約でも拒否する。
+// 管理者は別repositoryのyori-cliからDBへruleを更新するため、rule_type/valueの形式・重複・空・placeholder・長さはDB制約でも拒否する。
 
 const pool = createPool(requireDatabaseUrl());
 let workspace: WorkspaceFixture;
@@ -29,6 +29,22 @@ const PREVIOUS_MIGRATIONS = [
 ] as const;
 
 const MAX_CUSTOM_LITERAL_CODE_POINTS = 512;
+const MAX_ASSIGNMENT_KEY_CODE_POINTS = 128;
+const MAX_CUSTOM_RULES = 100;
+
+interface StructuredRule {
+  rule_type: 'literal' | 'assignment_key';
+  value: string;
+  normalized_value: string;
+}
+
+function literalRule(value: string): StructuredRule {
+  return { rule_type: 'literal', value, normalized_value: value };
+}
+
+function assignmentRule(value: string): StructuredRule {
+  return { rule_type: 'assignment_key', value, normalized_value: value.toLowerCase() };
+}
 
 before(async () => {
   await runMigrations(pool);
@@ -62,15 +78,26 @@ async function readMigrationFile(file: string): Promise<string> {
   }
 }
 
-async function insertPolicy(companyId: string, version: number, rules: string[] = []): Promise<void> {
+async function insertPolicy(companyId: string, version: number, rules: StructuredRule[] = []): Promise<void> {
   await pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, $2)', [companyId, version]);
   for (const rule of rules) {
-    await pool.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, rule]);
+    await insertRule(companyId, rule);
   }
 }
 
-function insertRule(companyId: string, literal: string): Promise<unknown> {
-  return pool.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, literal]);
+function insertRule(companyId: string, rule: StructuredRule): Promise<unknown> {
+  return pool.query(
+    'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)',
+    [companyId, rule.rule_type, rule.value, rule.normalized_value],
+  );
+}
+
+async function ruleCount(companyId: string): Promise<number> {
+  const result = await pool.query<{ count: string }>(
+    'SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1',
+    [companyId],
+  );
+  return Number(result.rows[0]?.count);
 }
 
 function insertAlias(projectId: string, companyId: string, repository: string): Promise<unknown> {
@@ -82,55 +109,116 @@ function insertAlias(projectId: string, companyId: string, repository: string): 
 }
 
 describe('custom伏せ字policyのschema契約', () => {
-  it('会社単位のversionとrulesを保存し、未登録会社は行を持たない', async () => {
-    await insertPolicy(workspace.companyId, 2, ['AcmeSecret', 'hunter2']);
+  it('rule_type/value/normalized_valueの構造でliteralとassignment_keyを保存し、未登録会社は行を持たない', async () => {
+    const columns = await pool.query<{ column_name: string }>(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'company_redaction_rules'
+        ORDER BY column_name`,
+    );
+    assert.deepEqual(
+      columns.rows.map((row) => row.column_name).sort(),
+      ['company_id', 'normalized_value', 'rule_type', 'value'],
+      'company_redaction_rulesがrule_type/value/normalized_value構造になっていない',
+    );
+
+    await insertPolicy(workspace.companyId, 2, [literalRule('AcmeSecret'), assignmentRule('Pass')]);
 
     const policy = await pool.query<{ version: number }>('SELECT version FROM company_redaction_policies WHERE company_id = $1', [
       workspace.companyId,
     ]);
     assert.equal(policy.rows[0]?.version, 2);
 
-    const rules = await pool.query<{ literal: string }>(
-      'SELECT literal FROM company_redaction_rules WHERE company_id = $1 ORDER BY literal',
+    const rules = await pool.query<{ rule_type: string; value: string; normalized_value: string }>(
+      'SELECT rule_type, value, normalized_value FROM company_redaction_rules WHERE company_id = $1 ORDER BY rule_type, value',
       [workspace.companyId],
     );
-    assert.deepEqual(rules.rows.map((row) => row.literal), ['AcmeSecret', 'hunter2']);
+    assert.deepEqual(
+      rules.rows,
+      [
+        { rule_type: 'assignment_key', value: 'Pass', normalized_value: 'pass' },
+        { rule_type: 'literal', value: 'AcmeSecret', normalized_value: 'AcmeSecret' },
+      ],
+      'structured ruleの保存・読出しができない',
+    );
 
     const otherCompanyId = await insertCompany(pool, 'company-policy-empty');
-    const otherPolicy = await pool.query('SELECT version FROM company_redaction_policies WHERE company_id = $1', [otherCompanyId]);
-    assert.equal(otherPolicy.rows.length, 0, '未登録会社へversion行を作っている（未登録はversion 0・rules空として扱う）');
+    const otherRules = await pool.query('SELECT 1 FROM company_redaction_rules WHERE company_id = $1', [otherCompanyId]);
+    assert.equal(otherRules.rows.length, 0, '未登録会社へrule行を作っている（未登録はversion 0・rules空として扱う）');
   });
 
-  it('空・placeholder・上限超過literal、重複、version 0、親のないruleを拒否する', async () => {
-    await insertPolicy(workspace.companyId, 1, ['AcmeSecret']);
+  it('不正rule_type・空value・placeholder literal・上限超過・大小文字別の重複を拒否する', async () => {
+    await insertPolicy(workspace.companyId, 1, [literalRule('AcmeSecret')]);
 
-    await expectDbError(insertRule(workspace.companyId, ''), '23514', '空literal');
-    await expectDbError(insertRule(workspace.companyId, '[REDACTED:custom]'), '23514', 'placeholder literal');
-    for (const fragment of ['REDACTED', 'custom', '[REDACTED', 'ED:custom]', 'env_value', 'authorization']) {
-      await expectDbError(insertRule(workspace.companyId, fragment), '23514', `placeholder部分文字列 ${fragment}`);
-    }
-    await insertRule(workspace.companyId, 'ProjectCodename');
-    const accepted = await pool.query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1 AND literal = 'ProjectCodename'",
-      [workspace.companyId],
-    );
-    assert.equal(accepted.rows[0]?.count, '1', '部分文字列でないliteralを拒否している');
-
-    // 512 code pointsの最大literalは主キーのB-tree index row上限内で保存・読出しでき、513は拒否する。
-    const maxLiteral = 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS);
-    await insertRule(workspace.companyId, maxLiteral);
-    const storedMax = await pool.query<{ literal: string }>(
-      'SELECT literal FROM company_redaction_rules WHERE company_id = $1 AND literal = $2',
-      [workspace.companyId, maxLiteral],
-    );
-    assert.equal(storedMax.rows[0]?.literal, maxLiteral, '512 code pointsのliteralを保存・読出しできない');
-    await expectDbError(insertRule(workspace.companyId, maxLiteral), '23505', '境界literalの重複');
     await expectDbError(
-      insertRule(workspace.companyId, 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS + 1)),
+      pool.query(
+        "INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, 'regex', 'x', 'x')",
+        [workspace.companyId],
+      ),
+      '23514',
+      '不正rule_type',
+    );
+    await expectDbError(insertRule(workspace.companyId, literalRule('')), '23514', '空literal value');
+    await expectDbError(insertRule(workspace.companyId, assignmentRule('')), '23514', '空assignment_key value');
+    await expectDbError(insertRule(workspace.companyId, literalRule('[REDACTED:custom]')), '23514', 'placeholder literal');
+    for (const fragment of ['REDACTED', 'custom', '[REDACTED', 'ED:custom]', 'env_value', 'authorization']) {
+      await expectDbError(insertRule(workspace.companyId, literalRule(fragment)), '23514', `placeholder部分文字列 ${fragment}`);
+    }
+    await expectDbError(
+      insertRule(workspace.companyId, assignmentRule('a'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS + 1))),
+      '23514',
+      '上限超過assignment_key',
+    );
+
+    // 512/128 code pointsの境界値は保存・読出しでき、超過は拒否する。
+    const maxLiteral = 'x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS);
+    await insertRule(workspace.companyId, literalRule(maxLiteral));
+    const storedMaxLiteral = await pool.query<{ value: string }>(
+      'SELECT value FROM company_redaction_rules WHERE company_id = $1 AND rule_type = $2 AND value = $3',
+      [workspace.companyId, 'literal', maxLiteral],
+    );
+    assert.equal(storedMaxLiteral.rows[0]?.value, maxLiteral, '512 code pointsのliteralを保存・読出しできない');
+    await expectDbError(insertRule(workspace.companyId, literalRule(maxLiteral)), '23505', '境界literalの重複');
+    await expectDbError(
+      insertRule(workspace.companyId, literalRule('x'.repeat(MAX_CUSTOM_LITERAL_CODE_POINTS + 1))),
       '23514',
       '上限超過literal',
     );
-    await expectDbError(insertRule(workspace.companyId, 'AcmeSecret'), '23505', '重複literal');
+
+    const maxKey = 'a'.repeat(MAX_ASSIGNMENT_KEY_CODE_POINTS);
+    await insertRule(workspace.companyId, assignmentRule(maxKey));
+    const storedMaxKey = await pool.query<{ value: string; normalized_value: string }>(
+      'SELECT value, normalized_value FROM company_redaction_rules WHERE company_id = $1 AND rule_type = $2 AND value = $3',
+      [workspace.companyId, 'assignment_key', maxKey],
+    );
+    assert.deepEqual(
+      storedMaxKey.rows[0],
+      { value: maxKey, normalized_value: maxKey },
+      '128 code pointsのassignment_keyを保存・読出しできない',
+    );
+
+    await expectDbError(insertRule(workspace.companyId, literalRule('AcmeSecret')), '23505', '同一literal重複');
+    // literalはcase-sensitive、assignment_keyはcase-insensitiveに重複を判定する。
+    await insertRule(workspace.companyId, literalRule('Pass'));
+    await insertRule(workspace.companyId, literalRule('pass'));
+    const caseLiterals = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1 AND rule_type = 'literal' AND value IN ('Pass', 'pass')",
+      [workspace.companyId],
+    );
+    assert.equal(caseLiterals.rows[0]?.count, '2', 'literal重複をcase-insensitiveに扱っている');
+    await insertRule(workspace.companyId, assignmentRule('PassKey'));
+    await expectDbError(insertRule(workspace.companyId, assignmentRule('passkey')), '23505', 'assignment_keyの大小文字違い重複');
+    await expectDbError(insertRule(workspace.companyId, assignmentRule('PassKey')), '23505', 'assignment_keyの同一value重複');
+
+    // typeが異なれば同名valueを受理する。
+    await insertRule(workspace.companyId, literalRule('cross_type'));
+    await insertRule(workspace.companyId, assignmentRule('cross_type'));
+    const crossType = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1 AND value = 'cross_type'",
+      [workspace.companyId],
+    );
+    assert.equal(crossType.rows[0]?.count, '2', 'typeが異なる同名valueを拒否している');
+
     await expectDbError(
       pool.query('INSERT INTO company_redaction_policies (company_id, version) VALUES ($1, 2)', [workspace.companyId]),
       '23505',
@@ -144,7 +232,7 @@ describe('custom伏せ字policyのschema契約', () => {
     );
 
     const orphanCompanyId = await insertCompany(pool, 'company-policy-orphan');
-    await expectDbError(insertRule(orphanCompanyId, 'AcmeSecret'), '23503', 'policy行のない会社のrule');
+    await expectDbError(insertRule(orphanCompanyId, literalRule('AcmeSecret')), '23503', 'policy行のない会社のrule');
 
     await pool.query('UPDATE company_redaction_policies SET version = 3 WHERE company_id = $1', [workspace.companyId]);
     const updated = await pool.query<{ version: number }>('SELECT version FROM company_redaction_policies WHERE company_id = $1', [
@@ -153,50 +241,84 @@ describe('custom伏せ字policyのschema契約', () => {
     assert.equal(updated.rows[0]?.version, 3);
   });
 
-  it('規則件数をDBで100件に制限し、並行atomic replaceでも101件目を拒否する', async () => {
+  it('literal/assignment_key合算100件limitとatomic replace・会社境界・並行insertを保証する', async () => {
     const companyId = await insertCompany(pool, 'company-rule-limit');
-    await insertPolicy(
-      companyId,
-      1,
-      Array.from({ length: 99 }, (_, index) => `rule-${String(index).padStart(3, '0')}`),
-    );
-    assert.equal(await ruleCount(companyId), 99);
+    await insertPolicy(companyId, 1, [
+      ...Array.from({ length: 99 }, (_, index) => literalRule(`rule-${String(index).padStart(3, '0')}`)),
+      assignmentRule('pass'),
+    ]);
+    assert.equal(await ruleCount(companyId), MAX_CUSTOM_RULES);
 
-    await insertRule(companyId, 'rule-100');
-    assert.equal(await ruleCount(companyId), 100);
-    await expectDbError(insertRule(companyId, 'rule-101'), '23514', '101件目のrule');
-    assert.equal(await ruleCount(companyId), 100, '拒否後も100件を維持していない');
+    await expectDbError(insertRule(companyId, literalRule('rule-101')), '23514', 'literalの101件目');
+    await expectDbError(insertRule(companyId, assignmentRule('extra_key')), '23514', 'assignment_keyの101件目');
+    assert.equal(await ruleCount(companyId), MAX_CUSTOM_RULES, '拒否後も100件を維持していない');
 
-    // yori-cliのatomic replace（新versionのruleを一括insert）でも、超過分はtransactionごとrollbackする。
+    // atomic replaceは同一transaction内のDELETE→INSERTで行い、旧100件を新100件へ置換する。
     const replaceClient = await pool.connect();
     try {
       await replaceClient.query('BEGIN');
-      await expectDbError(
-        replaceClient.query('INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)', [companyId, 'rule-102']),
-        '23514',
-        'transaction内101件目',
+      await replaceClient.query('DELETE FROM company_redaction_rules WHERE company_id = $1', [companyId]);
+      for (let index = 0; index < 99; index += 1) {
+        const value = `replaced-${String(index).padStart(3, '0')}`;
+        await replaceClient.query(
+          'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)',
+          [companyId, 'literal', value, value],
+        );
+      }
+      await replaceClient.query(
+        'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)',
+        [companyId, 'assignment_key', 'replaced_pass', 'replaced_pass'],
       );
-      await replaceClient.query('ROLLBACK');
+      await replaceClient.query('COMMIT');
     } finally {
       replaceClient.release();
     }
-    assert.equal(await ruleCount(companyId), 100, 'rollbackで件数が変わっている');
+    assert.equal(await ruleCount(companyId), MAX_CUSTOM_RULES, 'atomic replace後の件数が100でない');
+    const oldRemaining = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1 AND value = 'rule-000'",
+      [companyId],
+    );
+    assert.equal(oldRemaining.rows[0]?.count, '0', 'replaceで旧ruleが残っている');
 
-    // 並行transactionではpolicy行lockにより100件目が片方だけ成功する。
+    // 失敗したreplaceはrollbackし、replace前のruleを維持する。
+    const rollbackClient = await pool.connect();
+    try {
+      await rollbackClient.query('BEGIN');
+      await rollbackClient.query('DELETE FROM company_redaction_rules WHERE company_id = $1', [companyId]);
+      await rollbackClient.query(
+        'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)',
+        [companyId, 'literal', 'rollback-rule', 'rollback-rule'],
+      );
+      await rollbackClient.query('ROLLBACK');
+    } finally {
+      rollbackClient.release();
+    }
+    assert.equal(await ruleCount(companyId), MAX_CUSTOM_RULES, 'rollbackでreplace前のruleが消えている');
+
+    // 別会社の100件は自社のlimitへ影響しない。
+    const otherCompanyId = await insertCompany(pool, 'company-rule-other');
+    await insertPolicy(
+      otherCompanyId,
+      1,
+      Array.from({ length: MAX_CUSTOM_RULES }, (_, index) => literalRule(`other-${String(index).padStart(3, '0')}`)),
+    );
+    assert.equal(await ruleCount(otherCompanyId), MAX_CUSTOM_RULES);
+
+    // 並行insertでは99件から2件同時追加の片方だけが成功する。
     const raceCompanyId = await insertCompany(pool, 'company-rule-race');
     await insertPolicy(
       raceCompanyId,
       1,
-      Array.from({ length: 99 }, (_, index) => `race-${String(index).padStart(3, '0')}`),
+      Array.from({ length: 99 }, (_, index) => literalRule(`race-${String(index).padStart(3, '0')}`)),
     );
-    const insertSql = 'INSERT INTO company_redaction_rules (company_id, literal) VALUES ($1, $2)';
+    const insertSql = 'INSERT INTO company_redaction_rules (company_id, rule_type, value, normalized_value) VALUES ($1, $2, $3, $4)';
     const clientA = await pool.connect();
     const clientB = await pool.connect();
     try {
       await clientA.query('BEGIN');
-      await clientA.query(insertSql, [raceCompanyId, 'race-a']);
+      await clientA.query(insertSql, [raceCompanyId, 'literal', 'race-a', 'race-a']);
       await clientB.query('BEGIN');
-      const second = clientB.query(insertSql, [raceCompanyId, 'race-b']);
+      const second = clientB.query(insertSql, [raceCompanyId, 'assignment_key', 'race_b', 'race_b']);
       await clientA.query('COMMIT');
       const outcome = await second.then(
         () => 'fulfilled' as const,
@@ -208,19 +330,24 @@ describe('custom伏せ字policyのschema契約', () => {
       clientA.release();
       clientB.release();
     }
-    assert.equal(await ruleCount(raceCompanyId), 100, '並行insertで上限を越えている');
+    assert.equal(await ruleCount(raceCompanyId), MAX_CUSTOM_RULES, '並行insertで上限を越えている');
 
-    // 同会社内のliteral変更は件数を増やさないため許可する。
-    await pool.query("UPDATE company_redaction_rules SET literal = 'rule-100-renamed' WHERE company_id = $1 AND literal = 'rule-100'", [
-      companyId,
-    ]);
-    assert.equal(await ruleCount(companyId), 100, '同会社内UPDATEで件数が変わっている');
+    // 同会社内のvalue更新は件数を増やさないため許可する。
+    await pool.query(
+      "UPDATE company_redaction_rules SET value = 'replaced-renamed', normalized_value = 'replaced-renamed' WHERE company_id = $1 AND rule_type = 'literal' AND value = 'replaced-000'",
+      [companyId],
+    );
+    assert.equal(await ruleCount(companyId), MAX_CUSTOM_RULES, '同会社内UPDATEで件数が変わっている');
 
-    // 別会社のruleをcompany_id UPDATEで満杯の会社へ移すと拒否する。
+    // 満杯会社への会社移動は拒否し、空きのある会社へは移動できる。
     const fullCompanyId = await insertCompany(pool, 'company-rule-full');
-    await insertPolicy(fullCompanyId, 1, Array.from({ length: 100 }, (_, index) => `full-${String(index).padStart(3, '0')}`));
+    await insertPolicy(
+      fullCompanyId,
+      1,
+      Array.from({ length: MAX_CUSTOM_RULES }, (_, index) => literalRule(`full-${String(index).padStart(3, '0')}`)),
+    );
     const sourceCompanyId = await insertCompany(pool, 'company-rule-source');
-    await insertPolicy(sourceCompanyId, 1, ['move-me']);
+    await insertPolicy(sourceCompanyId, 1, [literalRule('move-me')]);
     await expectDbError(
       pool.query('UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2', [fullCompanyId, sourceCompanyId]),
       '23514',
@@ -228,20 +355,23 @@ describe('custom伏せ字policyのschema契約', () => {
     );
     assert.equal(await ruleCount(sourceCompanyId), 1, '拒否後に移動元ruleが消えている');
 
-    // 空きのある会社へはcompany_id UPDATEで移動できる。
     const roomCompanyId = await insertCompany(pool, 'company-rule-room');
-    await insertPolicy(roomCompanyId, 1, ['room-1']);
+    await insertPolicy(roomCompanyId, 1, [literalRule('room-1')]);
     await pool.query('UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2', [roomCompanyId, sourceCompanyId]);
     assert.equal(await ruleCount(roomCompanyId), 2, '空き会社へのcompany_id UPDATEが反映されていない');
     assert.equal(await ruleCount(sourceCompanyId), 0);
 
     // 並行のcompany_id UPDATEでもtarget policy lockで100件を越えない。
     const raceTargetId = await insertCompany(pool, 'company-rule-move-race');
-    await insertPolicy(raceTargetId, 1, Array.from({ length: 99 }, (_, index) => `t-${String(index).padStart(3, '0')}`));
+    await insertPolicy(
+      raceTargetId,
+      1,
+      Array.from({ length: 99 }, (_, index) => literalRule(`t-${String(index).padStart(3, '0')}`)),
+    );
     const moveSourceAId = await insertCompany(pool, 'company-rule-move-a');
-    await insertPolicy(moveSourceAId, 1, ['move-a']);
+    await insertPolicy(moveSourceAId, 1, [literalRule('move-a')]);
     const moveSourceBId = await insertCompany(pool, 'company-rule-move-b');
-    await insertPolicy(moveSourceBId, 1, ['move-b']);
+    await insertPolicy(moveSourceBId, 1, [literalRule('move-b')]);
     const moveSql = 'UPDATE company_redaction_rules SET company_id = $1 WHERE company_id = $2';
     const moveClientA = await pool.connect();
     const moveClientB = await pool.connect();
@@ -261,17 +391,9 @@ describe('custom伏せ字policyのschema契約', () => {
       moveClientA.release();
       moveClientB.release();
     }
-    assert.equal(await ruleCount(raceTargetId), 100, '並行UPDATEで上限を越えている');
+    assert.equal(await ruleCount(raceTargetId), MAX_CUSTOM_RULES, '並行UPDATEで上限を越えている');
   });
 });
-
-async function ruleCount(companyId: string): Promise<number> {
-  const result = await pool.query<{ count: string }>(
-    'SELECT count(*)::text AS count FROM company_redaction_rules WHERE company_id = $1',
-    [companyId],
-  );
-  return Number(result.rows[0]?.count);
-}
 
 describe('project repository aliasのschema契約', () => {
   it('primary repositoryをbackfillし、同じ会社の重複aliasを拒否して会社境界を保つ', async () => {
