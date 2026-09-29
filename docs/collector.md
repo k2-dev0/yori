@@ -25,7 +25,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 - `projects`（`repository`と`project_id`の対応表）は旧設定との後方互換で任意。新しい設定では書かず、hook cwdの`git remote.origin.url`からcanonical repositoryを求めて`POST /v1/collector/setup`でprojectとcurrent伏せ字policyを解決する。ディレクトリ名から案件を推定しない。
 - `projects`ありの旧設定ではcustom policyはAPI受付側で適用されてclient側の自動更新は行わず、client側の自動更新は`projects`を省略した新標準設定でのみ有効。
 - 正規化後のrepositoryは既存APIと同じ1024 UTF-8 bytes以内とし、NUL・単独サロゲートを拒否する。収集入口でも確認し、超過値をoutboxへ入れない。
-- setupで解決したprojectとpolicyは`state_dir`のSQLiteへcacheする。rules（literal/assignment_key）はtoken由来の鍵で暗号化し、平文valueをstateへ残さない。collectは毎回setupを試み、cacheなしの失敗は本文を読まず送信0件、cacheありの一時失敗はlast-known policyで継続する。
+- setupで解決したprojectとpolicyは`state_dir`のSQLiteへcacheする。fields/terms/suspicion_mode/detector_versionはtoken由来の鍵で暗号化し、平文のruleをstateへ残さない。collectは毎回setupを試み、cacheなしの失敗は本文を読まず送信0件、cacheありの一時失敗はlast-known policyで継続する。
 
 ## フック
 
@@ -77,7 +77,9 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 
 ## 診断と制約
 
-- 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。会社のcustom ruleは`literal`（exact・case-sensitive・最長一致・最大512コードポイント）と`assignment_key`（ASCII identifier・case-insensitive・最大128コードポイント、区切りは`:`/`=`/`：`）の2種で合計最大100件。`literal`は一致文字列を、`assignment_key`はkey表記・空白・区切りを保持してvalueだけを`[REDACTED:custom]`へ置換する（regexなし、keyのみ・空値・環境変数参照・placeholderは変更しない）。built-inは`PASS`/`pass`の代入値と全角colonも`[REDACTED:env_value]`へ置換し、custom assignment_keyを先に適用してcustom placeholderを維持する。collectorを経ないAPI直接送信でも受付側で同じpolicyを適用する。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
+- 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。会社のbusiness ruleは`fields`（ASCII identifier・case-insensitiveのexact key一致・最大128コードポイント）と`terms`（exact・case-sensitive・最長一致・最大512コードポイント）の2種で合計最大100件。`fields`はkey表記・空白・区切りを保持してvalueだけを`[REDACTED:business_value]`へ、`terms`は一致文字列を`[REDACTED:business_term]`へ置換する（regexなし、keyのみ・空値・環境変数参照・placeholderは変更しない）。登録済みfieldとexact一致する代入keyはbuilt-inの代入形検出よりfieldを優先する。built-inは`PASS`/`pass`の代入値と全角colonも`[REDACTED:env_value]`へ置換する。collectorを経ないAPI直接送信でも受付側で同じpolicyを適用する。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
+- known secretはcollector processのlocal環境変数`YORI_KNOWN_SECRETS_JSON`（strict JSON string array、8〜4096コードポイント・最大100件・exact重複拒否）で受け取り、完全一致値を最長一致で`[REDACTED:known_secret]`へ置換する。未設定は空配列、設定済みの不正は固定code`invalid_known_secrets`で本文を読まずにfail-closedとし、parse後は`process.env`から削除する。known secretの生値はstate・outbox・log・送信bodyへ残さない。
+- suspicion gate（detector `initial-v1`）はbuilt-in・known secret・fields・terms適用後の本文から32〜256コードポイントのtoken風候補を検出し、既知placeholder・UUID・7〜64桁hex/git SHA/checksum・semver・repository path・通常identifierを除外する。`suspicion_mode=observe`は候補を本文へ残して送信し固定code`message_suspected_secret`を診断へ記録、`block`はmessage/outboxを保存せず固定code`message_blocked_suspected_secret`と参照byte offsetだけを残してcursorを進め、後続messageの処理は継続する。
 - 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。本文長の判定は置換後に行う。
 - Codex Desktopから収集するのは`event_msg/item_completed`の`UserMessage`と`AgentMessage`だけ。`response_item`、`turn_context`、`token_usage_record`、`world_state`、`compacted`は既知の非会話top-level recordとして無診断で無視する。`Reasoning`、`CommandExecution`、`FileChange`、`Extension`、tool call/outputも収集しない。未知のtop-level typeは`transcript_unknown_record`として診断する。
 - 完成行を文字列へ変換する前にUTF-8を検証する。不正バイトを含む行は置換せず除外し、`transcript_invalid_utf8`とoffsetを記録する。正常なUnicodeと後続行は保持する。未完行の途中で切れた文字は完成まで判定しない。
