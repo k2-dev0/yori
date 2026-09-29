@@ -95,11 +95,13 @@ describe('custom伏せ字policyの純粋関数', () => {
       'pass::hogehoge',
       'compass: hogehoge',
       'bypass=hogehoge',
-      'passkey: hogehoge',
       'DB_PASS: hogehoge',
     ]) {
       assert.equal(applyPolicy(unchanged, rules), unchanged, `変更してはいけない入力: ${JSON.stringify(unchanged)}`);
     }
+    // passkeyはcustom rule `pass`とは別identifierのためcustom置換は起きない。KEY suffixとしての
+    // built-in置換だけが従来どおりvalueを伏せる。
+    assert.equal(applyPolicy('passkey: hogehoge', rules), 'passkey: [REDACTED:env_value]');
   });
 
   it('assignment_keyはenvironment variable参照とplaceholderを変更せず、再適用してもbyte一致する', () => {
