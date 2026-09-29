@@ -30,6 +30,10 @@ interface OpenApiSchema {
   maxItems?: unknown;
   maxLength?: unknown;
   additionalProperties?: unknown;
+  anyOf?: unknown[];
+  oneOf?: unknown[];
+  enum?: unknown[];
+  const?: unknown;
 }
 
 interface OpenApiParameter {
@@ -502,6 +506,37 @@ describe('OpenAPI 3.1契約の生成', () => {
     const serialized = JSON.stringify(servers);
     assert.ok(!serialized.includes('localhost') && !serialized.includes('127.0.0.1'), 'server URLへlocalhostを埋め込んでいる');
     assert.ok(document.paths?.['/openapi.json'] === undefined, '公開OpenAPI endpointをpathsへ追加している');
+  });
+
+  it('collector setup応答のrulesをliteral/assignment_keyのobject unionと100件上限で生成する', async () => {
+    const { document } = await generatedOpenApi();
+    const setupRoute = ROUTES.find((route) => route.path === '/v1/collector/setup');
+    assert.ok(setupRoute, 'collector setupのroute契約がない');
+    const { operation } = operationOf(document, setupRoute);
+    const responseSchema = jsonResponseSchema(document, operation, '200');
+    const policySchema = resolveSchema(document, responseSchema?.properties?.redaction_policy);
+    assert.ok(policySchema, 'CollectorSetupResponseにredaction_policyがない');
+
+    const rulesSchema = resolveSchema(document, policySchema?.properties?.rules);
+    assert.equal(rulesSchema?.type, 'array', 'redaction_policy.rulesがarrayでない');
+    assert.equal(rulesSchema?.maxItems, 100, 'redaction_policy.rulesの100件上限がない');
+
+    const itemSchema = resolveSchema(document, rulesSchema?.items);
+    const branches = itemSchema?.anyOf ?? itemSchema?.oneOf;
+    assert.ok(Array.isArray(branches) && branches.length === 2, 'rules itemがliteral/assignment_keyの2分岐unionでない');
+
+    const branchSchemas = branches.map((branch) => resolveSchema(document, branch));
+    const branchTypes = branchSchemas.map((branch) => {
+      const typeSchema = resolveSchema(document, branch?.properties?.type);
+      return typeSchema?.const ?? (Array.isArray(typeSchema?.enum) ? typeSchema.enum[0] : undefined);
+    });
+    assert.deepEqual([...branchTypes].sort(), ['assignment_key', 'literal'], 'rules unionのtypeがliteral/assignment_keyでない');
+
+    for (const branch of branchSchemas) {
+      assert.deepEqual(requiredNames(branch).sort(), ['type', 'value'], 'rule branchの必須fieldがtype/valueでない');
+      assert.equal(resolveSchema(document, branch?.properties?.type)?.type, 'string', 'ruleのtypeがstringでない');
+      assert.equal(resolveSchema(document, branch?.properties?.value)?.type, 'string', 'ruleのvalueがstringでない');
+    }
   });
 
   it('生成・versioning・互換性規則がdocs/api-contract.mdへ文書化されている', async () => {
