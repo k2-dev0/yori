@@ -3,9 +3,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE } from './contract.js';
-import type { AuthContext } from './events.js';
+import { SuspectedSecretError, type AuthContext } from './events.js';
 import { loadCompanyRedactionPolicy } from './redaction-policy.js';
-import { redactConversationTextWithPolicy } from './redaction.js';
+import { sanitizeConversationText } from './redaction.js';
 import type { EvidenceView, NotReceivedView, SearchLookupView, SearchView } from './response-schema.js';
 import type { ParsedSearchByInputQuery, ParsedSearchRequest } from './schema.js';
 import { EXECUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
@@ -79,7 +79,11 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
       `${auth.companyId}:${auth.employeeId}`,
     ]);
     const policy = await loadCompanyRedactionPolicy(client, auth.companyId);
-    const request: ParsedSearchRequest = { ...rawRequest, query: redactConversationTextWithPolicy(rawRequest.query, policy) };
+    const sanitized = sanitizeConversationText(rawRequest.query, policy);
+    if (sanitized.action === 'block') {
+      throw new SuspectedSecretError();
+    }
+    const request: ParsedSearchRequest = { ...rawRequest, query: sanitized.text };
     const targetResult = await client.query<InputTargetRow>(
       `SELECT m.id, m.role, m.current_revision, m.sequence_no, m.session_id,
               s.employee_id, s.project_id, p.company_id, r.text
