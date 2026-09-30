@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
+import type { TokenScope } from '../../api/contract.js';
 
 // テストごとに業務データを消す。migrationが作る業務テーブルのみを対象にする。
 const DATA_TABLES = [
@@ -57,13 +58,19 @@ export async function addProjectMember(pool: Pool, projectId: string, employeeId
 }
 
 // 生tokenは呼出元だけが保持する。DBにはSHA-256のみを保存する。
-export async function issueAuthToken(pool: Pool, companyId: string, employeeId: string): Promise<string> {
+export async function issueAuthToken(
+  pool: Pool,
+  companyId: string,
+  employeeId: string,
+  scope: TokenScope = 'employee',
+): Promise<string> {
   const token = `yori_${randomBytes(24).toString('base64url')}`;
-  await pool.query('INSERT INTO auth_tokens (id, company_id, employee_id, token_hash) VALUES ($1, $2, $3, $4)', [
+  await pool.query('INSERT INTO auth_tokens (id, company_id, employee_id, token_hash, scope) VALUES ($1, $2, $3, $4, $5)', [
     uuidv7(),
     companyId,
     employeeId,
     sha256Bytes(token),
+    scope,
   ]);
   return token;
 }
