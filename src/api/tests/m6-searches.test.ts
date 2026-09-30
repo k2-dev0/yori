@@ -1310,7 +1310,7 @@ describe('M6 POST /v1/searches 受付', () => {
 });
 
 describe('M6 認証と案件境界', () => {
-  it('GET /v1/searches/:idは未認証401、他社・非member・未知IDは404で存在を開示しない', async () => {
+  it('GET /v1/searches/:idは同じ会社へ共有し、未認証401・他社/未知IDは404にする', async () => {
     const input = await ingestUserInput('境界確認の入力');
 
     const unauthenticated = await getSearchById(app, { token: null, id: input.requestId });
@@ -1319,9 +1319,8 @@ describe('M6 認証と案件境界', () => {
 
     const employeeB = await insertEmployee(pool, workspace.companyId);
     const tokenB = await issueAuthToken(pool, workspace.companyId, employeeB);
-    const nonMember = await getSearchById(app, { token: tokenB, id: input.requestId });
-    assert.equal(nonMember.statusCode, 404, `非memberへ受付の存在を開示した: ${nonMember.body}`);
-    assert.equal(errorCode(nonMember), 'not_found');
+    const sameCompany = await getSearchById(app, { token: tokenB, id: input.requestId });
+    assert.equal(sameCompany.statusCode, 200, `同じ会社へ受付を共有していない: ${sameCompany.body}`);
 
     const other = await seedWorkspace(pool, { name: 'company-b', repositoryIdentifier: 'repo-b' });
     const otherCompany = await getSearchById(app, { token: other.token, id: input.requestId });
@@ -1333,7 +1332,7 @@ describe('M6 認証と案件境界', () => {
     assert.equal(errorCode(unknown), 'not_found');
   });
 
-  it('POST /v1/searchesは未認証401、非member403、他社員の入力404、assistant入力400を固定codeで返す', async () => {
+  it('POST /v1/searchesは未認証401、他社員の入力404、assistant入力400を固定codeで返す', async () => {
     const own = await ingestUserInput('自社員の入力');
     const employeeB = await insertEmployee(pool, workspace.companyId);
     const tokenB = await issueAuthToken(pool, workspace.companyId, employeeB);
@@ -1343,17 +1342,9 @@ describe('M6 認証と案件境界', () => {
     assert.equal(unauthenticated.statusCode, 401, `未認証を受理した: ${unauthenticated.body}`);
     assert.equal(errorCode(unauthenticated), 'unauthorized');
 
-    const nonMember = await postSearch(app, {
-      token: tokenB,
-      body: { ...base, idempotency_key: `nonmember-${randomUUID()}` },
-    });
-    assert.equal(nonMember.statusCode, 403, `非memberを受理した: ${nonMember.body}`);
-    assert.equal(errorCode(nonMember), 'forbidden');
-
-    await addProjectMember(pool, workspace.projectId, employeeB);
     const otherEmployeeInput = await postSearch(app, {
       token: tokenB,
-      body: { ...base, idempotency_key: `other-employee-${randomUUID()}` },
+      body: { ...base, idempotency_key: `nonmember-${randomUUID()}` },
     });
     assert.equal(otherEmployeeInput.statusCode, 404, `他社員のsession入力を照合した: ${otherEmployeeInput.body}`);
     assert.equal(errorCode(otherEmployeeInput), 'not_found');
