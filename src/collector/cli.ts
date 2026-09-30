@@ -3,11 +3,12 @@ import { z } from 'zod';
 import { EVENT_SOURCES, type EventSource } from '../api/contract.js';
 import { collectFromHook, flushCollector } from './collect.js';
 import { notifyFromHook, notifyLateFromHook } from './notify.js';
+import { parseCursorHookInput } from './adapters/cursor.js';
 import { loadCollectorConfig, type CollectorConfig } from './config.js';
 import { parseKnownSecretsEnv } from './known-secrets.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from './state.js';
 
-const hookSchema = z.object({
+const transcriptHookSchema = z.object({
   session_id: z.string().min(1),
   transcript_path: z.string().min(1),
   cwd: z.string().min(1),
@@ -57,6 +58,9 @@ function parseCommandLine(argv: string[]): { command: string; source?: string; c
   ) {
     fail('invalid_source');
   }
+  if ((command === 'notify' || command === 'notify-late') && source === 'cursor') {
+    fail('invalid_source');
+  }
   return { command, source, configPath };
 }
 
@@ -97,15 +101,31 @@ async function main(): Promise<void> {
     } catch {
       fail('invalid_hook_input');
     }
-    const hook = hookSchema.safeParse(hookInput);
-    if (!hook.success) {
-      fail('invalid_hook_input');
-    }
     if (command === 'collect') {
+      if (source === 'cursor') {
+        const hook = parseCursorHookInput(hookInput);
+        if (hook === null) {
+          fail('invalid_hook_input');
+        }
+        await collectFromHook({ source, hook, config, token, knownSecrets });
+        return;
+      }
+      const hook = transcriptHookSchema.safeParse(hookInput);
+      if (!hook.success) {
+        fail('invalid_hook_input');
+      }
       await collectFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     } else if (command === 'notify') {
+      const hook = transcriptHookSchema.safeParse(hookInput);
+      if (!hook.success) {
+        fail('invalid_hook_input');
+      }
       await notifyFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     } else {
+      const hook = transcriptHookSchema.safeParse(hookInput);
+      if (!hook.success) {
+        fail('invalid_hook_input');
+      }
       await notifyLateFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     }
     return;
