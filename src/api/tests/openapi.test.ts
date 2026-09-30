@@ -326,7 +326,7 @@ describe('OpenAPI 3.1契約の生成', () => {
     const eventItem = resolveSchema(document, eventsSchema?.properties?.events?.items);
     assert.equal(eventItem?.additionalProperties, false, 'eventのunknown fieldがstrictでない');
     assert.equal(eventItem?.properties?.idempotency_key?.maxLength, 512, 'idempotency_key上限がZod契約と一致しない');
-    assert.deepEqual(eventItem?.properties?.source?.enum, ['codex', 'claude_code', 'cursor']);
+    assert.deepEqual(eventItem?.properties?.source?.enum, ['codex', 'claude_code', 'cursor', 'deepseek_harness']);
     assert.equal(eventItem?.properties?.model_id?.maxLength, 1024, 'model_id上限が公開契約にない');
     assert.deepEqual(requiredNames(eventItem).sort(), [
       'idempotency_key',
