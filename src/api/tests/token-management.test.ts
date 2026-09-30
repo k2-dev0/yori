@@ -189,7 +189,7 @@ describe('本人・社員・token管理API', () => {
       expectedCode: string;
       expectedStatus: number;
       headers: Record<string, string>;
-      payload: unknown;
+      payload: { display_name: string; company_id?: string };
       url: string;
     }> = [
       {
