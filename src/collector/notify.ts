@@ -1,14 +1,26 @@
 import { z } from 'zod';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { EventSource } from '../api/contract.js';
 import { collectFromHook, type CollectorHookInput } from './collect.js';
 import type { CollectorConfig } from './config.js';
+import {
+  claimPendingNotification,
+  closeCollectorState,
+  collectorNamespace,
+  listPendingNotifications,
+  openCollectorState,
+  registerPendingNotification,
+} from './state.js';
 
 // M7の補助通知。UserPromptSubmit hookで既存collectを実行した後、その呼出しで確定できた
-// 最新user message identityをcollector stateから特定し、GET /v1/searches/by-inputを最大5秒×2で待つ。
+// 最新user message identityをcollector stateから特定し、GET /v1/searches/by-inputをfast/lateの2段階で待つ。
 // 完了結果だけを「過去履歴の資料」としてstdoutへ返し、token・prompt本文・未完了状態を出力しない。
 
-const WAIT_MS = 5_000;
-const MAX_WAIT_MS = 10_000;
+const FAST_WAIT_MS = 3_000;
+const LATE_WAIT_MS = 5_000;
+const LATE_START_DELAY_MS = FAST_WAIT_MS + 250;
+const MAX_LATE_WAIT_MS = 60_000;
+const HTTP_TIMEOUT_GRACE_MS = 750;
 
 export interface NotifyFromHookInput {
   source: EventSource;
@@ -32,8 +44,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-// 1回最大5秒、累計最大10秒。応答が返れば再試行せず、timeout/network失敗のときだけ1回再試行する。
-async function lookupByInput(input: NotifyFromHookInput, target: LatestUserInput): Promise<unknown | null> {
+// server long-pollを1回だけ呼ぶ。fast pathの期限後も検索job自体は取消さない。
+async function lookupByInput(input: NotifyFromHookInput, target: LatestUserInput, waitMs: number): Promise<unknown | null> {
   const endpoint = `${input.config.api_url.replace(/\/+$/, '')}/v1/searches/by-input`;
   const params = new URLSearchParams({
     project_id: target.projectId,
@@ -42,36 +54,28 @@ async function lookupByInput(input: NotifyFromHookInput, target: LatestUserInput
     source_session_id: target.sourceSessionId,
     source_message_id: target.sourceMessageId,
     revision: String(target.revision),
-    wait_ms: String(WAIT_MS),
+    wait_ms: String(waitMs),
   });
   const url = `${endpoint}?${params.toString()}`;
-  const deadline = Date.now() + MAX_WAIT_MS;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      return null;
-    }
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'GET',
-        headers: { authorization: `Bearer ${input.token}` },
-        signal: AbortSignal.timeout(Math.min(WAIT_MS, remaining)),
-        redirect: 'error',
-      });
-    } catch {
-      continue;
-    }
-    if (!response.ok) {
-      return null;
-    }
-    try {
-      return await response.json();
-    } catch {
-      return null;
-    }
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${input.token}` },
+      signal: AbortSignal.timeout(waitMs + HTTP_TIMEOUT_GRACE_MS),
+      redirect: 'error',
+    });
+  } catch {
+    return null;
   }
-  return null;
+  if (!response.ok) {
+    return null;
+  }
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
 }
 
 const notReceivedSchema = z.object({ lookup_status: z.literal('not_received') });
@@ -209,6 +213,88 @@ function buildNotificationContext(payload: unknown): string | null {
   return lines.join('\n');
 }
 
+function registerConfirmedInputs(
+  input: NotifyFromHookInput,
+  confirmedInputs: Awaited<ReturnType<typeof collectFromHook>>['confirmedUserInputs'],
+): void {
+  if (confirmedInputs.length === 0) {
+    return;
+  }
+  const state = openCollectorState(input.config.state_dir);
+  try {
+    const namespace = collectorNamespace(input.config.api_url, input.token);
+    for (const confirmed of confirmedInputs) {
+      registerPendingNotification(state, {
+        namespace,
+        projectId: confirmed.projectId,
+        source: input.source,
+        sourceScope: confirmed.sourceScope,
+        sourceSessionId: input.hook.session_id,
+        sourceMessageId: confirmed.sourceMessageId,
+        revision: confirmed.revision,
+        sequenceNo: confirmed.sequenceNo,
+      });
+    }
+  } finally {
+    closeCollectorState(state);
+  }
+}
+
+function pendingTargets(input: NotifyFromHookInput): LatestUserInput[] {
+  const state = openCollectorState(input.config.state_dir);
+  try {
+    return listPendingNotifications(
+      state,
+      collectorNamespace(input.config.api_url, input.token),
+      input.source,
+      input.hook.session_id,
+    ).map((pending) => ({
+      projectId: pending.project_id,
+      source: input.source,
+      sourceScope: pending.source_scope,
+      sourceSessionId: pending.source_session_id,
+      sourceMessageId: pending.source_message_id,
+      revision: pending.revision,
+    }));
+  } finally {
+    closeCollectorState(state);
+  }
+}
+
+function claimDelivery(input: NotifyFromHookInput, target: LatestUserInput): boolean {
+  const state = openCollectorState(input.config.state_dir);
+  try {
+    return claimPendingNotification(
+      state,
+      collectorNamespace(input.config.api_url, input.token),
+      input.source,
+      target.sourceSessionId,
+      target.sourceMessageId,
+      target.revision,
+    );
+  } finally {
+    closeCollectorState(state);
+  }
+}
+
+async function notificationContextFor(input: NotifyFromHookInput, target: LatestUserInput, waitMs: number): Promise<string | null> {
+  const payload = await lookupByInput(input, target, waitMs);
+  if (payload === null) {
+    return null;
+  }
+  const context = buildNotificationContext(payload);
+  if (context === null || !claimDelivery(input, target)) {
+    return null;
+  }
+  return context;
+}
+
+function emitContexts(contexts: readonly string[]): void {
+  if (contexts.length > 0) {
+    process.stdout.write(`${hookOutput(contexts.join('\n\n---\n\n'))}\n`);
+  }
+}
+
 // collectを先に実行し、その呼出しのSQLite commitで新規追加・revision更新として確定した
 // user入力だけを通知する。共有stateを前後比較しないため、HTTP待機中に別collectが後続入力を
 // 取り込んでも先行呼出しのidentityは混ざらない。確定差分がなければ無出力で終了する。
@@ -220,27 +306,56 @@ export async function notifyFromHook(input: NotifyFromHookInput): Promise<void> 
     token: input.token,
     knownSecrets: input.knownSecrets,
   });
-  if (result.confirmedUserInputs.length === 0) {
-    return;
-  }
-  // 同一呼出しで複数差分がある場合は、その呼出し内でsequence最大のuserを通知対象にする。
-  const confirmed = result.confirmedUserInputs.reduce((latest, current) =>
-    current.sequenceNo > latest.sequenceNo ? current : latest,
+  registerConfirmedInputs(input, result.confirmedUserInputs);
+  const latest = result.confirmedUserInputs.reduce<(typeof result.confirmedUserInputs)[number] | undefined>(
+    (current, candidate) => (current === undefined || candidate.sequenceNo > current.sequenceNo ? candidate : current),
+    undefined,
   );
-  const target: LatestUserInput = {
-    projectId: confirmed.projectId,
-    source: input.source,
-    sourceScope: confirmed.sourceScope,
-    sourceSessionId: input.hook.session_id,
-    sourceMessageId: confirmed.sourceMessageId,
-    revision: confirmed.revision,
-  };
-  const payload = await lookupByInput(input, target);
-  if (payload === null) {
-    return;
+  const currentKey = latest === undefined ? null : `${latest.sourceMessageId}:${latest.revision}`;
+  const contexts: string[] = [];
+  for (const target of pendingTargets(input)) {
+    const targetKey = `${target.sourceMessageId}:${target.revision}`;
+    const context = await notificationContextFor(input, target, targetKey === currentKey ? FAST_WAIT_MS : 0);
+    if (context !== null) {
+      contexts.push(context);
+    }
   }
-  const context = buildNotificationContext(payload);
-  if (context !== null) {
-    process.stdout.write(`${hookOutput(context)}\n`);
+  emitContexts(contexts);
+}
+
+// fast path後も検索を待ち、完了結果を一度だけ次の安全地点へ渡す。期限後も未配信行は残す。
+export async function notifyLateFromHook(input: NotifyFromHookInput): Promise<void> {
+  await sleep(LATE_START_DELAY_MS);
+  const result = await collectFromHook({
+    source: input.source,
+    hook: input.hook,
+    config: input.config,
+    token: input.token,
+    knownSecrets: input.knownSecrets,
+  });
+  registerConfirmedInputs(input, result.confirmedUserInputs);
+
+  const deadline = Date.now() + MAX_LATE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const pending = pendingTargets(input);
+    if (pending.length === 0) {
+      return;
+    }
+    const contexts: string[] = [];
+    for (const target of pending) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      const context = await notificationContextFor(input, target, Math.min(LATE_WAIT_MS, remaining));
+      if (context !== null) {
+        contexts.push(context);
+      }
+    }
+    if (contexts.length > 0) {
+      emitContexts(contexts);
+      return;
+    }
+    await sleep(250);
   }
 }
