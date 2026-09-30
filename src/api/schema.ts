@@ -222,8 +222,13 @@ export const tokenIssueRequestSchema = z.strictObject({
   scope: tokenScopeSchema,
 });
 
+export const employeeCreateRequestSchema = z.strictObject({
+  display_name: storableString,
+});
+
 export const employeeTokenParamsSchema = z.strictObject({ employee_id: normalizedUuid });
 export const tokenParamsSchema = z.strictObject({ token_id: normalizedUuid });
 
 export type ParsedProjectRegistrationRequest = z.infer<typeof projectRegistrationRequestSchema>;
+export type ParsedEmployeeCreateRequest = z.infer<typeof employeeCreateRequestSchema>;
 export type ParsedTokenIssueRequest = z.infer<typeof tokenIssueRequestSchema>;
