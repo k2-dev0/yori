@@ -117,7 +117,8 @@ async function main(): Promise<void> {
   } catch {
     fail('invalid_config');
   }
-  const token = readToken(config);
+  // dry-runはHTTP/SQLiteを使わないためtokenを要求しない。本実行と既存commandは従来どおり必須。
+  const token = command === 'backfill' && dryRun ? '' : readToken(config);
 
   if (command === 'collect' || command === 'notify' || command === 'notify-late' || command === 'flush' || command === 'backfill') {
     // known secretは本文を読む前にlocal envから検証し、不正時はfixed codeでfail-closedにする。
