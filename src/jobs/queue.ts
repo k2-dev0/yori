@@ -72,6 +72,27 @@ const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 60 * 60 * 1_000;
 
+// 完了jobの後から届いた変更を既存queueへ戻す。未承認/恒久失敗は自動再試行しない。
+export async function recoverDocumentBuilds(pool: Pool): Promise<number> {
+  const result = await pool.query(
+    `INSERT INTO jobs(id, kind, priority, session_id, message_id, target_revision, payload, idempotency_key, next_run_at)
+     SELECT gen_random_uuid(), 'build_documents', $1, b.session_id, m.id, m.current_revision, '{}'::jsonb,
+            'build_recovery:' || b.session_id || ':' || b.version, now()
+       FROM document_build_states b
+       JOIN LATERAL (
+         SELECT m.id, m.current_revision FROM messages m
+         JOIN message_analysis a ON a.message_id = m.id AND a.revision = m.current_revision
+         WHERE m.session_id = b.session_id AND a.policy_version = COALESCE(b.policy_version, 'initial-v1')
+         ORDER BY m.sequence_no DESC LIMIT 1
+       ) m ON true
+      WHERE b.dirty_sequence IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.session_id = b.session_id
+          AND j.kind IN ('build_documents', 'classify_message') AND j.status <> 'completed')
+      ORDER BY b.updated_at, b.session_id LIMIT 100
+      ON CONFLICT (idempotency_key) DO NOTHING`, [BUILD_DOCUMENTS_PRIORITY]);
+  return result.rowCount ?? 0;
+}
+
 interface JobRow {
   id: string;
   kind: JobKind;
