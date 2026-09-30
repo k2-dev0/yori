@@ -58,23 +58,26 @@ fi
 
 # 配布対象SHAをCompose interpolationへ渡し、api・workerの実行環境へ固定する。
 export YORI_RELEASE_SHA="$TARGET"
+compose() {
+  sudo env YORI_RELEASE_SHA="$TARGET" docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml "$@"
+}
 
 # 設定検査が失敗したらpull以降へ進まない。migration/config/pull/db失敗時は再作成しない。
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml config --quiet
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml pull
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml up -d --wait db
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml --profile tools run --rm migrate
+compose config --quiet
+compose pull
+compose up -d --wait db
+compose --profile tools run --rm migrate
 
 # migration成功後だけ旧api・workerを明示削除する。--force-recreateの判定に依存せず旧Node processを停止する。
-OLD_API_ID="$(sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml ps -q api)"
-OLD_WORKER_ID="$(sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml ps -q worker)"
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml rm -sf worker api
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml up -d --wait --no-deps api
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml up -d --wait --no-deps worker
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml --profile production up -d --wait --force-recreate --no-deps caddy
+OLD_API_ID="$(compose ps -q api)"
+OLD_WORKER_ID="$(compose ps -q worker)"
+compose rm -sf worker api
+compose up -d --wait --no-deps api
+compose up -d --wait --no-deps worker
+compose --profile production up -d --wait --force-recreate --no-deps caddy
 
-NEW_API_ID="$(sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml ps -q api)"
-NEW_WORKER_ID="$(sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml ps -q worker)"
+NEW_API_ID="$(compose ps -q api)"
+NEW_WORKER_ID="$(compose ps -q worker)"
 if [ -z "$NEW_API_ID" ] || [ -z "$NEW_WORKER_ID" ]; then
   echo "deploy: apiまたはworkerの新container IDを取得できない" >&2
   exit 1
@@ -84,13 +87,13 @@ if { [ -n "$OLD_API_ID" ] && [ "$OLD_API_ID" = "$NEW_API_ID" ]; } || \
   echo "deploy: apiまたはworkerのcontainer IDが更新されていない" >&2
   exit 1
 fi
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml exec -T api \
+compose exec -T api \
   sh -c 'test "$YORI_RELEASE_SHA" = "$1"' sh "$TARGET"
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml exec -T worker \
+compose exec -T worker \
   sh -c 'test "$YORI_RELEASE_SHA" = "$1"' sh "$TARGET"
 
 # composeが公開するloopback addressへhealth/readyを確認する。
-PORT_BINDING="$(sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml port api 3210 | head -n 1)"
+PORT_BINDING="$(compose port api 3210 | head -n 1)"
 PORT_ADDR="${PORT_BINDING%:*}"
 PORT_NUM="${PORT_BINDING##*:}"
 case "$PORT_ADDR" in
@@ -119,5 +122,5 @@ if [ "$SMOKE_STATUS" != '401' ] || [ "$(<"$SMOKE_BODY")" != '{"error":{"code":"u
 fi
 
 echo "deploy: old=$OLD_SHA new=$NEW_SHA"
-sudo docker compose --env-file "$ENV_FILE" -p yori -f deployment/compose.yaml ps
+compose ps
 DEPLOY_BODY
