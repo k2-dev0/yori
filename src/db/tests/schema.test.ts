@@ -129,6 +129,7 @@ describe('migration管理', () => {
       '0010_custom_redaction.sql',
       '0011_cursor.sql',
       '0012_deepseek_harness.sql',
+      '0013_auth_token_scope.sql',
     ]);
   });
 
@@ -137,7 +138,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '12');
+    assert.equal(versions.rows[0].count, '13');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -154,6 +155,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0010_custom_redaction.sql'), '0010_custom_redaction.sql がない');
     assert.ok(files.includes('0011_cursor.sql'), '0011_cursor.sql がない');
     assert.ok(files.includes('0012_deepseek_harness.sql'), '0012_deepseek_harness.sql がない');
+    assert.ok(files.includes('0013_auth_token_scope.sql'), '0013_auth_token_scope.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
@@ -350,6 +352,16 @@ describe('CHECK制約', () => {
       ),
       '23514',
       'trigger=other',
+    );
+  });
+
+  it('既存形式のtokenはemployee scopeになり、不正scopeを拒否する', async () => {
+    const scope = await pool.query<{ scope: string }>('SELECT scope FROM auth_tokens WHERE token_hash = $1', [sha256Bytes(workspace.token)]);
+    assert.deepEqual(scope.rows, [{ scope: 'employee' }]);
+    await expectDbError(
+      pool.query('UPDATE auth_tokens SET scope = $1 WHERE token_hash = $2', ['owner', sha256Bytes(workspace.token)]),
+      '23514',
+      'auth token scope=owner',
     );
   });
 
