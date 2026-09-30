@@ -1,5 +1,13 @@
 import { z } from 'zod';
-import { EVENT_ROLES, EVENT_SOURCES, MAX_BATCH_SIZE, MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, MIN_BATCH_SIZE } from './contract.js';
+import {
+  EVENT_ROLES,
+  EVENT_SOURCES,
+  MAX_BATCH_SIZE,
+  MAX_MODEL_IDENTIFIER_BYTES,
+  MAX_SOURCE_IDENTIFIER_BYTES,
+  MAX_TEXT_LENGTH,
+  MIN_BATCH_SIZE,
+} from './contract.js';
 
 // HTTPとMCPの入力境界で共有するprimitive。上限値の実体を1箇所に置き、片側だけdriftしないようにする。
 
@@ -25,6 +33,18 @@ export const sourceIdentifier = storableString
   .meta({
     description: `取り込み元identifierはUTF-8で${MAX_SOURCE_IDENTIFIER_BYTES}バイト以内`,
     'x-yori-max-utf8-bytes': MAX_SOURCE_IDENTIFIER_BYTES,
+  });
+
+// provider非依存のmodel ID。Cursorが返す任意slugを固定enumへ閉じず、保存可能な識別子だけを受理する。
+export const modelIdentifier = storableString
+  .max(MAX_MODEL_IDENTIFIER_BYTES)
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_MODEL_IDENTIFIER_BYTES, {
+    message: `model IDはUTF-8で${MAX_MODEL_IDENTIFIER_BYTES}バイト以内にしてください`,
+  })
+  .meta({
+    maxLength: MAX_MODEL_IDENTIFIER_BYTES,
+    description: `model IDはUTF-8で${MAX_MODEL_IDENTIFIER_BYTES}バイト以内`,
+    'x-yori-max-utf8-bytes': MAX_MODEL_IDENTIFIER_BYTES,
   });
 
 // UUIDは比較・保存の前に小文字の正規形へ揃える。HTTP body/queryとMCP入力を同じ規則にする。
@@ -66,6 +86,7 @@ const eventSchema = z.strictObject({
   revision: revisionSchema,
   role: z.enum(EVENT_ROLES),
   occurred_at: occurredAtSchema,
+  model_id: modelIdentifier.optional(),
   text: conversationText,
 });
 
