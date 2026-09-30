@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, SUSPECTED_SECRET_OBSERVED, type EventSource } from '../api/contract.js';
 import { emptyRedactionPolicy, redactConversationText, sanitizeConversationText, type RedactionPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
-import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from './adapters/codex.js';
+import { SUPPORTED_CODEX_CLI_VERSIONS, codexTurnMessageId, parseCodexTranscriptLine } from './adapters/codex.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending, resolvedTargetKey } from './send.js';
 import { decryptCachedPolicy, encryptCachedPolicy } from './policy-cache.js';
@@ -40,11 +40,16 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const READ_CHUNK_BYTES = 256 * 1024;
 const FINGERPRINT_BYTES = 4096;
 
-// hook JSONのうち収集に必要なfield。prompt等の本文は使わない。
+// 共通fieldに加え、Codexの安定hook契約からturn境界のuser/assistant本文を受け取る。
 export interface CollectorHookInput {
   session_id: string;
   transcript_path: string;
   cwd: string;
+  hook_event_name?: string;
+  turn_id?: string;
+  prompt?: string;
+  stop_hook_active?: boolean;
+  last_assistant_message?: string | null;
 }
 
 export interface CollectFromHookInput {
@@ -95,13 +100,43 @@ function isStorableIdentifier(value: string): boolean {
   return Buffer.byteLength(value, 'utf8') <= MAX_SOURCE_IDENTIFIER_BYTES;
 }
 
-// sourceごとの確認済みtranscript版。Codexはallowlist membership、Claude Codeは単一確認版との完全一致。
+// versionは互換性の診断情報にだけ使う。本文は各adapterの構造検証を通ったrecordだけを扱う。
 function isSupportedTranscriptVersion(source: EventSource, version: string): boolean {
   return source === 'codex' ? SUPPORTED_CODEX_CLI_VERSIONS.includes(version) : version === SUPPORTED_CLAUDE_CODE_VERSION;
 }
 
 function parseLine(source: EventSource, line: string): TranscriptRecord {
   return source === 'codex' ? parseCodexTranscriptLine(line) : parseClaudeTranscriptLine(line);
+}
+
+type HookMessageSelection =
+  | { kind: 'transcript' }
+  | { kind: 'empty' }
+  | { kind: 'message'; sourceMessageId: string; role: 'user' | 'assistant'; text: string };
+
+// Codex hookが正式に渡すturn_idと本文を通常収集の正本にする。旧hook・flushはtranscriptへfallbackする。
+function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookMessageSelection {
+  if (source !== 'codex') {
+    return { kind: 'transcript' };
+  }
+  if (hook.hook_event_name === 'UserPromptSubmit') {
+    if (hook.turn_id === undefined || hook.prompt === undefined) {
+      return { kind: 'empty' };
+    }
+    return { kind: 'message', sourceMessageId: codexTurnMessageId(hook.turn_id, 'user'), role: 'user', text: hook.prompt };
+  }
+  if (hook.hook_event_name === 'Stop') {
+    if (hook.turn_id === undefined || hook.last_assistant_message === undefined || hook.last_assistant_message === null) {
+      return { kind: 'empty' };
+    }
+    return {
+      kind: 'message',
+      sourceMessageId: codexTurnMessageId(hook.turn_id, 'assistant'),
+      role: 'assistant',
+      text: hook.last_assistant_message,
+    };
+  }
+  return { kind: 'transcript' };
 }
 
 // scanと同じfile descriptorの先頭固定長bytesのhash。同inode書換えをappendと区別して検知する。
@@ -280,7 +315,7 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     recordDiagnostic(ctx.state, ctx.namespace, 'message_invalid_identifier', byteOffset);
     return;
   }
-  const occurredAt = new Date(record.occurred_at).toISOString();
+  let occurredAt = new Date(record.occurred_at).toISOString();
   // custom policyの変更だけでrevisionを増やさないよう、source変更検知はbuilt-in適用後（custom適用前）で固定する。
   const contentHash = sha256Hex(redactConversationText(record.text));
   const stored = getStoredMessage(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id);
@@ -309,7 +344,14 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
       ctx.confirmedUserInputs.push({ sourceMessageId: record.source_message_id, revision, sequenceNo });
     }
   } else {
-    if (stored.role !== record.role || stored.occurred_at !== occurredAt) {
+    if (stored.role !== record.role) {
+      recordDiagnostic(ctx.state, ctx.namespace, 'message_identity_conflict', byteOffset);
+      return;
+    }
+    // turn hookにはagent側timestampがないため初回観測時刻を固定し、後続backfillのログ時刻では変更しない。
+    if (ctx.source === 'codex' && record.source_message_id.startsWith('turn:')) {
+      occurredAt = stored.occurred_at;
+    } else if (stored.occurred_at !== occurredAt) {
       recordDiagnostic(ctx.state, ctx.namespace, 'message_identity_conflict', byteOffset);
       return;
     }
@@ -367,9 +409,7 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
       return;
     }
     if (!isSupportedTranscriptVersion(ctx.source, record.transcript_version)) {
-      ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
-      ctx.held = true;
-      return;
+      recordDiagnostic(ctx.state, ctx.namespace, 'transcript_unverified_version', byteOffset);
     }
     // 確認済みsession_metaの時点でsessionを作成し、発言ゼロでも対応版とscope/project束縛を残す。
     if (!ctx.sessionExists) {
@@ -385,13 +425,14 @@ function processRecord(ctx: IngestContext, record: TranscriptRecord, byteOffset:
     return;
   }
   const version = record.transcript_version ?? ctx.version;
-  if (version === null || !isSupportedTranscriptVersion(ctx.source, version)) {
-    // 未知版は本文を取り込まず、cursorも進めず保留する。
-    ctx.heldDiagnostic = { code: 'transcript_unknown_version', byteOffset };
-    ctx.held = true;
-    return;
+  if (version === null) {
+    recordDiagnostic(ctx.state, ctx.namespace, 'transcript_missing_version', byteOffset);
+  } else {
+    if (!isSupportedTranscriptVersion(ctx.source, version)) {
+      recordDiagnostic(ctx.state, ctx.namespace, 'transcript_unverified_version', byteOffset);
+    }
+    ctx.version = version;
   }
-  ctx.version = version;
   ingestMessage(ctx, record, byteOffset);
 }
 
@@ -400,6 +441,97 @@ export interface IngestResult {
   projectId?: string;
   // commitで確定したuser発言identity。rollback/保留時は未設定。
   confirmedUserInputs?: Array<{ sourceMessageId: string; revision: number; sequenceNo: number }>;
+}
+
+function upsertRegisteredSource(
+  state: CollectorState,
+  input: { namespace: string; source: EventSource; hook: CollectorHookInput },
+): void {
+  state.db
+    .prepare(
+      `INSERT INTO sources (namespace, source, source_session_id, transcript_path, cwd, registered) VALUES (?, ?, ?, ?, ?, 1)
+       ON CONFLICT (namespace, source, source_session_id, transcript_path)
+       DO UPDATE SET cwd = excluded.cwd, registered = max(sources.registered, excluded.registered)`,
+    )
+    .run(input.namespace, input.source, input.hook.session_id, input.hook.transcript_path, input.hook.cwd);
+}
+
+// Codexの安定hook fieldから1件だけをtransactionへ反映する。timestampは初回観測時に固定する。
+function ingestHookMessage(
+  state: CollectorState,
+  input: {
+    namespace: string;
+    source: EventSource;
+    hook: CollectorHookInput;
+    repository: string;
+    projectId: string;
+    policy: RedactionPolicy;
+    knownSecrets: readonly string[];
+    message: Extract<HookMessageSelection, { kind: 'message' }>;
+  },
+): IngestResult {
+  if (!isStorableIdentifier(input.hook.session_id)) {
+    recordDiagnostic(state, input.namespace, 'session_invalid_identifier', NO_OFFSET);
+    return { held: true };
+  }
+  if (!isStorableIdentifier(input.repository)) {
+    recordDiagnostic(state, input.namespace, 'scope_invalid_identifier', NO_OFFSET);
+    return { held: true };
+  }
+  const existing = getSession(state, input.namespace, input.source, input.hook.session_id);
+  if (existing !== undefined && (existing.source_scope !== input.repository || existing.project_id !== input.projectId)) {
+    recordDiagnostic(state, input.namespace, 'source_project_reassignment', NO_OFFSET);
+    return { held: true, projectId: existing.project_id };
+  }
+
+  upsertRegisteredSource(state, input);
+  state.db.exec('BEGIN IMMEDIATE');
+  try {
+    const session = getSession(state, input.namespace, input.source, input.hook.session_id);
+    if (session !== undefined && (session.source_scope !== input.repository || session.project_id !== input.projectId)) {
+      recordDiagnostic(state, input.namespace, 'source_project_reassignment', NO_OFFSET);
+      state.db.exec('COMMIT');
+      return { held: true, projectId: session.project_id };
+    }
+    const stored = getStoredMessage(state, input.namespace, input.source, input.hook.session_id, input.message.sourceMessageId);
+    const ctx: IngestContext = {
+      state,
+      namespace: input.namespace,
+      source: input.source,
+      hook: input.hook,
+      repository: input.repository,
+      projectId: input.projectId,
+      policy: input.policy,
+      knownSecrets: input.knownSecrets,
+      version: session?.transcript_version ?? null,
+      nextSequence: session?.next_sequence ?? 1,
+      sessionExists: session !== undefined,
+      held: false,
+      confirmedUserInputs: [],
+      heldDiagnostic: null,
+    };
+    ingestMessage(
+      ctx,
+      {
+        kind: 'message',
+        source_session_id: input.hook.session_id,
+        transcript_version: null,
+        source_message_id: input.message.sourceMessageId,
+        occurred_at: stored?.occurred_at ?? new Date().toISOString(),
+        role: input.message.role,
+        text: input.message.text,
+      },
+      NO_OFFSET,
+    );
+    if (ctx.sessionExists) {
+      updateSessionNextSequence(state, input.namespace, input.source, input.hook.session_id, ctx.nextSequence);
+    }
+    state.db.exec('COMMIT');
+    return { held: false, confirmedUserInputs: ctx.confirmedUserInputs };
+  } catch (error) {
+    state.db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 // 指定transcriptの差分を1トランザクションでcursor・message・outbox・診断へ反映する。
@@ -431,13 +563,7 @@ export function ingestTranscript(
     return { held: true, projectId: existing.project_id };
   }
 
-  state.db
-    .prepare(
-      `INSERT INTO sources (namespace, source, source_session_id, transcript_path, cwd, registered) VALUES (?, ?, ?, ?, ?, 1)
-       ON CONFLICT (namespace, source, source_session_id, transcript_path)
-       DO UPDATE SET cwd = excluded.cwd, registered = max(sources.registered, excluded.registered)`,
-    )
-    .run(input.namespace, input.source, input.hook.session_id, input.hook.transcript_path, input.hook.cwd);
+  upsertRegisteredSource(state, input);
 
   // 読取からcursor commitまでをBEGIN IMMEDIATEで直列化する。cursor/offsetはTX取得後に読む。
   state.db.exec('BEGIN IMMEDIATE');
@@ -499,7 +625,7 @@ export function ingestTranscript(
       }
       if (ctx.sessionExists) {
         updateSessionNextSequence(state, input.namespace, input.source, input.hook.session_id, ctx.nextSequence);
-        if (input.source === 'codex' && ctx.version !== null) {
+        if (ctx.version !== null) {
           updateSessionVersion(state, input.namespace, input.source, input.hook.session_id, ctx.version);
         }
       }
@@ -638,15 +764,33 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
       policy = resolved.policy;
     }
     resolvedTargets.add(resolvedTargetKey(projectId, repository));
-    const result = ingestTranscript(state, {
-      namespace,
-      source: input.source,
-      hook: input.hook,
-      repository,
-      projectId,
-      policy,
-      knownSecrets: input.knownSecrets ?? [],
-    });
+    const hookMessage = selectHookMessage(input.source, input.hook);
+    let result: IngestResult;
+    if (hookMessage.kind === 'message') {
+      result = ingestHookMessage(state, {
+        namespace,
+        source: input.source,
+        hook: input.hook,
+        repository,
+        projectId,
+        policy,
+        knownSecrets: input.knownSecrets ?? [],
+        message: hookMessage,
+      });
+    } else if (hookMessage.kind === 'transcript') {
+      result = ingestTranscript(state, {
+        namespace,
+        source: input.source,
+        hook: input.hook,
+        repository,
+        projectId,
+        policy,
+        knownSecrets: input.knownSecrets ?? [],
+      });
+    } else {
+      upsertRegisteredSource(state, { namespace, source: input.source, hook: input.hook });
+      result = { held: false, confirmedUserInputs: [] };
+    }
     if (result.held) {
       return { confirmedUserInputs: [] };
     }
