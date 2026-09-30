@@ -11,6 +11,11 @@ const hookSchema = z.object({
   session_id: z.string().min(1),
   transcript_path: z.string().min(1),
   cwd: z.string().min(1),
+  hook_event_name: z.string().min(1).optional(),
+  turn_id: z.string().min(1).optional(),
+  prompt: z.string().optional(),
+  stop_hook_active: z.boolean().optional(),
+  last_assistant_message: z.string().nullable().optional(),
 });
 
 // CLIの終了コードは固定。raw error・本文・URL資格情報はstdout/stderrへ出さない。
