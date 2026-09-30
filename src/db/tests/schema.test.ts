@@ -1,6 +1,7 @@
 import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { readFile, readdir } from 'node:fs/promises';
 import { v7 as uuidv7 } from 'uuid';
 import { createPool, requireDatabaseUrl } from '../pool.js';
 import { runMigrations } from '../migrator.js';
@@ -363,6 +364,60 @@ describe('CHECK制約', () => {
       '23514',
       'auth token scope=owner',
     );
+  });
+
+  it('0012適用済みDBの既存tokenを0013でemployee scopeへ移行する', async () => {
+    const databaseName = `yori_token_scope_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    await pool.query(`CREATE DATABASE ${databaseName}`);
+    const legacyUrl = new URL(requireDatabaseUrl());
+    legacyUrl.pathname = `/${databaseName}`;
+    const legacy = createPool(legacyUrl.toString());
+    try {
+      const previousMigrations = [
+        '0001_init.sql',
+        '0002_m3.sql',
+        '0003_m3_response_model.sql',
+        '0004_m4.sql',
+        '0005_m5.sql',
+        '0006_m6.sql',
+        '0007_m7.sql',
+        '0008_m8.sql',
+        '0009_column_names.sql',
+        '0010_custom_redaction.sql',
+        '0011_cursor.sql',
+        '0012_deepseek_harness.sql',
+      ];
+      for (const file of previousMigrations) {
+        await legacy.query(await readFile(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+      }
+      await legacy.query(
+        `CREATE TABLE schema_migrations (
+           version text PRIMARY KEY,
+           applied_at timestamptz NOT NULL DEFAULT now()
+         )`,
+      );
+      for (const file of previousMigrations) {
+        await legacy.query('INSERT INTO schema_migrations (version) VALUES ($1)', [file]);
+      }
+      const companyId = uuidv7();
+      const employeeId = uuidv7();
+      const tokenHash = sha256Bytes('legacy-token');
+      await legacy.query('INSERT INTO companies (id, name) VALUES ($1, $2)', [companyId, 'legacy-company']);
+      await legacy.query('INSERT INTO employees (id, company_id, display_name) VALUES ($1, $2, $3)', [employeeId, companyId, 'legacy-employee']);
+      await legacy.query('INSERT INTO auth_tokens (id, company_id, employee_id, token_hash) VALUES ($1, $2, $3, $4)', [
+        uuidv7(),
+        companyId,
+        employeeId,
+        tokenHash,
+      ]);
+
+      assert.deepEqual(await runMigrations(legacy), ['0013_auth_token_scope.sql']);
+      const migrated = await legacy.query<{ scope: string }>('SELECT scope FROM auth_tokens WHERE token_hash = $1', [tokenHash]);
+      assert.deepEqual(migrated.rows, [{ scope: 'employee' }]);
+    } finally {
+      await legacy.end();
+      await pool.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    }
   });
 
   it('message_revisions.revisionは1以上', async () => {
