@@ -434,7 +434,7 @@ describe('MCP 5 toolの入力契約', () => {
     const result = inputSchemaOf(tools, 'get_search_result');
     assert.equal(result.properties?.wait_ms?.minimum, 0, 'wait_ms下限がHTTP契約と異なる');
     assert.equal(result.properties?.wait_ms?.maximum, 5000, 'wait_ms上限がHTTP契約と異なる');
-    assert.deepEqual(result.properties?.source?.enum, ['codex', 'claude_code']);
+    assert.deepEqual(result.properties?.source?.enum, ['codex', 'claude_code', 'cursor']);
     assert.equal(result.properties?.input_id?.format, 'uuid');
 
     const evidence = inputSchemaOf(tools, 'get_evidence');
