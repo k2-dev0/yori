@@ -3,6 +3,7 @@ import {
   MAX_REVISION,
   MAX_WAIT_MS,
   collectorSetupRequestSchema,
+  employeeCreateRequestSchema,
   tokenIssueRequestSchema,
   eventsRequestSchema,
   normalizedUuid,
@@ -16,6 +17,7 @@ import {
 import {
   collectorSetupResponseSchema,
   companyResponseSchema,
+  employeeCreateResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -176,6 +178,15 @@ function buildPaths(): JsonObject {
         responses: [success('200', 'CompanyResponse'), ...errorResponses(['401', '403', '500'])],
       }),
     },
+    '/v1/employees': {
+      post: buildOperation({
+        operationId: 'createEmployee',
+        summary: 'company adminが自社employeeを作成する',
+        secured: true,
+        requestComponent: 'EmployeeCreateRequest',
+        responses: [success('201', 'EmployeeCreateResponse'), ...errorResponses(['400', '401', '403', '413', '500'])],
+      }),
+    },
     '/v1/employees/{employee_id}/tokens': {
       post: buildOperation({
         operationId: 'issueEmployeeToken',
@@ -293,6 +304,7 @@ export function buildOpenApiDocument(): JsonObject {
   const componentSchemas: JsonObject = {
     EventsRequest: toOpenApiSchema(eventsRequestSchema, 'input'),
     ProjectRegistrationRequest: toOpenApiSchema(projectRegistrationRequestSchema, 'input'),
+    EmployeeCreateRequest: toOpenApiSchema(employeeCreateRequestSchema, 'input'),
     TokenIssueRequest: toOpenApiSchema(tokenIssueRequestSchema, 'input'),
     CollectorSetupRequest: toOpenApiSchema(collectorSetupRequestSchema, 'input'),
     SearchRequest: toOpenApiSchema(searchRequestSchema, 'input'),
@@ -302,6 +314,7 @@ export function buildOpenApiDocument(): JsonObject {
     ErrorResponse: toOpenApiSchema(errorResponseSchema, 'output'),
     EventsResponse: toOpenApiSchema(eventsResponseSchema, 'output'),
     ProjectRegistrationResponse: toOpenApiSchema(projectRegistrationResponseSchema, 'output'),
+    EmployeeCreateResponse: toOpenApiSchema(employeeCreateResponseSchema, 'output'),
     MeResponse: toOpenApiSchema(meResponseSchema, 'output'),
     CompanyResponse: toOpenApiSchema(companyResponseSchema, 'output'),
     TokenIssueResponse: toOpenApiSchema(tokenIssueResponseSchema, 'output'),
