@@ -33,12 +33,19 @@ test('buildが単一file artifactとversion/checksum付きmanifestを生成す�
     version?: unknown;
     file?: unknown;
     checksum?: unknown;
+    git_sha?: unknown;
   };
-  const packageJson = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')) as { version?: string };
+  const packageJson = JSON.parse(readFileSync(path.join(REPO_ROOT, 'src', 'collector', 'package.json'), 'utf8')) as { version?: string };
   assert.equal(typeof manifest.version, 'string', 'manifest.versionがない');
   assert.ok((manifest.version as string).length > 0, 'manifest.versionが空');
-  assert.equal(manifest.version, packageJson.version, 'manifest.versionがpackage.jsonと一致しない');
+  assert.notEqual(manifest.version, '0.0.0', 'collector versionがyori本体のplaceholder versionを使っている');
+  assert.equal(manifest.version, packageJson.version, 'manifest.versionがcollector package.jsonと一致しない');
   assert.equal(manifest.file, path.basename(ARTIFACT_PATH), 'manifest.fileがartifact名と一致しない');
+
+  const git = spawnSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: REPO_ROOT, encoding: 'utf8' });
+  assert.equal(git.status, 0, `Git SHAを取得できない: ${git.stderr}`);
+  assert.match(String(manifest.git_sha), /^[0-9a-f]{40}$/, 'manifest.git_shaが40桁Git SHAでない');
+  assert.equal(manifest.git_sha, git.stdout.trim(), 'manifest.git_shaがbuild対象HEADと一致しない');
 
   const checksum = createHash('sha256').update(readFileSync(ARTIFACT_PATH)).digest('hex');
   assert.equal(manifest.checksum, checksum, 'manifest.checksumがartifact内容と一致しない');
