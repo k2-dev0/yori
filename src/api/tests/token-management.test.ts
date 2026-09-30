@@ -142,6 +142,131 @@ describe('本人・社員・token管理API', () => {
     assert.equal(errorCode(unauthorized), 'unauthorized');
   });
 
+  it('admin tokenは自社employeeの表示名だけを冪等に変更し、既存tokenと社員IDを維持する', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'before rename');
+    const targetToken = await issueAuthToken(pool, workspace.companyId, targetEmployeeId, 'employee');
+    const tokensBefore = await countRows(pool, 'auth_tokens');
+    const employeeBefore = await pool.query<{ id: string; created_at: Date }>(
+      'SELECT id, created_at FROM employees WHERE id = $1',
+      [targetEmployeeId],
+    );
+
+    for (const displayName of ['after rename', 'after rename']) {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/v1/employees/${targetEmployeeId}`,
+        headers: headers(adminToken, true),
+        payload: { display_name: displayName },
+      });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.deepEqual(response.json(), { status: 'done', employee_id: targetEmployeeId, display_name: displayName });
+    }
+
+    const employeeAfter = await pool.query<{ id: string; display_name: string; created_at: Date }>(
+      'SELECT id, display_name, created_at FROM employees WHERE id = $1',
+      [targetEmployeeId],
+    );
+    assert.equal(employeeAfter.rows[0]!.id, employeeBefore.rows[0]!.id);
+    assert.equal(employeeAfter.rows[0]!.display_name, 'after rename');
+    assert.equal(employeeAfter.rows[0]!.created_at.toISOString(), employeeBefore.rows[0]!.created_at.toISOString());
+    assert.equal(await countRows(pool, 'auth_tokens'), tokensBefore);
+
+    const me = await app.inject({ method: 'GET', url: '/v1/me', headers: headers(targetToken) });
+    assert.equal(me.statusCode, 200, me.body);
+    const targetAccount = meResponseSchema.parse(me.json());
+    assert.equal(targetAccount.employee.employee_id, targetEmployeeId);
+    assert.equal(targetAccount.employee.display_name, 'after rename');
+  });
+
+  it('employee表示名変更は認証・入力・company境界を守り、拒否時にDBを変更しない', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'unchanged');
+    const otherCompanyId = await insertCompany(pool, 'other-company');
+    const otherEmployeeId = await insertEmployee(pool, otherCompanyId, 'other');
+    const missingEmployeeId = '00000000-0000-4000-8000-000000000000';
+    const rejectedRequests: Array<{
+      expectedCode: string;
+      expectedStatus: number;
+      headers: Record<string, string>;
+      payload: unknown;
+      url: string;
+    }> = [
+      {
+        expectedCode: 'unauthorized',
+        expectedStatus: 401,
+        headers: { 'content-type': 'application/json' },
+        payload: { display_name: 'unauthorized' },
+        url: `/v1/employees/${targetEmployeeId}`,
+      },
+      {
+        expectedCode: 'forbidden',
+        expectedStatus: 403,
+        headers: headers(workspace.token, true),
+        payload: { display_name: 'forbidden' },
+        url: `/v1/employees/${targetEmployeeId}`,
+      },
+      {
+        expectedCode: 'invalid_request',
+        expectedStatus: 400,
+        headers: headers(adminToken, true),
+        payload: { display_name: '' },
+        url: `/v1/employees/${targetEmployeeId}`,
+      },
+      {
+        expectedCode: 'invalid_request',
+        expectedStatus: 400,
+        headers: headers(adminToken, true),
+        payload: { display_name: 'forged', company_id: workspace.companyId },
+        url: `/v1/employees/${targetEmployeeId}`,
+      },
+      {
+        expectedCode: 'invalid_request',
+        expectedStatus: 400,
+        headers: headers(adminToken, true),
+        payload: { display_name: 'invalid id' },
+        url: '/v1/employees/not-a-uuid',
+      },
+      {
+        expectedCode: 'not_found',
+        expectedStatus: 404,
+        headers: headers(adminToken, true),
+        payload: { display_name: 'cross company' },
+        url: `/v1/employees/${otherEmployeeId}`,
+      },
+      {
+        expectedCode: 'not_found',
+        expectedStatus: 404,
+        headers: headers(adminToken, true),
+        payload: { display_name: 'missing' },
+        url: `/v1/employees/${missingEmployeeId}`,
+      },
+    ];
+
+    for (const request of rejectedRequests) {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: request.url,
+        headers: request.headers,
+        payload: request.payload,
+      });
+      assert.equal(response.statusCode, request.expectedStatus, `${request.url}: ${response.body}`);
+      assert.equal(errorCode(response), request.expectedCode);
+    }
+
+    const employees = await pool.query<{ id: string; display_name: string }>(
+      'SELECT id, display_name FROM employees WHERE id = ANY($1::uuid[]) ORDER BY id',
+      [[targetEmployeeId, otherEmployeeId]],
+    );
+    assert.deepEqual(
+      employees.rows,
+      [
+        { id: targetEmployeeId, display_name: 'unchanged' },
+        { id: otherEmployeeId, display_name: 'other' },
+      ].sort((left, right) => left.id.localeCompare(right.id)),
+    );
+  });
+
   it('admin tokenは同じcompanyだけを一覧し、通常/admin tokenを発行して冪等に失効する', async () => {
     const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
     const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
