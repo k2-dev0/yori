@@ -15,7 +15,7 @@ import {
 } from '../../db/tests/fixtures.js';
 
 // 認証済みcollector setup API。canonical repositoryから、tokenのemployeeがmemberである同一会社projectを解決し、
-// current redaction policyを返す。0件・別会社・非memberは存在を開示せず404、unknown field/不正repositoryは400。
+// current redaction policyを返す。0件・別会社は存在を開示せず404、unknown field/不正repositoryは400。
 
 const pool = createPool(requireDatabaseUrl());
 const app = buildApp({ pool });
