@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -125,7 +125,7 @@ function isSetup(request: CapturedRequest): boolean {
   return request.url === `${API_URL}/v1/collector/setup`;
 }
 
-describe('collector backfill', () => {
+describe('collector backfill', { concurrency: false }, () => {
   it('dry-runは3sourceを探索し、本文・path・IDを出さずHTTP/SQLiteを変更しない', async () => {
     const fixture = await createCollectorFixture();
     const home = path.join(fixture.root, 'home');
@@ -133,7 +133,8 @@ describe('collector backfill', () => {
     process.env.HOME = home;
     const mock = installFetchMock(ackResponse);
     try {
-      const { secret, sessionId } = await installHistory(home, fixture.repoDir);
+      const { secret, sessionId } = await installHistory(home, realpathSync(fixture.repoDir));
+      process.env.HOME = home;
       const summary = await backfillCollector({
         repository: fixture.repoDir,
         config: buildCollectorConfig({ state_dir: fixture.stateDir }),
@@ -172,7 +173,7 @@ describe('collector backfill', () => {
     const projectId = randomUUID();
     const mock = installFetchMock((request) => (isSetup(request) ? setupResponse(projectId) : ackResponse(request)));
     try {
-      await installHistory(home, fixture.repoDir);
+      await installHistory(home, realpathSync(fixture.repoDir));
       const input = {
         repository: fixture.repoDir,
         config: buildCollectorConfig({ state_dir: fixture.stateDir }),
@@ -181,7 +182,9 @@ describe('collector backfill', () => {
         dryRun: false as const,
         source: 'deepseek_harness' as const,
       };
+      process.env.HOME = home;
       const first = await backfillCollector(input);
+      process.env.HOME = home;
       const second = await backfillCollector(input);
 
       assert.equal(first.status, 'completed');
@@ -207,7 +210,7 @@ describe('collector backfill', () => {
     const fixture = await createCollectorFixture();
     const home = path.join(fixture.root, 'home');
     try {
-      await installHistory(home, fixture.repoDir);
+      await installHistory(home, realpathSync(fixture.repoDir));
       const configPath = path.join(fixture.root, 'collector.json');
       await writeFile(configPath, JSON.stringify(buildCollectorConfig({ state_dir: fixture.stateDir })), 'utf8');
       for (const source of [undefined, 'codex', 'claude_code', 'deepseek_harness'] as const) {
