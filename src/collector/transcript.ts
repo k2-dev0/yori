@@ -13,6 +13,8 @@ export interface TranscriptMessageRecord {
   source_message_id: string;
   occurred_at: string;
   role: 'user' | 'assistant';
+  model_id?: string;
+  client_version?: string;
   text: string;
 }
 
