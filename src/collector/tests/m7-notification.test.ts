@@ -275,6 +275,16 @@ async function runNotify(fixture: NotificationFixture, options: { token?: string
   });
 }
 
+async function runNotifyLate(fixture: NotificationFixture, options: { token?: string; homeDir?: string } = {}) {
+  return runCollectorCli(['notify-late', '--source', 'codex', '--config', fixture.configPath], {
+    stdin: JSON.stringify(fixture.hook),
+    env: {
+      YORI_TEST_TOKEN: options.token ?? 'token-a',
+      ...(options.homeDir === undefined ? {} : { HOME: options.homeDir }),
+    },
+  });
+}
+
 describe('M7 collector補助通知', () => {
   it('collect後に最新user message identityでby-inputを呼び、完了結果を追加contextとして返す', async () => {
     const token = `TOKEN-${randomUUID()}`;
@@ -310,8 +320,7 @@ describe('M7 collector補助通知', () => {
             assert.equal(params.get('source_session_id'), 'session-1');
             assert.equal(params.get('source_message_id'), 'turn:turn-1:user', 'turn identityを使っていない');
             assert.equal(params.get('revision'), '1');
-            const waitMs = Number(params.get('wait_ms'));
-            assert.ok(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 5_000, `wait_msが1回5秒を超えている: ${params.get('wait_ms')}`);
+            assert.equal(params.get('wait_ms'), '3000', 'fast pathが3秒待機ではない');
             assert.ok(JSON.stringify(central.requests).includes('現在の質問本文'), 'hookのprompt本文を収集していない');
           });
         },
@@ -595,7 +604,7 @@ describe('M7 collector補助通知', () => {
     );
   });
 
-  it('by-inputのtimeoutは最大5秒×2・累計10秒で打ち切り、無出力で終了する', async () => {
+  it('fast pathは最大3秒で打ち切り、検索結果の配信待ちを破棄しない', async () => {
     await withCentral(
       () => ({ hang: true }),
       async (central) => {
@@ -605,13 +614,38 @@ describe('M7 collector補助通知', () => {
           const elapsed = Date.now() - started;
           assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
           assert.equal(result.stdout.trim(), '', 'timeoutで追加contextを出力している');
-          assert.ok(central.byInputRequests.length <= 2, `by-inputを3回以上呼んでいる: ${central.byInputRequests.length}`);
-          assert.ok(elapsed <= 14_000, `累計10秒を大きく超えて待機している: ${elapsed}ms`);
-          if (central.byInputRequests.length === 2) {
-            const second = central.byInputRequests[1] as RecordedHttpRequest;
-            const first = central.byInputRequests[0] as RecordedHttpRequest;
-            assert.ok(second.receivedAt - first.receivedAt >= 4_000, '1回5秒の待機前に再試行している');
-          }
+          assert.equal(central.byInputRequests.length, 1, `fast pathが複数回待機している: ${central.byInputRequests.length}`);
+          assert.equal(queryParams(central.byInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '3000');
+          assert.ok(elapsed >= 2_500, `3秒待機より早く終了している: ${elapsed}ms`);
+          assert.ok(elapsed <= 5_000, `3秒を大きく超えて待機している: ${elapsed}ms`);
+        });
+      },
+    );
+  });
+
+  it('fast pathで未完了の結果をlate通知が後から一度だけ配信する', async () => {
+    let lookupCount = 0;
+    await withCentral(
+      () => {
+        lookupCount += 1;
+        if (lookupCount === 1) {
+          return { status: 200, body: searchView({ status: 'running', outcome: null, matches: [] }) };
+        }
+        return { status: 200, body: searchView() };
+      },
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const immediate = await runNotify(fixture);
+          assert.equal(immediate.code, 0, `notifyが失敗した: ${immediate.stderr}`);
+          assert.equal(immediate.stdout.trim(), '', '未完了結果をfast pathで出力している');
+
+          const late = await runNotifyLate(fixture);
+          assert.equal(late.code, 0, `notify-lateが失敗した: ${late.stderr}`);
+          assert.ok(hookContext(late.stdout).includes('M7-EVIDENCE-TEXT'), 'late結果を追加contextへ出力していない');
+
+          const duplicate = await runNotifyLate(fixture);
+          assert.equal(duplicate.code, 0, `notify-late再実行が失敗した: ${duplicate.stderr}`);
+          assert.equal(duplicate.stdout.trim(), '', '同じ検索結果を二重配信している');
         });
       },
     );
