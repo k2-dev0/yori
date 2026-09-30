@@ -89,6 +89,13 @@ export const companyResponseSchema = z.strictObject({
   tokens: z.array(tokenMetadataResponseSchema),
 });
 
+export const employeeCreateResponseSchema = z.strictObject({
+  status: z.literal('done'),
+  employee_id: z.uuid(),
+  display_name: storableString,
+  created_at: occurredAtSchema,
+});
+
 export const tokenIssueResponseSchema = z.strictObject({
   status: z.literal('done'),
   token_id: z.uuid(),
@@ -208,6 +215,7 @@ export type EventsResponse = z.infer<typeof eventsResponseSchema>;
 export type ProjectRegistrationResponse = z.infer<typeof projectRegistrationResponseSchema>;
 export type MeResponse = z.infer<typeof meResponseSchema>;
 export type CompanyResponse = z.infer<typeof companyResponseSchema>;
+export type EmployeeCreateResponse = z.infer<typeof employeeCreateResponseSchema>;
 export type TokenIssueResponse = z.infer<typeof tokenIssueResponseSchema>;
 export type TokenRevokeResponse = z.infer<typeof tokenRevokeResponseSchema>;
 export type SearchView = z.infer<typeof searchViewResponseSchema>;
