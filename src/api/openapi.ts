@@ -4,6 +4,7 @@ import {
   MAX_WAIT_MS,
   collectorSetupRequestSchema,
   employeeCreateRequestSchema,
+  employeeRenameRequestSchema,
   tokenIssueRequestSchema,
   eventsRequestSchema,
   normalizedUuid,
@@ -18,6 +19,7 @@ import {
   collectorSetupResponseSchema,
   companyResponseSchema,
   employeeCreateResponseSchema,
+  employeeRenameResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -187,6 +189,16 @@ function buildPaths(): JsonObject {
         responses: [success('201', 'EmployeeCreateResponse'), ...errorResponses(['400', '401', '403', '413', '500'])],
       }),
     },
+    '/v1/employees/{employee_id}': {
+      patch: buildOperation({
+        operationId: 'renameEmployee',
+        summary: 'company adminが同じ会社の社員表示名を変更する',
+        secured: true,
+        parameters: [parameter('employee_id', 'path', true, uuid)],
+        requestComponent: 'EmployeeRenameRequest',
+        responses: [success('200', 'EmployeeRenameResponse'), ...errorResponses(['400', '401', '403', '404', '413', '500'])],
+      }),
+    },
     '/v1/employees/{employee_id}/tokens': {
       post: buildOperation({
         operationId: 'issueEmployeeToken',
@@ -305,6 +317,7 @@ export function buildOpenApiDocument(): JsonObject {
     EventsRequest: toOpenApiSchema(eventsRequestSchema, 'input'),
     ProjectRegistrationRequest: toOpenApiSchema(projectRegistrationRequestSchema, 'input'),
     EmployeeCreateRequest: toOpenApiSchema(employeeCreateRequestSchema, 'input'),
+    EmployeeRenameRequest: toOpenApiSchema(employeeRenameRequestSchema, 'input'),
     TokenIssueRequest: toOpenApiSchema(tokenIssueRequestSchema, 'input'),
     CollectorSetupRequest: toOpenApiSchema(collectorSetupRequestSchema, 'input'),
     SearchRequest: toOpenApiSchema(searchRequestSchema, 'input'),
@@ -315,6 +328,7 @@ export function buildOpenApiDocument(): JsonObject {
     EventsResponse: toOpenApiSchema(eventsResponseSchema, 'output'),
     ProjectRegistrationResponse: toOpenApiSchema(projectRegistrationResponseSchema, 'output'),
     EmployeeCreateResponse: toOpenApiSchema(employeeCreateResponseSchema, 'output'),
+    EmployeeRenameResponse: toOpenApiSchema(employeeRenameResponseSchema, 'output'),
     MeResponse: toOpenApiSchema(meResponseSchema, 'output'),
     CompanyResponse: toOpenApiSchema(companyResponseSchema, 'output'),
     TokenIssueResponse: toOpenApiSchema(tokenIssueResponseSchema, 'output'),
