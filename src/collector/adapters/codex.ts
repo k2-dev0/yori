@@ -4,6 +4,10 @@ import type { TranscriptRecord } from '../transcript.js';
 // 外部CLI版0.156.1とは別物として扱う。
 export const SUPPORTED_CODEX_CLI_VERSIONS: readonly string[] = ['0.155.0-alpha.9.2', '0.155.0-alpha.16.4'];
 
+export function codexTurnMessageId(turnId: string, role: 'user' | 'assistant'): string {
+  return `turn:${turnId}:${role}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -87,11 +91,16 @@ export function parseCodexTranscriptLine(line: string): TranscriptRecord {
   }
   if (item.type === 'UserMessage') {
     const text = extractText(item.content, 'text');
-    return text === null ? { kind: 'ignored' } : buildMessage(payload.thread_id, item.id, value.timestamp, 'user', text);
+    const messageId = typeof payload.turn_id === 'string' ? codexTurnMessageId(payload.turn_id, 'user') : item.id;
+    return text === null ? { kind: 'ignored' } : buildMessage(payload.thread_id, messageId, value.timestamp, 'user', text);
   }
   if (item.type === 'AgentMessage') {
+    if (item.phase !== 'final_answer') {
+      return { kind: 'ignored' };
+    }
     const text = extractText(item.content, 'Text');
-    return text === null ? { kind: 'ignored' } : buildMessage(payload.thread_id, item.id, value.timestamp, 'assistant', text);
+    const messageId = typeof payload.turn_id === 'string' ? codexTurnMessageId(payload.turn_id, 'assistant') : item.id;
+    return text === null ? { kind: 'ignored' } : buildMessage(payload.thread_id, messageId, value.timestamp, 'assistant', text);
   }
   return { kind: 'ignored' };
 }
