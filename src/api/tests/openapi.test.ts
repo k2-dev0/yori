@@ -70,7 +70,7 @@ interface OpenApiDocument {
 
 interface RouteContract {
   path: string;
-  method: 'get' | 'post';
+  method: 'get' | 'put' | 'post';
   secured: boolean;
   success: string[];
   errors: string[];
@@ -83,6 +83,26 @@ interface RouteContract {
 const ROUTES: RouteContract[] = [
   { path: '/health/live', method: 'get', secured: false, success: ['200'], errors: ['500'], pathParams: [], queryParams: [], hasBody: false },
   { path: '/health/ready', method: 'get', secured: false, success: ['200'], errors: ['503'], pathParams: [], queryParams: [], hasBody: false },
+  {
+    path: '/v1/projects',
+    method: 'post',
+    secured: true,
+    success: ['200', '201'],
+    errors: ['400', '401', '409', '413', '500'],
+    pathParams: [],
+    queryParams: [],
+    hasBody: true,
+  },
+  {
+    path: '/v1/projects/{project_id}/members/{employee_id}',
+    method: 'put',
+    secured: true,
+    success: ['200'],
+    errors: ['400', '401', '403', '404', '500'],
+    pathParams: ['project_id', 'employee_id'],
+    queryParams: [],
+    hasBody: false,
+  },
   {
     path: '/v1/events',
     method: 'post',
@@ -165,7 +185,7 @@ const ROUTES: RouteContract[] = [
   },
 ];
 
-const ERROR_CODES = ['invalid_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'payload_too_large', 'internal_error', 'suspected_secret'];
+const ERROR_CODES = ['invalid_request', 'unauthorized', 'forbidden', 'not_found', 'conflict', 'repository_conflict', 'payload_too_large', 'internal_error', 'suspected_secret'];
 
 interface GeneratedOpenApi {
   json: string;
@@ -268,7 +288,7 @@ function effectiveSecurity(document: OpenApiDocument, pathItem: OpenApiPathItem,
 }
 
 describe('OpenAPI 3.1契約の生成', () => {
-  it('OpenAPI 3.1として9 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
+  it('OpenAPI 3.1として11 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
     const { document } = await generatedOpenApi();
     assert.match(String(document.openapi), /^3\.1\.\d+$/, 'OpenAPI 3.1.xではない');
     assert.equal(document.info?.version, '1.0.0', 'API契約版が1.0.0ではない');
