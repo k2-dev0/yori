@@ -3,8 +3,10 @@ import {
   MAX_REVISION,
   MAX_WAIT_MS,
   collectorSetupRequestSchema,
+  tokenIssueRequestSchema,
   eventsRequestSchema,
   normalizedUuid,
+  projectRegistrationRequestSchema,
   revisionSchema,
   searchByInputBranchSchemas,
   searchRequestSchema,
@@ -13,15 +15,20 @@ import {
 } from './schema.js';
 import {
   collectorSetupResponseSchema,
+  companyResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
   healthLiveResponseSchema,
   healthReadyResponseSchema,
+  meResponseSchema,
+  projectRegistrationResponseSchema,
   searchAcceptedResponseSchema,
   searchLookupResponseSchema,
   searchViewResponseSchema,
   sessionLinkResponseSchema,
+  tokenIssueResponseSchema,
+  tokenRevokeResponseSchema,
 } from './response-schema.js';
 
 // yori HTTP APIのOpenAPI 3.1文書を、実行時契約のZod schemaから決定的に生成する。
@@ -96,7 +103,7 @@ function propertySchemasOf(schema: JsonObject): Record<string, JsonObject> {
   return typeof properties === 'object' && properties !== null ? (properties as Record<string, JsonObject>) : {};
 }
 
-// 9 routeを計画4節のmethod・path・statusで固定する。実装が返さないstatusは追加しない。
+// routeをmethod・path・statusで固定する。実装が返さないstatusは追加しない。
 function buildPaths(): JsonObject {
   const uuid = toOpenApiSchema(normalizedUuid, 'input');
   // query parameterはwireが文字列でも、意味上のschemaは整数の範囲として表す。
@@ -153,6 +160,41 @@ function buildPaths(): JsonObject {
         responses: [success('200', 'HealthReadyResponse'), success('503', 'HealthReadyResponse')],
       }),
     },
+    '/v1/me': {
+      get: buildOperation({
+        operationId: 'getMe',
+        summary: '本人・現在token・会社projectのmetadataを返す',
+        secured: true,
+        responses: [success('200', 'MeResponse'), ...errorResponses(['401', '500'])],
+      }),
+    },
+    '/v1/company': {
+      get: buildOperation({
+        operationId: 'getCompany',
+        summary: 'company adminへ会社・社員・project・token metadataを返す',
+        secured: true,
+        responses: [success('200', 'CompanyResponse'), ...errorResponses(['401', '403', '500'])],
+      }),
+    },
+    '/v1/employees/{employee_id}/tokens': {
+      post: buildOperation({
+        operationId: 'issueEmployeeToken',
+        summary: 'company adminが同じ会社の社員へtokenを発行する',
+        secured: true,
+        parameters: [parameter('employee_id', 'path', true, uuid)],
+        requestComponent: 'TokenIssueRequest',
+        responses: [success('201', 'TokenIssueResponse'), ...errorResponses(['400', '401', '403', '404', '413', '500'])],
+      }),
+    },
+    '/v1/tokens/{token_id}': {
+      delete: buildOperation({
+        operationId: 'revokeToken',
+        summary: 'company adminが同じ会社のtokenを失効する',
+        secured: true,
+        parameters: [parameter('token_id', 'path', true, uuid)],
+        responses: [success('200', 'TokenRevokeResponse'), ...errorResponses(['400', '401', '403', '404', '409', '500'])],
+      }),
+    },
     '/v1/events': {
       post: buildOperation({
         operationId: 'createEvents',
@@ -160,6 +202,19 @@ function buildPaths(): JsonObject {
         secured: true,
         requestComponent: 'EventsRequest',
         responses: [success('202', 'EventsResponse'), ...errorResponses(['400', '401', '403', '409', '413', '500'])],
+      }),
+    },
+    '/v1/projects': {
+      post: buildOperation({
+        operationId: 'createProject',
+        summary: '認証社員の会社へcanonical repository projectを登録する',
+        secured: true,
+        requestComponent: 'ProjectRegistrationRequest',
+        responses: [
+          success('200', 'ProjectRegistrationResponse'),
+          success('201', 'ProjectRegistrationResponse'),
+          ...errorResponses(['400', '401', '409', '413', '500']),
+        ],
       }),
     },
     '/v1/searches': {
@@ -237,6 +292,8 @@ function buildPaths(): JsonObject {
 export function buildOpenApiDocument(): JsonObject {
   const componentSchemas: JsonObject = {
     EventsRequest: toOpenApiSchema(eventsRequestSchema, 'input'),
+    ProjectRegistrationRequest: toOpenApiSchema(projectRegistrationRequestSchema, 'input'),
+    TokenIssueRequest: toOpenApiSchema(tokenIssueRequestSchema, 'input'),
     CollectorSetupRequest: toOpenApiSchema(collectorSetupRequestSchema, 'input'),
     SearchRequest: toOpenApiSchema(searchRequestSchema, 'input'),
     SessionLinkRequest: toOpenApiSchema(sessionLinkRequestSchema, 'input'),
@@ -244,6 +301,11 @@ export function buildOpenApiDocument(): JsonObject {
     HealthReadyResponse: toOpenApiSchema(healthReadyResponseSchema, 'output'),
     ErrorResponse: toOpenApiSchema(errorResponseSchema, 'output'),
     EventsResponse: toOpenApiSchema(eventsResponseSchema, 'output'),
+    ProjectRegistrationResponse: toOpenApiSchema(projectRegistrationResponseSchema, 'output'),
+    MeResponse: toOpenApiSchema(meResponseSchema, 'output'),
+    CompanyResponse: toOpenApiSchema(companyResponseSchema, 'output'),
+    TokenIssueResponse: toOpenApiSchema(tokenIssueResponseSchema, 'output'),
+    TokenRevokeResponse: toOpenApiSchema(tokenRevokeResponseSchema, 'output'),
     CollectorSetupResponse: toOpenApiSchema(collectorSetupResponseSchema, 'output'),
     SearchAcceptedResponse: toOpenApiSchema(searchAcceptedResponseSchema, 'output'),
     SearchViewResponse: toOpenApiSchema(searchViewResponseSchema, 'output'),
