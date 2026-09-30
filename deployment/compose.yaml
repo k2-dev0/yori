@@ -18,6 +18,7 @@ x-node-service: &node-service
     <<: *database-environment
     API_HOST: 0.0.0.0
     API_PORT: "3210"
+    YORI_RELEASE_SHA: ${YORI_RELEASE_SHA:?required}
   depends_on:
     db:
       condition: service_healthy
@@ -88,6 +89,7 @@ services:
       - test -x node_modules/.bin/tsx || npm ci --no-audit --no-fund; exec ./node_modules/.bin/tsx src/worker/cli.ts start
     environment:
       <<: *database-environment
+      YORI_RELEASE_SHA: ${YORI_RELEASE_SHA:?required}
       JEV_API_KEY: ${JEV_API_KEY:?required}
       JEV_ACCOUNT_REF: ${JEV_ACCOUNT_REF:?required}
       JEV_API_URL: ${JEV_API_URL:?required}
