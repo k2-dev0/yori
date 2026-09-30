@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import { DEFAULT_JOB_LEASE_MS, claimJobs, recoverExpiredJobs, renewJobLease, type ClaimedJob, type JobKind } from '../jobs/queue.js';
+import { DEFAULT_JOB_LEASE_MS, claimJobs, recoverDocumentBuilds, recoverExpiredJobs, renewJobLease, type ClaimedJob, type JobKind } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import { processJob } from './process.js';
 
@@ -78,6 +78,7 @@ export async function runWorker(options: RunWorkerOptions): Promise<void> {
     while (!signal.aborted) {
       try {
         await recoverExpiredJobs(options.pool);
+        await recoverDocumentBuilds(options.pool);
       } catch (error) {
         console.error(`worker: 期限切れjobの回収失敗: ${errorName(error)}`);
       }
