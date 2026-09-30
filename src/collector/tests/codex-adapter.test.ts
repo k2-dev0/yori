@@ -12,7 +12,7 @@ describe('Codex transcriptアダプター', () => {
     });
   });
 
-  it('item_completedのUserMessage/AgentMessageだけを本文・日時付きで返す', () => {
+  it('item_completedのUserMessageとturn最終AgentMessageだけを本文・日時付きで返す', () => {
     assert.deepEqual(
       parseCodexTranscriptLine(
         codexMessageLine({
@@ -35,15 +35,7 @@ describe('Codex transcriptアダプター', () => {
     );
     assert.deepEqual(
       parseCodexTranscriptLine(codexMessageLine({ sessionId: 'session-1', messageId: 'item-commentary', role: 'assistant', text: '途中経過', phase: 'commentary' })),
-      {
-        kind: 'message',
-        source_session_id: 'session-1',
-        transcript_version: null,
-        source_message_id: 'item-commentary',
-        occurred_at: '2026-09-21T00:00:01.000Z',
-        role: 'assistant',
-        text: '途中経過',
-      },
+      { kind: 'ignored' },
     );
     assert.deepEqual(
       parseCodexTranscriptLine(codexMessageLine({ sessionId: 'session-1', messageId: 'item-final', role: 'assistant', text: '最終回答', phase: 'final_answer' })),
@@ -91,7 +83,7 @@ describe('Codex transcriptアダプター', () => {
     }
   });
 
-  it('Desktop確認版のUserMessageとAgentMessage commentary/finalを既存shapeで返し、追加fieldを混入しない', () => {
+  it('Desktop確認版のUserMessageとfinal AgentMessageをturn identityで返し、commentaryと追加fieldを混入しない', () => {
     const lines = [
       JSON.stringify({
         timestamp: '2026-09-21T00:00:01.000Z',
@@ -117,6 +109,7 @@ describe('Codex transcriptアダプター', () => {
         payload: {
           type: 'item_completed',
           thread_id: 'session-1',
+          turn_id: 'FIXTURE_TURN_ID',
           item: {
             id: 'item-commentary',
             type: 'AgentMessage',
@@ -135,6 +128,7 @@ describe('Codex transcriptアダプター', () => {
         payload: {
           type: 'item_completed',
           thread_id: 'session-1',
+          turn_id: 'FIXTURE_TURN_ID',
           item: { id: 'item-final', type: 'AgentMessage', phase: 'final_answer', content: [{ type: 'Text', text: 'fixture-assistant-final-text' }] },
         },
       }),
@@ -143,25 +137,17 @@ describe('Codex transcriptアダプター', () => {
       kind: 'message',
       source_session_id: 'session-1',
       transcript_version: null,
-      source_message_id: 'item-user',
+      source_message_id: 'turn:FIXTURE_TURN_ID:user',
       occurred_at: '2026-09-21T00:00:01.000Z',
       role: 'user',
       text: 'fixture-user-text',
     });
-    assert.deepEqual(parseCodexTranscriptLine(lines[1]), {
-      kind: 'message',
-      source_session_id: 'session-1',
-      transcript_version: null,
-      source_message_id: 'item-commentary',
-      occurred_at: '2026-09-21T00:00:02.000Z',
-      role: 'assistant',
-      text: 'fixture-assistant-commentary-text',
-    });
+    assert.deepEqual(parseCodexTranscriptLine(lines[1]), { kind: 'ignored' });
     assert.deepEqual(parseCodexTranscriptLine(lines[2]), {
       kind: 'message',
       source_session_id: 'session-1',
       transcript_version: null,
-      source_message_id: 'item-final',
+      source_message_id: 'turn:FIXTURE_TURN_ID:assistant',
       occurred_at: '2026-09-21T00:00:03.000Z',
       role: 'assistant',
       text: 'fixture-assistant-final-text',
