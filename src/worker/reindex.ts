@@ -418,6 +418,11 @@ async function applyEmbeddings(
       await client.query('ROLLBACK');
       return 0;
     }
+    // 原文/分類の更新triggerと同じsession状態を先にlockし、公開解除と再公開を直列化する。
+    await client.query(
+      `SELECT b.session_id FROM document_build_states b
+       WHERE b.session_id IN (SELECT d.session_id FROM search_documents d WHERE d.id = ANY($1::uuid[]))
+       ORDER BY b.session_id FOR UPDATE`, [input.items.map((item) => item.id)]);
     let applied = 0;
     for (let index = 0; index < input.items.length; index += 1) {
       const item = input.items[index];
@@ -449,14 +454,13 @@ async function applyEmbeddings(
       ) {
         continue;
       }
-      // 出典の現行性をM4 applyと同じFOR SHAREで再検証する。source消失・改訂済みmessageは公開しない。
+      // session状態lock中は更新triggerのcommitが待機するため、messageへの逆順lockを避ける。
       const sources = await client.query<{ message_id: string; message_revision: number; current_revision: number }>(
         `SELECT s.message_id, s.message_revision, m.current_revision
            FROM search_document_sources s
            JOIN messages m ON m.id = s.message_id
           WHERE s.document_id = $1 AND s.document_revision = $2
-          ORDER BY s.display_order
-          FOR SHARE OF m`,
+          ORDER BY s.display_order`,
         [item.id, item.desired_revision],
       );
       if (
@@ -508,7 +512,13 @@ export async function countIncompleteDocuments(
          ON e.document_id = d.id AND e.revision = d.desired_revision AND e.generation_id = $2
        LEFT JOIN document_publications p
          ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = d.desired_revision
-      WHERE d.project_id = $1 AND d.is_searchable AND r.status <> 'excluded'
+      WHERE d.project_id = $1 AND r.status <> 'excluded'
+        AND (d.is_searchable OR EXISTS (
+          SELECT 1 FROM document_build_states b JOIN search_document_sources s ON s.document_id = d.id
+            AND s.document_revision = d.desired_revision
+          JOIN messages m ON m.id = s.message_id
+          WHERE b.session_id = d.session_id AND b.dirty_sequence IS NOT NULL AND m.current_revision <> s.message_revision
+        ))
         AND (e.input_hash IS NULL OR e.input_hash <> r.content_hash OR p.document_id IS NULL OR p.is_stale
              OR NOT EXISTS (
                SELECT 1 FROM search_document_sources s
