@@ -45,6 +45,24 @@ function assertUuidV7(value: unknown): void {
 }
 
 describe('POST /v1/events 正常保存', () => {
+  it('DeepSeek Harnessイベントをsource契約どおり保存する', async () => {
+    const event = {
+      ...buildEventInput({
+        idempotency_key: 'deepseek-harness-1',
+        source_message_id: 'deepseek-message-1',
+        text: 'DeepSeek Harnessの発言',
+      }),
+      source: 'deepseek_harness' as const,
+      source_session_id: 'deepseek-session-1',
+    };
+
+    const response = await postEvents(app, { token: workspace.token, body: { project_id: workspace.projectId, events: [event] } });
+
+    assert.equal(response.statusCode, 202, response.body);
+    const session = await pool.query<{ source: string; source_session_id: string }>('SELECT source, source_session_id FROM sessions');
+    assert.deepEqual(session.rows, [{ source: 'deepseek_harness', source_session_id: 'deepseek-session-1' }]);
+  });
+
   it('Cursorイベントのsourceと選択modelをmessage revisionへ保存する', async () => {
     const event = {
       ...buildEventInput({
