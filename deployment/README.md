@@ -129,8 +129,12 @@ sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.
 更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。
 
 ```sh
+export YORI_RELEASE_SHA=<更新対象の40桁Git SHA>
 sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate
-sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml rm -sf worker api
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait --no-deps api
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait --no-deps worker
+sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --wait --force-recreate --no-deps caddy
 ```
 
 - migrationはforward-onlyで、down migrationは提供しない。適用済みschemaは旧migration fileや旧base imageへ戻しても戻らない。
@@ -142,7 +146,7 @@ sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.
 1. 新しい小文字64桁hexを生成する（`openssl rand -hex 32`）。
 2. `psql`で`ALTER ROLE`を実行し、DB内部のpasswordを変更する。secretは対話SQLで入力し、command line引数やshell historyへ残さない。
 3. `/etc/yori/yori.env`の`YORI_POSTGRES_PASSWORD`を新しい値へ更新する。
-4. `api`・`worker`を`--force-recreate`で再作成し、`migrate` serviceを同じenvで再実行（再作成）する。
+4. `api`・`worker`を`rm -sf`後に個別起動し、`migrate` serviceを同じenvで再実行（再作成）する。
 5. 設定検査とhealthを再確認する。
 
 公式PostgreSQL imageの`POSTGRES_*`は、空のdata directoryを最初に初期化する時だけrole・database・passwordを作る。既存`yori-pgdata`にenv変更だけをしてもDB内部のpasswordは変わらないため、env更新だけをrotation完了と扱わない。
@@ -188,7 +192,7 @@ npm run deploy:production -- <40桁hex SHA> # 指定commitを配布
 | 変数 | 既定 | 用途 |
 |---|---|---|
 | `YORI_DEPLOY_HOST` | `yori-production` | `~/.ssh/config`のSSH alias |
-| `YORI_DEPLOY_HEALTH_URL` | `https://yori-pilot.online/health/ready` | remote成功後に200を確認する公開health URL |
+| `YORI_DEPLOY_HEALTH_URL` | `https://yori-pilot.online/health/ready` | remote成功後にrelease SHA・API契約versionを確認する公開health URL |
 
 - hostは安全なSSH alias文字だけ、targetは40桁hex SHAだけを受理する。URLはhttps固定で、loopback（127.0.0.1・::1・localhost）のhttpだけテスト用途に許可する。
 - secret・password・keyは引数やlogへ出さない。remoteのsecretは`/etc/yori/yori.env`のままで、`docker compose --env-file`だけが読む。
@@ -197,9 +201,9 @@ npm run deploy:production -- <40桁hex SHA> # 指定commitを配布
 
 remote scriptは`/srv/yori/.git`配下のlockを`flock -n`で取り、同時deployを拒否する。lock下ではremote worktreeのdirty確認、`git fetch origin main`、targetの存在・`origin/main`への包含・HEADからのfast-forward可否の確認、`git merge --ff-only`、merge後HEADのtarget一致確認を行う。`git reset`・`git checkout`・force mergeは行わない。
 
-その後、`/etc/yori/yori.env`がroot:root 0600であることを確認し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml`で`config --quiet`、`pull`、`db up -d --wait`、`--profile tools run --rm migrate`、`--profile production up -d --wait --force-recreate --no-deps api worker caddy`の順に実行する。config・pull・db・migrateのどれかが失敗した場合はapi・worker・caddyを再作成しない。`down -v`やvolume削除、schema rollback、`git reset`は行わない。再作成後は`docker compose port api 3210`で得たloopback addressの`/health/ready`が200であることを確認し、compose psとold/new SHAを表示する。secretを含むenvの内容は表示しない。
+その後、`/etc/yori/yori.env`を`sudo stat`し、親`/etc/yori`がroot:root 0700でもenv自体がroot:root 0600であることを確認する。対象SHAを`YORI_RELEASE_SHA`としてComposeへ渡し、`config --quiet`、`pull`、`db up -d --wait`、`--profile tools run --rm migrate`の順に実行する。migration成功後だけ旧api・workerのcontainer IDを取得して`rm -sf worker api`で明示削除し、api・workerを個別起動、caddyを再作成する。新IDが無い、旧IDと同じ、api・worker内の`YORI_RELEASE_SHA`が対象SHAと違う場合は失敗する。config・pull・db・migrateのどれかが失敗した場合はapi・workerを削除しない。`down -v`やvolume削除、schema rollback、`git reset`は行わない。
 
-Mac側はremote成功後だけ`YORI_DEPLOY_HEALTH_URL`を1回確認し、200なら終了0、SSHまたはhealthが失敗なら非0で終了する。更新・rollbackの考え方は「6. 更新とrollback」と同じで、migrationはforward-onlyとする。
+再作成後はloopbackと公開URLの`/health/ready`が対象`release_sha`と`api_contract_version: 1`を返すこと、および認証なし`POST /v1/collector/setup`が正規の401を返すことを確認する。404・契約外body・SHA不一致は成功扱いしない。更新・rollbackの考え方は「6. 更新とrollback」と同じで、migrationはforward-onlyとする。
 
 ## イベント受付の契約
 
@@ -292,7 +296,7 @@ Lightsail等のLinux VMへ配置する手順の出発点（詳細は「本番設
 3. DNSで `YORI_DOMAIN` をVMの公開IPへ向ける。`YORI_DOMAIN` を実domainにしてproduction profileを起動すると、Caddyがautomatic HTTPSで証明書を取得する。80はACMEとHTTPS redirectに使う。
 4. `sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml up -d --wait db` でdbを起動し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用する。yori-cli bootstrapと`run --rm --no-deps worker npm run provider:approve -- ...`の後、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d` でapi・worker・db・caddyを起動する。apiのhost公開はloopbackのみ、caddy data/configとPostgreSQLはnamed volumeへ永続化される。
 5. `curl -sS https://<YORI_DOMAIN>/health/live` と `/health/ready`、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml ps` でhealthを確認する。
-6. 更新・rollback: このComposeのnode serviceはホストのsource treeを `/app` へbind mountするため、Node imageのdigestは**アプリ版を固定しない**（依存導入と実行環境の版）。アプリ版はGit commitで管理する。更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile tools run --rm migrate` でmigrationを適用し、`sudo docker compose --env-file /etc/yori/yori.env -p yori -f deployment/compose.yaml --profile production up -d --force-recreate api worker caddy` のようにserviceを明示再作成して新しいsourceを読み直させる。`down -v` は実行しない（volumeを保持する）。
+6. 更新・rollback: このComposeのnode serviceはホストのsource treeを `/app` へbind mountするため、Node imageのdigestは**アプリ版を固定しない**（依存導入と実行環境の版）。アプリ版はGit commitで管理する。更新前に正確なGit commitと`deployment/compose.yaml`（image digest・profile・volume名）を記録し、互換性を確認してから対象commitへ移動する。migration後は旧api・workerを`rm -sf`で削除して個別起動し、container ID・稼働SHA・health・setup smokeを確認する。通常はこの一連を行う`npm run deploy:production`を使う。`down -v`は実行しない（volumeを保持する）。
    - migrationはforward-onlyで、down migrationは提供しない。適用済みschemaは旧migration fileや旧base imageへ戻しても戻らない。
    - rollbackできるのは、適用済みschemaと後方互換な旧sourceへ戻し、依存を復元し、api/worker/caddyを同じく明示再作成する場合だけ。非互換なschema変更後はこの手順だけではrollbackできず、事前に取得した管理者snapshotからのrestoreまたはforward fixが必要。自動backupは今回の実装対象外で、単一VM・バックアップなしのため保証範囲はこのVM内に限る。
 7. 資源は `docker stats`、`df -h`、`docker system df`、composeのjson-file log rotation（max-size 10m / max-file 3）で監視する。metricsの `search_duration_ms.p50/p95` と `reindex.pending_documents`、job滞留を確認する。
