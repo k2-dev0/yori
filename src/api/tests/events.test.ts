@@ -646,15 +646,15 @@ describe('POST /v1/events 認証・project権限', () => {
     await assertNoEventWrites(pool);
   });
 
-  it('project_membersにない社員は403で書き込まない', async () => {
+  it('同じcompanyの社員はproject_members未登録でも書き込める', async () => {
     const outsider = await insertEmployee(pool, workspace.companyId, 'employee-outsider');
     const outsiderToken = await issueAuthToken(pool, workspace.companyId, outsider);
     const response = await postEvents(app, {
       token: outsiderToken,
       body: buildEventBatch(workspace.projectId, [buildEventInput()]),
     });
-    assert.equal(response.statusCode, 403, `非メンバーが403にならない: ${response.body}`);
-    await assertNoEventWrites(pool);
+    assert.equal(response.statusCode, 202, `同じ会社の社員がprojectを利用できない: ${response.body}`);
+    assert.equal(await countRows(pool, 'sessions'), 1);
   });
 
   it('他companyのprojectは403で書き込まない', async () => {
