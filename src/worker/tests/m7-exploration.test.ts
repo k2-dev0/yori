@@ -648,6 +648,23 @@ describe('M7 推定session候補', () => {
 });
 
 describe('M7 revoke・changeの後続探索', () => {
+  it('非公開の訂正前文書は訂正が入力境界外なら単独で返さない', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionId = await seedSession(pool, workspace);
+    const original = await seedMessage(pool, { sessionId, sequenceNo: 1, text: 'PRIMARY-OLD-ONLY' });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId, sequenceNo: 2, text: 'QUERY-OLD-ONLY' });
+    await seedReadyDocument(pool, { companyId: workspace.companyId, projectId: workspace.projectId,
+      sessionId, documentKey: 'old-only', content: 'PRIMARY-OLD-ONLY', generationId: generation.id,
+      embedding: basisVector(0, 1), sources: [{ messageId: original.messageId, messageRevision: 1, startOffset: 0, endOffset: 16 }] });
+    const correction = await seedMessage(pool, { sessionId, sequenceNo: 3, text: 'FUTURE-CORRECTION' });
+    await seedRelation(pool, { sourceMessageId: correction.messageId, sourceRevision: 1,
+      targetMessageId: original.messageId, targetRevision: 1, relation: 'change' });
+    assert.equal((await pool.query('SELECT 1 FROM document_publications')).rowCount, 0);
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    assert.equal((await readSearchRequest(pool, input.requestId)).outcome, 'no_match');
+  });
+
   it('後続関係を最大3 hop追跡し、元根拠を残して循環を重複させない', async () => {
     const { config } = await startProviders();
     const generation = await ensureActiveGeneration(
