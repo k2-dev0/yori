@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { collectFromHook } from '../collect.js';
+import { collectFromHook, flushCollector } from '../collect.js';
 import {
   ackResponse,
   buildHook,
@@ -71,7 +71,7 @@ describe('hookの安定fieldを使う会話収集', () => {
           text: '実装できました！',
         }),
       ];
-      await writeTranscript(transcript, lines);
+      await writeTranscript(transcript, [lines[0] as string]);
       const configPath = path.join(fixture.root, 'collector.json');
       await writeFile(configPath, JSON.stringify(fixture.config), 'utf8');
 
@@ -104,6 +104,8 @@ describe('hookの安定fieldを使う会話収集', () => {
       });
       assert.equal(stopResult.code, 0, stopResult.stderr);
 
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+
       assert.deepEqual(
         sentEvents(mock.requests).map((event) => [event.source_message_id, event.role, event.text, event.revision]),
         [
@@ -113,27 +115,30 @@ describe('hookの安定fieldを使う会話収集', () => {
       );
       assert.ok(sentEvents(mock.requests).every((event) => Number.isFinite(Date.parse(event.occurred_at))));
 
+      await writeTranscript(transcript, lines);
       await collectFromHook({
         source: 'codex',
         hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
         config: fixture.config,
         token: 'token-a',
       });
-      assert.equal(mock.requests.length, 2, '同じturnをtranscript backfillで二重送信している');
+      assert.equal(mock.requests.length, 1, '同じturnをtranscript backfillで二重送信している');
       assert.ok(!JSON.stringify(mock.requests).includes('影響範囲を調査します'), 'commentaryを送信している');
 
       await runCollectorCli(['collect', '--source', 'codex', '--config', configPath], {
         stdin: JSON.stringify(stopHook),
         env: { YORI_TEST_TOKEN: 'token-a' },
       });
-      assert.equal(mock.requests.length, 2, '同じStop hookを再送している');
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '同じStop hookを再送している');
 
       await runCollectorCli(['collect', '--source', 'codex', '--config', configPath], {
         stdin: JSON.stringify({ ...stopHook, last_assistant_message: '追加修正も完了しました' }),
         env: { YORI_TEST_TOKEN: 'token-a' },
       });
+      await flushCollector({ config: fixture.config, token: 'token-a' });
       assert.deepEqual(
-        sentEvents(mock.requests.slice(2)).map((event) => [event.source_message_id, event.text, event.revision]),
+        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.text, event.revision]),
         [['turn:turn-1:assistant', '追加修正も完了しました', 2]],
       );
     } finally {
