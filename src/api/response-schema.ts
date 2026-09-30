@@ -96,6 +96,12 @@ export const employeeCreateResponseSchema = z.strictObject({
   created_at: occurredAtSchema,
 });
 
+export const employeeRenameResponseSchema = z.strictObject({
+  status: z.literal('done'),
+  employee_id: z.uuid(),
+  display_name: storableString,
+});
+
 export const tokenIssueResponseSchema = z.strictObject({
   status: z.literal('done'),
   token_id: z.uuid(),
@@ -216,6 +222,7 @@ export type ProjectRegistrationResponse = z.infer<typeof projectRegistrationResp
 export type MeResponse = z.infer<typeof meResponseSchema>;
 export type CompanyResponse = z.infer<typeof companyResponseSchema>;
 export type EmployeeCreateResponse = z.infer<typeof employeeCreateResponseSchema>;
+export type EmployeeRenameResponse = z.infer<typeof employeeRenameResponseSchema>;
 export type TokenIssueResponse = z.infer<typeof tokenIssueResponseSchema>;
 export type TokenRevokeResponse = z.infer<typeof tokenRevokeResponseSchema>;
 export type SearchView = z.infer<typeof searchViewResponseSchema>;
