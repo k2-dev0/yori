@@ -337,6 +337,7 @@ if (rest.length === 0) {
   process.exit(0);
 }
 const childEnv = Object.assign({}, process.env, { YORI_FAKE_VIA_SUDO: '1' });
+delete childEnv.YORI_RELEASE_SHA;
 const child = spawnSync(rest[0], rest.slice(1), { stdio: 'inherit', env: childEnv });
 process.exit(child.status === null ? 1 : child.status);
 `;
@@ -492,7 +493,7 @@ for (const candidate of ['config', 'pull', 'up', 'run', 'rm', 'port', 'ps', 'dow
 }
 let status = 0;
 if (sub === 'config') {
-  status = Number(process.env.FAKE_DOCKER_CONFIG_STATUS || '0');
+  status = process.env.YORI_RELEASE_SHA ? Number(process.env.FAKE_DOCKER_CONFIG_STATUS || '0') : 64;
 } else if (sub === 'pull') {
   status = Number(process.env.FAKE_DOCKER_PULL_STATUS || '0');
 } else if (sub === 'up') {
