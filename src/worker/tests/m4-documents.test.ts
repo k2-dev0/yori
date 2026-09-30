@@ -2507,6 +2507,113 @@ describe('M4 Green追加契約', () => {
   });
 });
 
+describe('incremental build consistency', () => {
+  it('末尾追加と集約済み要求では確定済み先頭文書を書き直さず全体構築と一致する', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'src/original.ts alpha beta gamma\n'.repeat(400) });
+    await runBuildJob(pool, { buildJobId: first.buildJobId, config });
+    const before = await pool.query<{ document_id: string; revision: number; stamp: string }>(
+      `SELECT document_id, revision, xmin::text AS stamp FROM document_entities`,
+    );
+    assert.ok(before.rows.length > 0, 'identifier fixtureがない');
+    const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: 'append src/new.ts' });
+    const third = await seedSearchableMessage(pool, { sessionId, sequenceNo: 3, text: 'append src/last.ts' });
+    await runBuildJob(pool, { buildJobId: second.buildJobId, config });
+    const afterBuild = await snapshotSearchState(pool, workspace.projectId);
+    await runBuildJob(pool, { buildJobId: third.buildJobId, config });
+    assert.deepEqual(await snapshotSearchState(pool, workspace.projectId), afterBuild);
+    const expected = await planDocumentChunks(sessionId, (await loadSessionMessages(pool, sessionId)).messages);
+    const actual = await pool.query<{ document_key: string; content: string }>(
+      `SELECT d.document_key, r.content FROM search_documents d
+       JOIN document_publications p ON p.document_id = d.id
+       JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = p.revision
+       WHERE d.session_id = $1`, [sessionId],
+    );
+    assert.deepEqual(actual.rows.sort((a, b) => a.document_key.localeCompare(b.document_key)),
+      expected.map((c) => ({ document_key: c.documentKey, content: c.content })).sort((a, b) => a.document_key.localeCompare(b.document_key)));
+    const after = await pool.query<{ document_id: string; revision: number; stamp: string }>(
+      'SELECT document_id, revision, xmin::text AS stamp FROM document_entities',
+    );
+    const unchanged = before.rows.filter((row) =>
+      after.rows.some((other) => other.document_id === row.document_id && other.revision === row.revision));
+    assert.ok(unchanged.length > 0);
+    for (const row of unchanged) {
+      assert.ok(after.rows.some((other) => other.document_id === row.document_id && other.revision === row.revision && other.stamp === row.stamp),
+        '確定済み文書のidentifierを追記で再書き込みした');
+    }
+  });
+
+  it('再分類の公開解除はbuildの着手とVoyage承認を待たない', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'remove me' });
+    await runBuildJob(pool, { buildJobId: first.buildJobId, config });
+    await upsertAnalysis(pool, { messageId: first.messageId, revision: 1, retention: 'progress_only', isSearchable: false });
+    assert.equal((await readPublications(pool, workspace.projectId)).length, 0, 'build前に旧publicationが残る');
+  });
+
+  it('撤回の公開解除はbuildを待たず別sessionの公開は維持する', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '撤回する根拠' });
+    await runBuildJob(pool, { buildJobId: first.buildJobId, config });
+    const otherSession = await seedSession(pool, workspace);
+    const other = await seedSearchableMessage(pool, { sessionId: otherSession, sequenceNo: 1, text: '独立した根拠' });
+    await runBuildJob(pool, { buildJobId: other.buildJobId, config });
+    const revoker = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: '撤回' });
+    await insertMessageRelation(pool, { sourceMessageId: revoker.messageId, sourceRevision: 1,
+      targetMessageId: first.messageId, targetRevision: 1, relation: 'revoke' });
+    const remaining = await pool.query<{ session_id: string }>(
+      'SELECT d.session_id FROM document_publications p JOIN search_documents d ON d.id = p.document_id');
+    assert.deepEqual(remaining.rows.map((r) => r.session_id), [otherSession]);
+  });
+
+  it('外部応答待ち中の再分類を旧workerが再公開しない', async () => {
+    const gate = deferred();
+    const { config, server } = await startApprovedVoyage(pool, workspace.companyId, async (body) => {
+      await gate.promise;
+      return { body: validVoyageReply(readVoyageRequest(body).input ?? []) };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '応答中に除外' });
+    const job = await claimBuildJob(pool, first.buildJobId);
+    const processing = processJob(pool, job, config);
+    try {
+      assert.ok(await waitUntil(() => server.requests.length > 0, EXTERNAL_WAIT_TIMEOUT_MS));
+      await upsertAnalysis(pool, { messageId: first.messageId, revision: 1, retention: 'progress_only', isSearchable: false });
+    } finally { gate.resolve(); }
+    await processing;
+    assert.equal((await readPublications(pool, workspace.projectId)).length, 0);
+  });
+
+  it('外部応答待ち中の追記は進行中の公開を妨げず次回構築へ残る', async () => {
+    const gate = deferred();
+    let block = true;
+    const { config, server } = await startApprovedVoyage(pool, workspace.companyId, async (body) => {
+      if (block) await gate.promise;
+      return { body: validVoyageReply(readVoyageRequest(body).input ?? []) };
+    });
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '処理開始時の発言' });
+    const job = await claimBuildJob(pool, first.buildJobId);
+    const processing = processJob(pool, job, config);
+    let second: SeededMessage;
+    try {
+      assert.ok(await waitUntil(() => server.requests.length > 0, EXTERNAL_WAIT_TIMEOUT_MS));
+      second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: '処理中に到着した発言' });
+    } finally { block = false; gate.resolve(); }
+    await processing;
+    assert.equal((await readJob(pool, first.buildJobId)).status, 'completed');
+    assert.equal((await readJob(pool, second!.buildJobId)).status, 'pending');
+    await runBuildJob(pool, { buildJobId: second!.buildJobId, config });
+    const published = await pool.query<{ content: string }>(
+      `SELECT r.content FROM document_publications p JOIN search_document_revisions r
+       ON r.document_id = p.document_id AND r.revision = p.revision`);
+    assert.ok(published.rows.some((r) => r.content.includes('処理中に到着した発言')));
+  });
+});
+
 describe('M4 監査修正契約', () => {
   it('先頭message編集後もdocument_keyは不変で、同じdocumentの新revisionになる', async () => {
     const { config } = await startApprovedVoyage(pool, workspace.companyId);
