@@ -42,8 +42,9 @@ import {
 } from './session-links.js';
 
 // 認証・入力検証・project権限・保存をHTTP境界としてまとめる。DB失敗の詳細は応答へ出さない。
-export function buildApp(deps: { pool: Pool }): FastifyInstance {
+export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInstance {
   const app = Fastify({ bodyLimit: MAX_EVENT_BODY_BYTES });
+  const releaseMetadata = { release_sha: deps.releaseSha ?? '0'.repeat(40), api_contract_version: 1 as const };
 
   // 予期しない例外の応答にDBメッセージ・SQL・本文・認証情報を含めない。4xxは状態だけを保つ。
   app.setErrorHandler((error: FastifyError, _request, reply) => {
@@ -56,10 +57,10 @@ export function buildApp(deps: { pool: Pool }): FastifyInstance {
   app.get('/health/ready', async (_request, reply) => {
     try {
       await deps.pool.query('SELECT 1');
-      return reply.code(200).send(healthReadyResponseSchema.parse({ status: 'ready' }));
+      return reply.code(200).send(healthReadyResponseSchema.parse({ status: 'ready', ...releaseMetadata }));
     } catch {
       // DB等の依存が落ちていても受付可否だけを返し、接続情報やSQLは出さない。
-      return reply.code(503).send(healthReadyResponseSchema.parse({ status: 'unavailable' }));
+      return reply.code(503).send(healthReadyResponseSchema.parse({ status: 'unavailable', ...releaseMetadata }));
     }
   });
 
