@@ -3,7 +3,13 @@ import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import type { TokenScope } from './contract.js';
 import type { AuthContext } from './events.js';
-import type { CompanyResponse, MeResponse, TokenIssueResponse, TokenRevokeResponse } from './response-schema.js';
+import type {
+  CompanyResponse,
+  EmployeeCreateResponse,
+  MeResponse,
+  TokenIssueResponse,
+  TokenRevokeResponse,
+} from './response-schema.js';
 
 export class AccountTargetNotFoundError extends Error {}
 export class LastCompanyAdminError extends Error {}
@@ -111,6 +117,36 @@ export async function loadCompany(pool: Pool, auth: AuthContext): Promise<Compan
     projects: projectsResult.rows.map(projectView),
     tokens: tokensResult.rows.map(tokenView),
   };
+}
+
+export async function createCompanyEmployee(
+  pool: Pool,
+  auth: AuthContext,
+  displayName: string,
+): Promise<EmployeeCreateResponse> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const employeeId = uuidv7();
+    const inserted = await client.query<{ created_at: Date }>(
+      `INSERT INTO employees (id, company_id, display_name)
+       VALUES ($1, $2, $3)
+       RETURNING created_at`,
+      [employeeId, auth.companyId, displayName],
+    );
+    await client.query('COMMIT');
+    return {
+      status: 'done',
+      employee_id: employeeId,
+      display_name: displayName,
+      created_at: inserted.rows[0]!.created_at.toISOString(),
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function issueCompanyToken(
