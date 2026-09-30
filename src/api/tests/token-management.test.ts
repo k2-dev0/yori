@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { buildApp } from '../app.js';
-import { companyResponseSchema, meResponseSchema, tokenIssueResponseSchema, tokenRevokeResponseSchema } from '../response-schema.js';
+import {
+  companyResponseSchema,
+  employeeCreateResponseSchema,
+  meResponseSchema,
+  tokenIssueResponseSchema,
+  tokenRevokeResponseSchema,
+} from '../response-schema.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
@@ -84,6 +90,56 @@ describe('本人・社員・token管理API', () => {
     assert.equal(await countRows(pool, 'auth_tokens'), before);
     const current = await pool.query<{ revoked_at: Date | null }>('SELECT revoked_at FROM auth_tokens WHERE id = $1', [tokenId]);
     assert.equal(current.rows[0]!.revoked_at, null);
+  });
+
+  it('admin tokenは自社employeeだけを作成し、tokenは自動発行しない', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const employeesBefore = await countRows(pool, 'employees');
+    const tokensBefore = await countRows(pool, 'auth_tokens');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/employees',
+      headers: headers(adminToken, true),
+      payload: { display_name: 'new employee' },
+    });
+    assert.equal(response.statusCode, 201, response.body);
+    const created = employeeCreateResponseSchema.parse(response.json());
+    assert.equal(created.status, 'done');
+    assert.equal(created.display_name, 'new employee');
+    assert.equal(await countRows(pool, 'employees'), employeesBefore + 1);
+    assert.equal(await countRows(pool, 'auth_tokens'), tokensBefore, '社員作成時にtokenを自動発行している');
+    const stored = await pool.query<{ company_id: string; display_name: string }>(
+      'SELECT company_id, display_name FROM employees WHERE id = $1',
+      [created.employee_id],
+    );
+    assert.deepEqual(stored.rows, [{ company_id: workspace.companyId, display_name: 'new employee' }]);
+
+    const forbidden = await app.inject({
+      method: 'POST',
+      url: '/v1/employees',
+      headers: headers(workspace.token, true),
+      payload: { display_name: 'forbidden' },
+    });
+    assert.equal(forbidden.statusCode, 403);
+    assert.equal(errorCode(forbidden), 'forbidden');
+
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/employees',
+      headers: headers(adminToken, true),
+      payload: { display_name: 'forged', company_id: workspace.companyId },
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(errorCode(invalid), 'invalid_request');
+
+    const unauthorized = await app.inject({
+      method: 'POST',
+      url: '/v1/employees',
+      headers: { 'content-type': 'application/json' },
+      payload: { display_name: 'unauthorized' },
+    });
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(errorCode(unauthorized), 'unauthorized');
   });
 
   it('admin tokenは同じcompanyだけを一覧し、通常/admin tokenを発行して冪等に失効する', async () => {
