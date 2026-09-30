@@ -263,7 +263,7 @@ process.exit(Number(process.env.FAKE_SSH_STATUS || '0'));
 `;
 
 const FAKE_CURL_SOURCE = `#!/usr/bin/env -S node --
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const stateDir = process.env.YORI_FAKE_STATE_DIR;
@@ -281,8 +281,24 @@ for (let i = 0; i < argv.length; i = i + 1) {
 }
 appendFileSync(path.join(stateDir, 'curl.log'), url + String.fromCharCode(10));
 const writeOut = argv.indexOf('-w') !== -1 || argv.indexOf('--write-out') !== -1 || argv.some((arg) => arg.indexOf('--write-out=') === 0);
+const isSetup = url.endsWith('/v1/collector/setup');
+const status = isSetup ? (process.env.FAKE_SETUP_HTTP_CODE || '401') : (process.env.FAKE_CURL_HTTP_CODE || '200');
+const body = isSetup
+  ? (process.env.FAKE_SETUP_BODY || '{"error":{"code":"unauthorized"}}')
+  : (process.env.FAKE_HEALTH_BODY || JSON.stringify({ status: status === '200' ? 'ready' : 'unavailable', release_sha: process.env.FAKE_HEALTH_SHA || process.env.FAKE_GIT_HEAD, api_contract_version: 1 }));
+let outputPath = null;
+for (let i = 0; i < argv.length; i = i + 1) {
+  if ((argv[i] === '-o' || argv[i] === '--output') && argv[i + 1]) {
+    outputPath = argv[i + 1];
+  }
+}
+if (outputPath !== null) {
+  writeFileSync(outputPath, body);
+} else {
+  process.stdout.write(body);
+}
 if (writeOut) {
-  process.stdout.write((process.env.FAKE_CURL_HTTP_CODE || '200') + String.fromCharCode(10));
+  process.stdout.write(status + String.fromCharCode(10));
 }
 process.exit(Number(process.env.FAKE_CURL_STATUS || '0'));
 `;
@@ -403,6 +419,10 @@ if (!stateDir) {
 }
 const argv = process.argv.slice(2);
 appendFileSync(path.join(stateDir, 'commands.log'), ['stat'].concat(argv).join(' ') + String.fromCharCode(10));
+if (process.env.FAKE_ENV_PARENT_MODE === '700' && process.env.YORI_FAKE_VIA_SUDO !== '1') {
+  console.error('stat: cannot statx /etc/yori/yori.env: Permission denied');
+  process.exit(1);
+}
 const owner = process.env.FAKE_ENVFILE_OWNER || 'root';
 const group = process.env.FAKE_ENVFILE_GROUP || 'root';
 const mode = process.env.FAKE_ENVFILE_MODE || '600';
@@ -449,7 +469,7 @@ process.exit(0);
 `;
 
 const FAKE_DOCKER_SOURCE = `#!/usr/bin/env -S node --
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const stateDir = process.env.YORI_FAKE_STATE_DIR;
@@ -464,7 +484,7 @@ function has(value) {
   return argv.indexOf(value) !== -1;
 }
 let sub = '';
-for (const candidate of ['config', 'pull', 'up', 'run', 'port', 'ps', 'down', 'logs', 'exec']) {
+for (const candidate of ['config', 'pull', 'up', 'run', 'rm', 'port', 'ps', 'down', 'logs', 'exec']) {
   if (has(candidate)) {
     sub = candidate;
     break;
@@ -479,12 +499,38 @@ if (sub === 'config') {
   status = has('db') ? Number(process.env.FAKE_DOCKER_DB_STATUS || '0') : Number(process.env.FAKE_DOCKER_RECREATE_STATUS || '0');
 } else if (sub === 'run') {
   status = Number(process.env.FAKE_DOCKER_MIGRATE_STATUS || '0');
+} else if (sub === 'rm') {
+  for (const service of ['api', 'worker']) {
+    if (has(service)) {
+      rmSync(path.join(stateDir, service + '-id'), { force: true });
+      writeFileSync(path.join(stateDir, service + '-removed'), '1');
+    }
+  }
 } else if (sub === 'port') {
   process.stdout.write((process.env.FAKE_DOCKER_PORT || '127.0.0.1:39119') + String.fromCharCode(10));
   process.exit(0);
 } else if (sub === 'ps') {
+  if (has('-q')) {
+    const service = has('worker') ? 'worker' : 'api';
+    const idPath = path.join(stateDir, service + '-id');
+    const removedPath = path.join(stateDir, service + '-removed');
+    if (!existsSync(idPath) && !existsSync(removedPath) && process.env.FAKE_DOCKER_NO_OLD !== '1') {
+      writeFileSync(idPath, process.env['FAKE_DOCKER_' + service.toUpperCase() + '_OLD_ID'] || 'old-' + service + '-id');
+    }
+    if (existsSync(idPath)) {
+      process.stdout.write(readFileSync(idPath, 'utf8') + String.fromCharCode(10));
+    }
+    process.exit(0);
+  }
   process.stdout.write('NAME IMAGE STATUS' + String.fromCharCode(10) + 'fake-ps api running' + String.fromCharCode(10));
   process.exit(0);
+}
+if (sub === 'up' && status === 0 && !has('db')) {
+  for (const service of ['api', 'worker']) {
+    if (has(service)) {
+      writeFileSync(path.join(stateDir, service + '-id'), process.env['FAKE_DOCKER_' + service.toUpperCase() + '_NEW_ID'] || 'new-' + service + '-id');
+    }
+  }
 }
 if (status !== 0) {
   console.error('fake docker: ' + sub + ' failed');
@@ -588,6 +634,7 @@ function macEnv(stateDir: string, healthUrl: string, overrides: Record<string, s
     FAKE_GIT_CONTAINED: HEAD_SHA,
     FAKE_CURL_STATUS: '0',
     FAKE_CURL_HTTP_CODE: '200',
+    FAKE_HEALTH_SHA: HEAD_SHA,
     YORI_DEPLOY_HEALTH_URL: healthUrl,
     ...overrides,
   };
@@ -652,14 +699,21 @@ interface HealthServer {
   close: () => Promise<void>;
 }
 
-function startHealthServer(status: number): Promise<HealthServer> {
+function startHealthServer(status: number, releaseSha = HEAD_SHA): Promise<HealthServer> {
   return new Promise((resolve, reject) => {
     const calls: string[] = [];
     const server: Server = createServer((_request, response) => {
       calls.push(_request.url ?? '');
       response.setHeader('connection', 'close');
       response.statusCode = status;
-      response.end(status === 200 ? 'ok' : 'unavailable');
+      if ((_request.url ?? '').endsWith('/v1/collector/setup')) {
+        response.statusCode = 401;
+        response.setHeader('content-type', 'application/json');
+        response.end('{"error":{"code":"unauthorized"}}');
+        return;
+      }
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ status: status === 200 ? 'ready' : 'unavailable', release_sha: releaseSha, api_contract_version: 1 }));
     });
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
@@ -713,6 +767,7 @@ function remoteHappyEnv(overrides: Record<string, string> = {}): Record<string, 
     FAKE_GIT_ORIGIN_MAIN: TARGET_SHA,
     FAKE_GIT_CONTAINED: `${HEAD_SHA},${TARGET_SHA}`,
     FAKE_GIT_KNOWN: TARGET_SHA,
+    FAKE_HEALTH_SHA: TARGET_SHA,
     ...overrides,
   };
 }
@@ -780,7 +835,7 @@ describe('Mac側 deploy-production.mjs (Red)', () => {
         readFileSync(REMOTE_SCRIPT, 'utf8'),
         'ssh stdinがdeployment/deploy.sh本文と一致しない',
       );
-      assert.equal(healthCallCount(stateDir, health.calls), 1, '公開health確認が1回でない');
+      assert.equal(healthCallCount(stateDir, health.calls), 2, '公開healthとsetup smokeの確認が各1回でない');
     } finally {
       await health.close();
       rmSync(stateDir, { recursive: true, force: true });
@@ -790,16 +845,17 @@ describe('Mac側 deploy-production.mjs (Red)', () => {
   it('B2: 40桁hexのtarget引数をsshへ渡し、そのSHAだけを配布する', async () => {
     requireScripts();
     const stateDir = makeStateDir();
-    const health = await startHealthServer(200);
+    const health = await startHealthServer(200, TARGET_SHA);
     try {
       const result = runMac([TARGET_SHA], stateDir, health.url, {
         FAKE_GIT_ORIGIN_MAIN: TARGET_SHA,
         FAKE_GIT_CONTAINED: `${HEAD_SHA},${TARGET_SHA}`,
+        FAKE_HEALTH_SHA: TARGET_SHA,
         FAKE_GIT_KNOWN: TARGET_SHA,
       });
       assert.equal(result.status, 0, `target指定deployが0でない:\n${describeResult(result)}`);
       assertSshInvocation(sshCalls(stateDir)[0] ?? [], 'yori-production', TARGET_SHA);
-      assert.equal(healthCallCount(stateDir, health.calls), 1, '公開health確認が1回でない');
+      assert.equal(healthCallCount(stateDir, health.calls), 2, '公開healthとsetup smokeの確認が各1回でない');
     } finally {
       await health.close();
       rmSync(stateDir, { recursive: true, force: true });
@@ -945,6 +1001,43 @@ describe('Mac側 deploy-production.mjs (Red)', () => {
     }
   });
 
+  it('D3: 公開healthのrelease SHAまたはAPI契約versionが一致しなければ非0で終わる', async () => {
+    requireScripts();
+    for (const [label, overrides] of [
+      ['release SHA不一致', { FAKE_HEALTH_SHA: TARGET_SHA }],
+      ['契約version不一致', { FAKE_HEALTH_BODY: JSON.stringify({ status: 'ready', release_sha: HEAD_SHA, api_contract_version: 0 }) }],
+    ] as Array<[string, Record<string, string>]>) {
+      const stateDir = makeStateDir();
+      const health = await startHealthServer(200);
+      try {
+        const result = runMac([], stateDir, health.url, overrides);
+        assert.notEqual(result.status, 0, `${label}なのに0で終了した:\n${describeResult(result)}`);
+        assert.equal(sshCalls(stateDir).length, 1, `${label}でSSHが成功していない`);
+        assert.equal(healthCallCount(stateDir, health.calls), 1, `${label}でsetup smokeまで進んだ`);
+      } finally {
+        await health.close();
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('D4: 公開setup smokeが正規401でなければ非0で終わる', async () => {
+    requireScripts();
+    const stateDir = makeStateDir();
+    const health = await startHealthServer(200);
+    try {
+      const result = runMac([], stateDir, health.url, {
+        FAKE_SETUP_HTTP_CODE: '404',
+        FAKE_SETUP_BODY: '{"message":"Route POST:/v1/collector/setup not found","error":"Not Found","statusCode":404}',
+      });
+      assert.notEqual(result.status, 0, `setup 404なのに0で終了した:\n${describeResult(result)}`);
+      assert.equal(healthCallCount(stateDir, health.calls), 2, 'health後にsetup smokeを1回実行していない');
+    } finally {
+      await health.close();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it('G1: shell注入可能なtarget・host・URLを受理しない', async () => {
     requireScripts();
     const health = await startHealthServer(200);
@@ -1007,7 +1100,7 @@ describe('Mac側 deploy-production.mjs (Red)', () => {
 });
 
 describe('remote deployment/deploy.sh (Red)', () => {
-  it('E1: lock下で検証→ff-only merge→config→pull→db→migrate→force-recreate→port→health→psの順に実行する', () => {
+  it('E1: migration後に旧ID取得→api/worker削除→個別起動→新ID・SHA・health・setup smokeを検証する', () => {
     requireRemoteScript();
     const stateDir = makeStateDir();
     try {
@@ -1038,13 +1131,31 @@ describe('remote deployment/deploy.sh (Red)', () => {
         'tools migrate',
         (line) => line.startsWith('docker ') && line.includes(' run ') && line.includes('migrate'),
       );
-      const recreateIndex = findLine(
-        'api worker caddy再作成',
-        (line) => line.startsWith('docker ') && line.includes('--force-recreate') && line.includes('--no-deps'),
+      const oldIdIndex = findLine('旧container ID取得', (line) => line.startsWith('docker ') && line.includes(' ps ') && line.includes(' -q '));
+      const removeIndex = findLine(
+        'api worker削除',
+        (line) => line.startsWith('docker ') && line.includes(' rm ') && line.includes('api') && line.includes('worker'),
       );
+      const apiUpIndex = findLine(
+        'api新規起動',
+        (line) => line.startsWith('docker ') && line.includes(' up ') && /(?:^|\s)api(?:\s|$)/.test(line) && !line.includes('worker'),
+      );
+      const workerUpIndex = findLine(
+        'worker新規起動',
+        (line) => line.startsWith('docker ') && line.includes(' up ') && /(?:^|\s)worker(?:\s|$)/.test(line),
+      );
+      const caddyUpIndex = findLine(
+        'caddy再作成',
+        (line) => line.startsWith('docker ') && line.includes(' up ') && line.includes('caddy') && line.includes('--force-recreate'),
+      );
+      const newIdIndex = lines.findIndex(
+        (line, index) => index > caddyUpIndex && line.startsWith('docker ') && line.includes(' ps ') && line.includes(' -q '),
+      );
+      assert.ok(newIdIndex !== -1, `新container ID取得が実行されていない:\n${lines.join('\n')}`);
       const portIndex = findLine('compose port api 3210', (line) => line.startsWith('docker ') && line.includes(' port ') && line.includes('3210'));
       const healthIndex = findLine('curl health/ready', (line) => line.startsWith('curl ') && line.includes('/health/ready'));
-      const psIndex = findLine('compose ps', (line) => line.startsWith('docker ') && line.includes(' ps'));
+      const smokeIndex = findLine('collector setup smoke', (line) => line.startsWith('curl ') && line.includes('/v1/collector/setup'));
+      const psIndex = findLine('compose ps', (line) => line.startsWith('docker ') && line.includes(' ps') && !line.includes(' -q '));
       const indexes = [
         lockIndex,
         fetchIndex,
@@ -1054,9 +1165,15 @@ describe('remote deployment/deploy.sh (Red)', () => {
         pullIndex,
         dbIndex,
         migrateIndex,
-        recreateIndex,
+        oldIdIndex,
+        removeIndex,
+        apiUpIndex,
+        workerUpIndex,
+        caddyUpIndex,
+        newIdIndex,
         portIndex,
         healthIndex,
+        smokeIndex,
         psIndex,
       ];
       assert.deepEqual(indexes, [...indexes].sort((a, b) => a - b), `実行順序が契約と違う:\n${lines.join('\n')}`);
@@ -1070,9 +1187,9 @@ describe('remote deployment/deploy.sh (Red)', () => {
         assert.ok(line.includes('deployment/compose.yaml'), `deployment/compose.yamlがない: ${line}`);
       }
 
-      const recreateLine = lines[recreateIndex] ?? '';
-      for (const token of ['api', 'worker', 'caddy', '-d', '--wait']) {
-        assert.ok(recreateLine.includes(token), `再作成commandに${token}がない: ${recreateLine}`);
+      assert.ok((lines[removeIndex] ?? '').includes('-f'), `api/worker削除が強制停止を伴わない: ${lines[removeIndex] ?? ''}`);
+      for (const index of [apiUpIndex, workerUpIndex, caddyUpIndex]) {
+        assert.ok((lines[index] ?? '').includes('-d') && (lines[index] ?? '').includes('--wait'), `起動commandに-d --waitがない: ${lines[index] ?? ''}`);
       }
       const migrateLine = lines[migrateIndex] ?? '';
       assert.ok(migrateLine.includes('tools'), `migrateがtools profileでない: ${migrateLine}`);
@@ -1084,6 +1201,10 @@ describe('remote deployment/deploy.sh (Red)', () => {
       assert.ok(
         (lines[healthIndex] ?? '').includes('http://127.0.0.1:39119/health/ready'),
         `loopbackのhealth URLが違う: ${lines[healthIndex] ?? ''}`,
+      );
+      assert.ok(
+        (lines[smokeIndex] ?? '').includes('http://127.0.0.1:39119/v1/collector/setup'),
+        `loopbackのsetup smoke URLが違う: ${lines[smokeIndex] ?? ''}`,
       );
       assert.ok(!output.includes(SECRET_MARKER), 'secret markerが出力された');
       assert.ok(!lines.join('\n').includes(SECRET_MARKER), 'secret markerがcommand logへ出た');
@@ -1100,6 +1221,7 @@ describe('remote deployment/deploy.sh (Red)', () => {
       assert.notEqual(result.status, 0, `config失敗なのに0で終了した:\n${describeResult(result)}`);
       const lines = commandLines(configState);
       assert.ok(!lines.some((line) => line.includes('--force-recreate')), `config失敗後に再作成した:\n${lines.join('\n')}`);
+      assert.ok(!lines.some((line) => line.includes(' rm ') && line.includes('api')), `config失敗後にapi/workerを削除した:\n${lines.join('\n')}`);
       assert.ok(!lines.some((line) => line.includes(' pull')), `config失敗後にpullした:\n${lines.join('\n')}`);
       assert.ok(!lines.some((line) => line.includes(' run ') && line.includes('migrate')), `config失敗後にmigrateした:\n${lines.join('\n')}`);
     } finally {
@@ -1113,6 +1235,7 @@ describe('remote deployment/deploy.sh (Red)', () => {
       const lines = commandLines(migrateState);
       assert.ok(lines.some((line) => line.includes(' run ') && line.includes('migrate')), 'migrateが実行されていない');
       assert.ok(!lines.some((line) => line.includes('--force-recreate')), `migrate失敗後に再作成した:\n${lines.join('\n')}`);
+      assert.ok(!lines.some((line) => line.includes(' rm ') && line.includes('api')), `migrate失敗後にapi/workerを削除した:\n${lines.join('\n')}`);
     } finally {
       rmSync(migrateState, { recursive: true, force: true });
     }
@@ -1130,6 +1253,7 @@ describe('remote deployment/deploy.sh (Red)', () => {
         assert.notEqual(result.status, 0, `${label}失敗なのに0で終了した:\n${describeResult(result)}`);
         const lines = commandLines(stateDir);
         assert.ok(!lines.some((line) => line.includes('--force-recreate')), `${label}失敗後に再作成した:\n${lines.join('\n')}`);
+        assert.ok(!lines.some((line) => line.includes(' rm ') && line.includes('api')), `${label}失敗後にapi/workerを削除した:\n${lines.join('\n')}`);
         assert.ok(!lines.some((line) => line.includes(' run ') && line.includes('migrate')), `${label}失敗後にmigrateした:\n${lines.join('\n')}`);
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
@@ -1188,6 +1312,74 @@ describe('remote deployment/deploy.sh (Red)', () => {
         const lines = commandLines(stateDir);
         assert.ok(!lines.some((line) => line.includes(' config')), `${label}なのにconfigした:\n${lines.join('\n')}`);
         assert.ok(!lines.some((line) => line.includes('--force-recreate')), `${label}なのに再作成した:\n${lines.join('\n')}`);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('E6b: /etc/yoriがroot:root 0700でもsudo statでenvを検査してdeployできる', () => {
+    requireRemoteScript();
+    const stateDir = makeStateDir();
+    try {
+      const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv({ FAKE_ENV_PARENT_MODE: '700' }));
+      assert.equal(result.status, 0, `親directory 0700でdeployできない:\n${describeResult(result)}`);
+      const lines = commandLines(stateDir);
+      const sudoStat = lines.findIndex((line) => line.startsWith('sudo ') && line.includes('stat'));
+      const stat = lines.findIndex((line) => line.startsWith('stat '));
+      assert.ok(sudoStat !== -1 && stat !== -1 && sudoStat < stat, `sudo statを実行していない:\n${lines.join('\n')}`);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('E6c: apiまたはworkerのcontainer IDが更新されなければ失敗する', () => {
+    requireRemoteScript();
+    for (const service of ['API', 'WORKER']) {
+      const stateDir = makeStateDir();
+      try {
+        const overrides = {
+          [`FAKE_DOCKER_${service}_OLD_ID`]: `same-${service.toLowerCase()}-id`,
+          [`FAKE_DOCKER_${service}_NEW_ID`]: `same-${service.toLowerCase()}-id`,
+        };
+        const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv(overrides));
+        assert.notEqual(result.status, 0, `${service} ID未更新なのに0で終了した:\n${describeResult(result)}`);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('E6d: 初回deployで旧containerが無くても新ID・SHA・health・smokeが揃えば成功する', () => {
+    requireRemoteScript();
+    const stateDir = makeStateDir();
+    try {
+      const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv({ FAKE_DOCKER_NO_OLD: '1' }));
+      assert.equal(result.status, 0, `初回deployが失敗した:\n${describeResult(result)}`);
+      const lines = commandLines(stateDir);
+      assert.ok(lines.some((line) => line.includes('/health/ready')), '初回deployでhealthを確認していない');
+      assert.ok(lines.some((line) => line.includes('/v1/collector/setup')), '初回deployでsetup smokeを確認していない');
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('E6e: loopback healthのSHA不一致またはsetup 404を成功扱いしない', () => {
+    requireRemoteScript();
+    for (const [label, overrides] of [
+      ['SHA不一致', { FAKE_HEALTH_SHA: HEAD_SHA }],
+      [
+        'setup 404',
+        {
+          FAKE_SETUP_HTTP_CODE: '404',
+          FAKE_SETUP_BODY: '{"message":"Route POST:/v1/collector/setup not found","error":"Not Found","statusCode":404}',
+        },
+      ],
+    ] as Array<[string, Record<string, string>]>) {
+      const stateDir = makeStateDir();
+      try {
+        const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv(overrides));
+        assert.notEqual(result.status, 0, `${label}なのに0で終了した:\n${describeResult(result)}`);
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
       }
