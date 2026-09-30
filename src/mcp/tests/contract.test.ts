@@ -35,7 +35,7 @@ const DATE_TIME_PATTERN = "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48
 
 // tools/listのJSON Schema期待値。production schemaへ依存せず、公開契約をliteralで固定する。
 const UUID_INPUT_JSON_SCHEMA = { type: 'string', format: 'uuid', pattern: UUID_PATTERN };
-const SOURCE_INPUT_JSON_SCHEMA = { type: 'string', enum: ['codex', 'claude_code', 'cursor'] };
+const SOURCE_INPUT_JSON_SCHEMA = { type: 'string', enum: ['codex', 'claude_code', 'cursor', 'deepseek_harness'] };
 const REVISION_INPUT_JSON_SCHEMA = { type: 'integer', minimum: 1, maximum: 2_147_483_647 };
 const WAIT_MS_INPUT_JSON_SCHEMA = { type: 'integer', minimum: 0, maximum: 5_000 };
 const IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA = { type: 'string', minLength: 1, maxLength: 512 };
@@ -434,7 +434,7 @@ describe('MCP 5 toolの入力契約', () => {
     const result = inputSchemaOf(tools, 'get_search_result');
     assert.equal(result.properties?.wait_ms?.minimum, 0, 'wait_ms下限がHTTP契約と異なる');
     assert.equal(result.properties?.wait_ms?.maximum, 5000, 'wait_ms上限がHTTP契約と異なる');
-    assert.deepEqual(result.properties?.source?.enum, ['codex', 'claude_code', 'cursor']);
+    assert.deepEqual(result.properties?.source?.enum, ['codex', 'claude_code', 'cursor', 'deepseek_harness']);
     assert.equal(result.properties?.input_id?.format, 'uuid');
 
     const evidence = inputSchemaOf(tools, 'get_evidence');
