@@ -175,33 +175,44 @@ function buildNotificationContext(payload: unknown): string | null {
     .map((item) => truncateContextText(item.text))
     .filter((text) => text.length > 0)
     .slice(0, 5);
-  if (evidenceTexts.length > 0) {
-    lines.push('根拠:');
-    for (const text of evidenceTexts) {
-      lines.push(`- ${text}`);
-    }
-  }
   // 訂正・撤回をneighborより先に、同種内は元の安定順で最大5件まで併記する。
   const relatedItems = (view.matches ?? []).flatMap((match) => match.related_evidence ?? []);
   const orderedRelated = [...relatedItems].sort(
     (left, right) => Number(right.source_kind === 'correction') - Number(left.source_kind === 'correction'),
   );
-  const relatedLines: string[] = [];
+  const correctionLines: string[] = [];
+  const otherRelatedLines: string[] = [];
   for (const item of orderedRelated) {
-    if (relatedLines.length >= 5) {
+    if (correctionLines.length + otherRelatedLines.length >= 5) {
       break;
     }
     const text = truncateContextText(item.text);
     if (text.length === 0) {
       continue;
     }
-    relatedLines.push(`- ${relationLabel(item)} ${text}`);
+    const line = `- ${relationLabel(item)} ${text}`;
+    if (item.source_kind === 'correction') {
+      correctionLines.push(line);
+    } else {
+      otherRelatedLines.push(line);
+    }
   }
-  if (relatedLines.length > 0) {
+  if (correctionLines.length > 0) {
+    lines.push('現在の訂正・撤回:');
+    lines.push(...correctionLines);
+  }
+  if (evidenceTexts.length > 0) {
+    lines.push(correctionLines.length > 0 ? '元の根拠（訂正・撤回前を含みます）:' : '根拠:');
+    for (const text of evidenceTexts) {
+      lines.push(`- ${text}`);
+    }
+  }
+  if (otherRelatedLines.length > 0) {
     lines.push('関連根拠:');
-    lines.push(...relatedLines);
+    lines.push(...otherRelatedLines);
   }
-  const omitted = relatedItems.filter((item) => truncateContextText(item.text).length > 0).length - relatedLines.length;
+  const omitted =
+    relatedItems.filter((item) => truncateContextText(item.text).length > 0).length - correctionLines.length - otherRelatedLines.length;
   if (omitted > 0) {
     lines.push(`（関連根拠を${omitted}件省略）`);
   }
