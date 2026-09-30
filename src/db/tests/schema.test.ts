@@ -128,6 +128,7 @@ describe('migration管理', () => {
       '0009_column_names.sql',
       '0010_custom_redaction.sql',
       '0011_cursor.sql',
+      '0012_deepseek_harness.sql',
     ]);
   });
 
@@ -136,7 +137,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '11');
+    assert.equal(versions.rows[0].count, '12');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -152,6 +153,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0009_column_names.sql'), '0009_column_names.sql がない');
     assert.ok(files.includes('0010_custom_redaction.sql'), '0010_custom_redaction.sql がない');
     assert.ok(files.includes('0011_cursor.sql'), '0011_cursor.sql がない');
+    assert.ok(files.includes('0012_deepseek_harness.sql'), '0012_deepseek_harness.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
@@ -293,6 +295,13 @@ describe('一意制約', () => {
 
 describe('CHECK制約', () => {
   it('source・role・sequence_no・revision・status・kind・triggerの値を制限する', async () => {
+    for (const source of ['cursor', 'deepseek_harness']) {
+      await pool.query(
+        `INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
+         VALUES ($1, $2, $3, $4, 'scope', $5, now())`,
+        [uuidv7(), workspace.projectId, workspace.employeeId, source, `session-${source}`],
+      );
+    }
     await expectDbError(
       pool.query(
         `INSERT INTO sessions (id, project_id, employee_id, source, source_namespace, source_session_id, started_at)
