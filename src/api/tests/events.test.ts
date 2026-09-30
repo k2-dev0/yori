@@ -56,6 +56,7 @@ describe('POST /v1/events 正常保存', () => {
       source: 'cursor',
       source_session_id: 'conversation-1',
       model_id: 'anthropic/claude-sonnet-4',
+      client_version: '1.7.2',
     };
 
     const response = await postEvents(app, { token: workspace.token, body: { project_id: workspace.projectId, events: [event] } });
@@ -63,8 +64,10 @@ describe('POST /v1/events 正常保存', () => {
     assert.equal(response.statusCode, 202, response.body);
     const session = await pool.query<{ source: string; source_session_id: string }>('SELECT source, source_session_id FROM sessions');
     assert.deepEqual(session.rows, [{ source: 'cursor', source_session_id: 'conversation-1' }]);
-    const revision = await pool.query<{ text: string; model_id: string | null }>('SELECT text, model_id FROM message_revisions');
-    assert.deepEqual(revision.rows, [{ text: 'Cursorの回答', model_id: 'anthropic/claude-sonnet-4' }]);
+    const revision = await pool.query<{ text: string; model_id: string | null; client_version: string | null }>(
+      'SELECT text, model_id, client_version FROM message_revisions',
+    );
+    assert.deepEqual(revision.rows, [{ text: 'Cursorの回答', model_id: 'anthropic/claude-sonnet-4', client_version: '1.7.2' }]);
   });
 
   it('model_idを持たない既存clientのイベントを従来どおり保存する', async () => {
@@ -73,8 +76,10 @@ describe('POST /v1/events 正常保存', () => {
     const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
 
     assert.equal(response.statusCode, 202, response.body);
-    const revision = await pool.query<{ model_id: string | null }>('SELECT model_id FROM message_revisions');
-    assert.deepEqual(revision.rows, [{ model_id: null }]);
+    const revision = await pool.query<{ model_id: string | null; client_version: string | null }>(
+      'SELECT model_id, client_version FROM message_revisions',
+    );
+    assert.deepEqual(revision.rows, [{ model_id: null, client_version: null }]);
   });
 
   it('userイベントを202で受理し、原文・classify job・自動検索受付を同一TXで保存する', async () => {
