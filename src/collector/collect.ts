@@ -6,6 +6,7 @@ import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, SUSPECTED_SECRET_OBSERVED
 import { emptyRedactionPolicy, redactConversationText, sanitizeConversationText, type RedactionPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
 import { SUPPORTED_CODEX_CLI_VERSIONS, codexTurnMessageId, parseCodexTranscriptLine } from './adapters/codex.js';
+import { DEEPSEEK_HARNESS_VERSION, createDeepSeekTranscriptParser } from './adapters/deepseek.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending, resolvedTargetKey } from './send.js';
 import { decryptCachedPolicy, encryptCachedPolicy } from './policy-cache.js';
@@ -110,14 +111,23 @@ function isSupportedTranscriptVersion(source: EventSource, version: string): boo
   if (source === 'codex') {
     return SUPPORTED_CODEX_CLI_VERSIONS.includes(version);
   }
-  return source === 'claude_code' && version === SUPPORTED_CLAUDE_CODE_VERSION;
+  if (source === 'claude_code') {
+    return version === SUPPORTED_CLAUDE_CODE_VERSION;
+  }
+  return source === 'deepseek_harness' && version === String(DEEPSEEK_HARNESS_VERSION);
 }
 
-function parseLine(source: EventSource, line: string): TranscriptRecord {
+function createTranscriptLineParser(source: EventSource): (line: string) => TranscriptRecord[] {
   if (source === 'codex') {
-    return parseCodexTranscriptLine(line);
+    return (line) => [parseCodexTranscriptLine(line)];
   }
-  return source === 'claude_code' ? parseClaudeTranscriptLine(line) : { kind: 'unknown' };
+  if (source === 'claude_code') {
+    return (line) => [parseClaudeTranscriptLine(line)];
+  }
+  if (source === 'deepseek_harness') {
+    return createDeepSeekTranscriptParser().parseLine;
+  }
+  return () => [{ kind: 'unknown' }];
 }
 
 type HookMessageSelection =
@@ -240,6 +250,7 @@ interface ScanInput {
   onLine: (line: string, byteOffset: number) => void;
   onOversize: (byteOffset: number) => void;
   onInvalidUtf8: (byteOffset: number) => void;
+  maxReadBytes?: number;
 }
 
 // 4MiB予算の範囲で改行単位に読み、未完の末尾行はcursorへ含めない。1MiB超の行は本文を保持せず読み飛ばす。
@@ -252,8 +263,9 @@ function scanLines(input: ScanInput): { cursor: number; skipStart: number | null
   let skipStart = input.skipStart;
   let cursor = lineStart;
   let consumed = 0;
-  while (consumed < MAX_READ_BYTES && !input.shouldStop()) {
-    const toRead = Math.min(READ_CHUNK_BYTES, MAX_READ_BYTES - consumed);
+  const maxReadBytes = input.maxReadBytes ?? MAX_READ_BYTES;
+  while (consumed < maxReadBytes && !input.shouldStop()) {
+    const toRead = Math.min(READ_CHUNK_BYTES, maxReadBytes - consumed);
     const buffer = Buffer.allocUnsafe(toRead);
     const read = readSync(input.fd, buffer, 0, toRead, position);
     if (read === 0) {
@@ -668,7 +680,10 @@ export function ingestTranscript(
       const inode = String(stat.ino);
       const size = Number(stat.size);
       const cursor = getCursor(state, input.namespace, input.source, input.hook.session_id, transcriptPath);
-      const start = resolveStartOffset(fd, cursor, size, device, inode);
+      // DeepSeekのassistant確定はturn/endまでの状態を要する。backfill再実行は先頭から読み、
+      // stored message/outboxの既存冪等性で重複を除く。途中offsetから推測復元しない。
+      const start = input.source === 'deepseek_harness' ? { offset: 0, skipStart: null } : resolveStartOffset(fd, cursor, size, device, inode);
+      const parseLine = createTranscriptLineParser(input.source);
       const ctx: IngestContext = {
         state,
         namespace: input.namespace,
@@ -690,9 +705,17 @@ export function ingestTranscript(
         startOffset: start.offset,
         skipStart: start.skipStart,
         shouldStop: () => ctx.held,
-        onLine: (line, offset) => processRecord(ctx, parseLine(input.source, line), offset),
+        onLine: (line, offset) => {
+          for (const record of parseLine(line)) {
+            processRecord(ctx, record, offset);
+            if (ctx.held) {
+              break;
+            }
+          }
+        },
         onOversize: (offset) => recordDiagnostic(state, input.namespace, 'transcript_line_too_long', offset),
         onInvalidUtf8: (offset) => recordDiagnostic(state, input.namespace, 'transcript_invalid_utf8', offset),
+        maxReadBytes: input.source === 'deepseek_harness' ? Number.MAX_SAFE_INTEGER : undefined,
       });
       if (ctx.held) {
         // 同scanで積んだ先行message/outbox/採番/cursorは一体で戻し、保留原因の診断だけを残す。
