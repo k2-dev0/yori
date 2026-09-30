@@ -8,6 +8,7 @@ import {
   MAX_SOURCE_IDENTIFIER_BYTES,
   MAX_TEXT_LENGTH,
   MIN_BATCH_SIZE,
+  TOKEN_SCOPES,
 } from './contract.js';
 
 // HTTPとMCPの入力境界で共有するprimitive。上限値の実体を1箇所に置き、片側だけdriftしないようにする。
@@ -62,6 +63,7 @@ export const clientVersion = storableString
 
 // UUIDは比較・保存の前に小文字の正規形へ揃える。HTTP body/queryとMCP入力を同じ規則にする。
 export const normalizedUuid = z.uuid().transform((value) => value.toLowerCase());
+export const tokenScopeSchema = z.enum(TOKEN_SCOPES);
 
 // 正数IDの上限。message revision・sequence_no・input_revisionで共有する。
 export const revisionSchema = z.int().min(1).max(MAX_REVISION);
@@ -211,3 +213,17 @@ export const collectorSetupRequestSchema = z.strictObject({
 });
 
 export type ParsedCollectorSetupRequest = z.infer<typeof collectorSetupRequestSchema>;
+
+export const projectRegistrationRequestSchema = z.strictObject({
+  repository: canonicalRepository,
+});
+
+export const tokenIssueRequestSchema = z.strictObject({
+  scope: tokenScopeSchema,
+});
+
+export const employeeTokenParamsSchema = z.strictObject({ employee_id: normalizedUuid });
+export const tokenParamsSchema = z.strictObject({ token_id: normalizedUuid });
+
+export type ParsedProjectRegistrationRequest = z.infer<typeof projectRegistrationRequestSchema>;
+export type ParsedTokenIssueRequest = z.infer<typeof tokenIssueRequestSchema>;
