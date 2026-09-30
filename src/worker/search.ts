@@ -138,13 +138,13 @@ const VECTOR_CANDIDATES_SQL = `
   SELECT e.document_id, e.revision, r.content
     FROM document_embeddings e
     JOIN search_documents d ON d.id = e.document_id
-    JOIN document_publications p
+    JOIN document_search_entries p
       ON p.document_id = e.document_id AND p.generation_id = $4 AND p.revision = e.revision
     JOIN search_document_revisions r
-      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
+      ON r.document_id = e.document_id AND r.revision = e.revision
+        AND (r.status IN ('ready', 'superseded') OR p.correction_only)
    WHERE d.company_id = $1
      AND d.project_id = $2
-     AND d.is_searchable
      AND e.generation_id = $4
      AND NOT EXISTS (
        SELECT 1
@@ -163,13 +163,13 @@ const ENTITY_CANDIDATES_SQL = `
   SELECT DISTINCT e.document_id, e.revision, r.content
     FROM document_entities e
     JOIN search_documents d ON d.id = e.document_id
-    JOIN document_publications p
+    JOIN document_search_entries p
       ON p.document_id = e.document_id AND p.generation_id = $3 AND p.revision = e.revision
     JOIN search_document_revisions r
-      ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
+      ON r.document_id = e.document_id AND r.revision = e.revision
+        AND (r.status IN ('ready', 'superseded') OR p.correction_only)
    WHERE d.company_id = $1
      AND d.project_id = $2
-     AND d.is_searchable
      AND (e.entity_type, e.entity_key) IN (SELECT * FROM unnest($4::text[], $5::text[]))
      AND NOT EXISTS (
        SELECT 1
@@ -617,7 +617,12 @@ async function loadValidCandidate(
   target: JobTarget,
   generation: EmbeddingGeneration,
   candidate: Candidate,
-): Promise<{ stale: boolean; evidence: EvidenceRow[] } | null> {
+): Promise<{ stale: boolean; evidence: EvidenceRow[]; correctionOnly: boolean } | null> {
+  // relation更新triggerはrelation→documentの順にlockするため、保存側も同じ順序に揃える。
+  await client.query(
+    `SELECT r.id FROM message_relations r WHERE r.to_message_id IN (
+       SELECT message_id FROM search_document_sources WHERE document_id = $1 AND document_revision = $2
+     ) ORDER BY r.id FOR SHARE`, [candidate.documentId, candidate.revision]);
   // source messageのcurrent_revision確認とsaveのcommitまで、同じmessages行を共有lockで保持する。
   // eventsのrevision更新と競合した場合は検索commitか改訂のどちらかが先に確定し、旧原文のmatched保存を作らない。
   const sources = await client.query<EvidenceRow>(
@@ -646,21 +651,49 @@ async function loadValidCandidate(
       return null;
     }
   }
-  const document = await client.query<{ is_stale: boolean }>(
-    `SELECT p.is_stale, p.revision
+  // 非公開化のtriggerもdocument行をlockする。候補entryの読込まで同じlockで保護する。
+  await client.query('SELECT id FROM search_documents WHERE id = $1 FOR UPDATE', [candidate.documentId]);
+  await client.query(
+    'SELECT document_id FROM document_publications WHERE document_id = $1 AND generation_id = $2 AND revision = $3 FOR UPDATE',
+    [candidate.documentId, generation.id, candidate.revision]);
+  await client.query(
+    'SELECT document_id FROM document_correction_anchors WHERE document_id = $1 AND generation_id = $2 AND revision = $3 FOR SHARE',
+    [candidate.documentId, generation.id, candidate.revision]);
+  await client.query('SELECT document_id FROM search_document_revisions WHERE document_id = $1 AND revision = $2 FOR SHARE',
+    [candidate.documentId, candidate.revision]);
+  const document = await client.query<{ is_stale: boolean; correction_only: boolean }>(
+    `SELECT p.is_stale, p.revision, p.correction_only
        FROM search_documents d
-       JOIN document_publications p
+       JOIN document_search_entries p
          ON p.document_id = d.id AND p.generation_id = $2 AND p.revision = $3
        JOIN search_document_revisions r
-         ON r.document_id = d.id AND r.revision = $3 AND r.status IN ('ready', 'superseded')
-      WHERE d.id = $1 AND d.company_id = $4 AND d.project_id = $5 AND d.is_searchable
-      FOR UPDATE OF d, p, r`,
+         ON r.document_id = d.id AND r.revision = $3 AND (r.status IN ('ready', 'superseded') OR p.correction_only)
+      WHERE d.id = $1 AND d.company_id = $4 AND d.project_id = $5`,
     [candidate.documentId, generation.id, candidate.revision, target.companyId, target.projectId],
   );
   if (document.rows.length === 0) {
     return null;
   }
-  return { stale: document.rows[0].is_stale, evidence: sources.rows };
+  return { stale: document.rows[0].is_stale, evidence: sources.rows, correctionOnly: document.rows[0].correction_only };
+}
+
+// 訂正された根拠は有効な訂正本文と組でのみ返す。探索打切り・範囲外・失効なら単独採用しない。
+async function correctionsCovered(client: PoolClient, evidence: readonly EvidenceRow[], related: readonly RelatedEvidenceDraft[], correctionOnly: boolean) {
+  const relations = await client.query<{
+    from_message_id: string; from_message_revision: number; to_message_id: string; to_message_revision: number; relation: string;
+  }>(
+    `SELECT r.from_message_id, r.from_message_revision, r.to_message_id, r.to_message_revision, r.relation
+       FROM message_relations r JOIN messages fm ON fm.id = r.from_message_id AND fm.current_revision = r.from_message_revision
+       JOIN messages tm ON tm.id = r.to_message_id AND tm.current_revision = r.to_message_revision
+       JOIN sessions fs ON fs.id = fm.session_id JOIN sessions ts ON ts.id = tm.session_id
+      WHERE r.to_message_id = ANY($1::uuid[]) AND r.policy_version = $2
+        AND r.relation IN ('revoke', 'change') AND fs.project_id = ts.project_id
+      FOR SHARE OF r`, [evidence.map((source) => source.message_id), WORKER_POLICY_VERSION]);
+  if (correctionOnly && relations.rows.length === 0) return false;
+  return relations.rows.every((relation) => related.some((item) => item.sourceKind === 'correction' &&
+    item.messageId === relation.from_message_id && item.revision === relation.from_message_revision &&
+    item.relations?.some((r) => r.relatedToMessageId === relation.to_message_id &&
+      r.relatedToRevision === relation.to_message_revision && r.relation === relation.relation)));
 }
 
 function buildMatch(
@@ -1018,6 +1051,11 @@ async function saveSearchResult(
     let adoptedKey: string | null = null;
     let outcome = 'no_match';
     if (input.generation !== null) {
+      // 後続訂正の再検証でdocument→relationの逆順lockを作らない。
+      const correctionIds = input.exploration?.related.filter((item) => item.sourceKind === 'correction').map((item) => item.messageId) ?? [];
+      if (correctionIds.length > 0) {
+        await client.query('SELECT id FROM message_relations WHERE from_message_id = ANY($1::uuid[]) ORDER BY id FOR SHARE', [correctionIds]);
+      }
       for (const assessment of rankAccepted(input.evaluations)) {
         const valid = await loadValidCandidate(client, input.target, input.generation, assessment.candidate);
         if (valid === null) {
@@ -1036,6 +1074,9 @@ async function saveSearchResult(
           related = await revalidateRelatedEvidence(client, input.target, input.exploration.related);
           truncated = input.exploration.truncated;
           warnings.push(...input.exploration.warnings);
+        }
+        if (!(await correctionsCovered(client, valid.evidence, related, valid.correctionOnly))) {
+          continue;
         }
         match = buildMatch(assessment, valid, related, truncated);
         adoptedKey = candidateKey(assessment.candidate);
