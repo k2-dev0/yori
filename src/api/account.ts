@@ -6,6 +6,7 @@ import type { AuthContext } from './events.js';
 import type {
   CompanyResponse,
   EmployeeCreateResponse,
+  EmployeeRenameResponse,
   MeResponse,
   TokenIssueResponse,
   TokenRevokeResponse,
@@ -147,6 +148,26 @@ export async function createCompanyEmployee(
   } finally {
     client.release();
   }
+}
+
+export async function renameCompanyEmployee(
+  pool: Pool,
+  auth: AuthContext,
+  employeeId: string,
+  displayName: string,
+): Promise<EmployeeRenameResponse> {
+  const updated = await pool.query<{ id: string; display_name: string }>(
+    `UPDATE employees
+        SET display_name = $1
+      WHERE id = $2 AND company_id = $3
+      RETURNING id, display_name`,
+    [displayName, employeeId, auth.companyId],
+  );
+  const employee = updated.rows[0];
+  if (employee === undefined) {
+    throw new AccountTargetNotFoundError();
+  }
+  return { status: 'done', employee_id: employee.id, display_name: employee.display_name };
 }
 
 export async function issueCompanyToken(
