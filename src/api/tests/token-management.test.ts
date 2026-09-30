@@ -1,13 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { buildApp } from '../app.js';
-import {
-  employeeListResponseSchema,
-  meResponseSchema,
-  tokenIssueResponseSchema,
-  tokenListResponseSchema,
-  tokenRevokeResponseSchema,
-} from '../response-schema.js';
+import { companyResponseSchema, meResponseSchema, tokenIssueResponseSchema, tokenRevokeResponseSchema } from '../response-schema.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
@@ -58,22 +52,22 @@ describe('本人・社員・token管理API', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/me', headers: headers(workspace.token) });
     assert.equal(response.statusCode, 200, response.body);
     const body = meResponseSchema.parse(response.json());
-    assert.equal(body.company_id, workspace.companyId);
-    assert.equal(body.employee_id, workspace.employeeId);
+    assert.equal(body.company.company_id, workspace.companyId);
+    assert.equal(body.employee.employee_id, workspace.employeeId);
     assert.equal(body.token.token_id, await tokenIdOf(workspace.token));
     assert.equal(body.token.scope, 'employee');
     assert.equal(body.token.revoked_at, null);
+    assert.ok(body.projects.some((project) => project.project_id === workspace.projectId));
     assert.ok(!response.body.includes(workspace.token), 'raw tokenを返している');
     assert.ok(!response.body.includes(sha256Bytes(workspace.token).toString('hex')), 'token hashを返している');
   });
 
-  it('employee tokenは社員/token一覧・発行・失効を403にし、DBを変更しない', async () => {
+  it('employee tokenはcompany情報・token発行・失効を403にし、DBを変更しない', async () => {
     const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
     const tokenId = await tokenIdOf(workspace.token);
     const before = await countRows(pool, 'auth_tokens');
     const requests = [
-      { method: 'GET', url: '/v1/employees' },
-      { method: 'GET', url: '/v1/tokens' },
+      { method: 'GET', url: '/v1/company' },
       { method: 'POST', url: `/v1/employees/${targetEmployeeId}/tokens`, payload: { scope: 'employee' } },
       { method: 'DELETE', url: `/v1/tokens/${tokenId}` },
     ];
@@ -99,11 +93,14 @@ describe('本人・社員・token管理API', () => {
     const otherEmployeeId = await insertEmployee(pool, otherCompanyId, 'other');
     await issueAuthToken(pool, otherCompanyId, otherEmployeeId, 'company_admin');
 
-    const employeesResponse = await app.inject({ method: 'GET', url: '/v1/employees', headers: headers(adminToken) });
-    assert.equal(employeesResponse.statusCode, 200, employeesResponse.body);
-    const employees = employeeListResponseSchema.parse(employeesResponse.json()).employees;
+    const companyResponse = await app.inject({ method: 'GET', url: '/v1/company', headers: headers(adminToken) });
+    assert.equal(companyResponse.statusCode, 200, companyResponse.body);
+    const company = companyResponseSchema.parse(companyResponse.json());
+    const employees = company.employees;
     assert.deepEqual(employees.map((employee) => employee.employee_id).sort(), [workspace.employeeId, targetEmployeeId].sort());
     assert.ok(!employees.some((employee) => employee.employee_id === otherEmployeeId));
+    assert.ok(company.projects.some((project) => project.project_id === workspace.projectId));
+    assert.ok(!company.tokens.some((token) => token.employee_id === otherEmployeeId));
 
     for (const scope of ['employee', 'company_admin'] as const) {
       const issuedResponse = await app.inject({
@@ -119,9 +116,9 @@ describe('本人・社員・token管理API', () => {
       assert.equal(issued.scope, scope);
       assert.match(issued.token, /^yori_[A-Za-z0-9_-]+$/);
 
-      const tokensResponse = await app.inject({ method: 'GET', url: '/v1/tokens', headers: headers(adminToken) });
+      const tokensResponse = await app.inject({ method: 'GET', url: '/v1/company', headers: headers(adminToken) });
       assert.equal(tokensResponse.statusCode, 200, tokensResponse.body);
-      const tokens = tokenListResponseSchema.parse(tokensResponse.json()).tokens;
+      const tokens = companyResponseSchema.parse(tokensResponse.json()).tokens;
       assert.ok(tokens.some((token) => token.token_id === issued.token_id && token.employee_id === targetEmployeeId && token.scope === scope));
       assert.ok(!tokens.some((token) => token.employee_id === otherEmployeeId));
       assert.ok(!tokensResponse.body.includes(issued.token), '一覧へraw tokenを返している');
