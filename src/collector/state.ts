@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS source_sessions (
   transcript_version TEXT,
   PRIMARY KEY (namespace, source, source_session_id)
 );
+CREATE TABLE IF NOT EXISTS direct_sources (
+  namespace TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  PRIMARY KEY (namespace, source, source_session_id)
+);
 CREATE TABLE IF NOT EXISTS file_cursors (
   namespace TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -80,6 +87,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   revision INTEGER NOT NULL,
   role TEXT NOT NULL,
   occurred_at TEXT NOT NULL,
+  model_id TEXT,
+  client_version TEXT,
   text TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   UNIQUE (namespace, idempotency_key)
@@ -171,6 +180,8 @@ export function openCollectorState(stateDir: string): CollectorState {
   // oversize行の読み捨て位置を保持する列は、旧stateではCREATE TABLE IF NOT EXISTSで追加されない。
   ensureColumn(db, 'file_cursors', 'skip_start', 'INTEGER');
   ensureColumn(db, 'file_cursors', 'skip_offset', 'INTEGER');
+  ensureColumn(db, 'outbox', 'model_id', 'TEXT');
+  ensureColumn(db, 'outbox', 'client_version', 'TEXT');
   return { stateDir, dbPath, db };
 }
 
@@ -247,6 +258,8 @@ export interface OutboxRow {
   revision: number;
   role: EventRole;
   occurred_at: string;
+  model_id: string | null;
+  client_version: string | null;
   text: string;
 }
 
@@ -511,13 +524,17 @@ export function enqueueOutbox(
     revision: number;
     role: EventRole;
     occurred_at: string;
+    model_id?: string;
+    client_version?: string;
     text: string;
   },
 ): void {
   state.db
     .prepare(
-      `INSERT INTO outbox (namespace, idempotency_key, project_id, source, source_scope, source_session_id, source_message_id, sequence_no, revision, role, occurred_at, text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO outbox
+         (namespace, idempotency_key, project_id, source, source_scope, source_session_id, source_message_id,
+          sequence_no, revision, role, occurred_at, model_id, client_version, text, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (namespace, idempotency_key) DO NOTHING`,
     )
     .run(
@@ -532,6 +549,8 @@ export function enqueueOutbox(
       input.revision,
       input.role,
       input.occurred_at,
+      input.model_id ?? null,
+      input.client_version ?? null,
       input.text,
       Date.now(),
     );
