@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
-import { EVENT_SOURCES, type EventSource } from '../api/contract.js';
+import type { EventSource } from '../api/contract.js';
+import { BACKFILL_SOURCES, backfillCollector, type BackfillSource } from './backfill.js';
 import { collectFromHook, flushCollector } from './collect.js';
 import { notifyFromHook, notifyLateFromHook } from './notify.js';
 import { parseCursorHookInput } from './adapters/cursor.js';
@@ -25,43 +27,78 @@ function fail(code: string): never {
   process.exit(1);
 }
 
-function parseCommandLine(argv: string[]): { command: string; source?: string; configPath: string } {
+const HOOK_SOURCES = ['codex', 'claude_code', 'cursor'] as const;
+
+function parseCommandLine(argv: string[]): {
+  command: string;
+  source?: string;
+  configPath: string;
+  repository?: string;
+  dryRun: boolean;
+} {
   const [command, ...rest] = argv;
   if (
     command === undefined ||
-    (command !== 'collect' && command !== 'notify' && command !== 'notify-late' && command !== 'flush' && command !== 'diagnostics')
+    (command !== 'collect' &&
+      command !== 'notify' &&
+      command !== 'notify-late' &&
+      command !== 'flush' &&
+      command !== 'diagnostics' &&
+      command !== 'backfill')
   ) {
     fail('unknown_command');
   }
   let source: string | undefined;
   let configPath: string | undefined;
-  for (let index = 0; index < rest.length; index += 2) {
+  let repository: string | undefined;
+  let dryRun = false;
+  for (let index = 0; index < rest.length; index += 1) {
     const key = rest[index];
+    if (key === '--dry-run') {
+      if (command !== 'backfill' || dryRun) {
+        fail('invalid_arguments');
+      }
+      dryRun = true;
+      continue;
+    }
     const value = rest[index + 1];
-    if (key === undefined || value === undefined) {
+    if (key === undefined || value === undefined || value.startsWith('--')) {
       fail('invalid_arguments');
     }
     if (key === '--source') {
       source = value;
     } else if (key === '--config') {
       configPath = value;
+    } else if (key === '--repository') {
+      repository = value;
     } else {
       fail('invalid_arguments');
     }
+    index += 1;
   }
   if (configPath === undefined) {
     fail('invalid_arguments');
   }
   if (
     (command === 'collect' || command === 'notify' || command === 'notify-late') &&
-    (source === undefined || !EVENT_SOURCES.includes(source as EventSource))
+    (source === undefined || !HOOK_SOURCES.includes(source as (typeof HOOK_SOURCES)[number]))
   ) {
     fail('invalid_source');
   }
   if ((command === 'notify' || command === 'notify-late') && source === 'cursor') {
     fail('invalid_source');
   }
-  return { command, source, configPath };
+  if (command === 'backfill') {
+    if (repository === undefined || !path.isAbsolute(repository)) {
+      fail('invalid_arguments');
+    }
+    if (source !== undefined && !BACKFILL_SOURCES.includes(source as BackfillSource)) {
+      fail('invalid_source');
+    }
+  } else if (repository !== undefined || dryRun) {
+    fail('invalid_arguments');
+  }
+  return { command, source, configPath, repository, dryRun };
 }
 
 function readToken(config: CollectorConfig): string {
@@ -73,7 +110,7 @@ function readToken(config: CollectorConfig): string {
 }
 
 async function main(): Promise<void> {
-  const { command, source, configPath } = parseCommandLine(process.argv.slice(2));
+  const { command, source, configPath, repository, dryRun } = parseCommandLine(process.argv.slice(2));
   let config: CollectorConfig;
   try {
     config = loadCollectorConfig(configPath);
@@ -82,7 +119,7 @@ async function main(): Promise<void> {
   }
   const token = readToken(config);
 
-  if (command === 'collect' || command === 'notify' || command === 'notify-late' || command === 'flush') {
+  if (command === 'collect' || command === 'notify' || command === 'notify-late' || command === 'flush' || command === 'backfill') {
     // known secretは本文を読む前にlocal envから検証し、不正時はfixed codeでfail-closedにする。
     // parseに成功するとenvから削除され、SQLite・outbox・log・送信bodyへ生値を残さない。
     let knownSecrets: string[];
@@ -93,6 +130,23 @@ async function main(): Promise<void> {
     }
     if (command === 'flush') {
       await flushCollector({ config, token, knownSecrets });
+      return;
+    }
+    if (command === 'backfill') {
+      let summary;
+      try {
+        summary = await backfillCollector({
+          repository: repository as string,
+          config,
+          token,
+          knownSecrets,
+          dryRun,
+          ...(source === undefined ? {} : { source: source as BackfillSource }),
+        });
+      } catch {
+        fail('invalid_arguments');
+      }
+      process.stdout.write(`${JSON.stringify(summary)}\n`);
       return;
     }
     let hookInput: unknown;
