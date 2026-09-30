@@ -157,7 +157,7 @@ async function applyEvent(
        VALUES ($1, $2, $3, $4, $5, $6, 1)`,
       [messageId, sessionId, event.source_message_id, event.sequence_no, event.role, occurredAt],
     );
-    await insertRevision(client, messageId, event.revision, event.text);
+    await insertRevision(client, messageId, event.revision, event.text, event.model_id);
   }
 
   const requestId = event.role === 'user' ? await resolveAutoSearchRequest(client, auth, projectId, sessionId, messageId, event) : null;
@@ -237,26 +237,27 @@ async function applyRevision(client: PoolClient, message: StoredMessage, event: 
     throw new EventConflictError();
   }
   if (event.revision === message.current_revision + 1) {
-    await insertRevision(client, message.id, event.revision, event.text);
+    await insertRevision(client, message.id, event.revision, event.text, event.model_id);
     await client.query('UPDATE messages SET current_revision = $2, updated_at = now() WHERE id = $1', [message.id, event.revision]);
     return;
   }
-  const existing = await client.query<{ text: string }>(
-    'SELECT text FROM message_revisions WHERE message_id = $1 AND revision = $2',
+  const existing = await client.query<{ text: string; model_id: string | null }>(
+    'SELECT text, model_id FROM message_revisions WHERE message_id = $1 AND revision = $2',
     [message.id, event.revision],
   );
   const revision = existing.rows[0];
-  if (!revision || revision.text !== event.text) {
+  if (!revision || revision.text !== event.text || revision.model_id !== (event.model_id ?? null)) {
     throw new EventConflictError();
   }
 }
 
-async function insertRevision(client: PoolClient, messageId: string, revision: number, text: string): Promise<void> {
-  await client.query('INSERT INTO message_revisions (message_id, revision, text, content_hash) VALUES ($1, $2, $3, $4)', [
+async function insertRevision(client: PoolClient, messageId: string, revision: number, text: string, modelId: string | undefined): Promise<void> {
+  await client.query('INSERT INTO message_revisions (message_id, revision, text, content_hash, model_id) VALUES ($1, $2, $3, $4, $5)', [
     messageId,
     revision,
     text,
     sha256Utf8(text),
+    modelId ?? null,
   ]);
 }
 
@@ -298,7 +299,7 @@ interface ReceiptHashInput {
 
 // receipt payloadはcontractで固定したキー順のJSONに直列化し、occurred_atは受信文字列をそのまま使う。
 function receiptHash(input: ReceiptHashInput): Buffer {
-  const values: Record<string, string | number> = {
+  const values: Record<string, string | number | undefined> = {
     company_id: input.companyId,
     employee_id: input.employeeId,
     project_id: input.projectId,
@@ -311,6 +312,7 @@ function receiptHash(input: ReceiptHashInput): Buffer {
     revision: input.event.revision,
     role: input.event.role,
     occurred_at: input.event.occurred_at,
+    model_id: input.event.model_id,
     text: input.event.text,
   };
   const ordered = RECEIPT_PAYLOAD_KEYS.map((key) => [key, values[key]] as const);
