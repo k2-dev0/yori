@@ -543,6 +543,12 @@ describe('M7 collector補助通知', () => {
           assert.ok(context.includes('M7-CORRECTION-TEXT'), '訂正文がadditionalContextにない');
           assert.ok(context.includes('change'), 'correctionのrelationがadditionalContextにない');
           assert.ok(context.includes('M7-RELATED-NEIGHBOR'), 'related_evidenceがadditionalContextにない');
+          assert.ok(context.includes('現在の訂正・撤回:'), '訂正を現在の情報として明示していない');
+          assert.ok(context.includes('元の根拠（訂正・撤回前を含みます）:'), 'primary evidenceを元の根拠として区別していない');
+          assert.ok(
+            context.indexOf('M7-CORRECTION-TEXT') < context.indexOf('M7-EVIDENCE-TEXT'),
+            '訂正より先に元のprimary evidenceを提示している',
+          );
           assert.ok(!result.stdout.includes('token-a'), 'tokenを出力している');
         });
       },
