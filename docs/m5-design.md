@@ -28,7 +28,7 @@ M5は`execute_search`、案件内の厳密vector検索、明示識別子の完�
 ## Jev候補判定
 
 - TypeSafeの`POST /v1/systemone`へstructured objectのstateを送り、候補ごとの4段階relevance（unrelated/peripheral/useful/direct）とは別に、対象一致、症状または修正依頼の類似、環境・制約の近さ、実装理由の根拠、手順の再利用性、proposal/reported_completed/reported_verified/unknownを独立したChoice質問で判定する。
-- `useful`または`direct`だけを採用し、relevance段階、RRF、文書IDの順で代表候補を1件選ぶ。confidenceを正答率へ変換しない。
+- `useful`または`direct`だけを採用する。代表候補はrelevance段階、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFの順で選ぶ。同じ既知の発言状態かつRRF同点ではsourceの最新日時を使い、unknown同士は日時で推測せず文書IDの安定順を維持する。confidenceを正答率へ変換しない。
 - 検証済みChoice回答だけを、全候補について`candidate_evaluations`へ保存する。document ID・revision、総合relevance、positiveな理由コード、statement status、各質問のchoice・全probabilities・confidence、代表採用の有無を残す。原文や外部error bodyはこの診断fieldへ複製しない。
 - HTTP送信直前にJevの会社・account・endpoint・学習利用条件の承認を確認する。試行ごとにusageを保存し、原文・credential・外部error bodyは運用ログへ出さない。
 - TypeSafe公式APIはstateにstring/object/arrayを受け付け、構造化fieldをinstructionsから参照できる。実Jevへの社内データ送信は未実施で、テストはloopback fixtureのみ。
