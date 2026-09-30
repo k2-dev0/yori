@@ -6,7 +6,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 
 - Node.js 24以降と`git`（案件特定に`git -C <cwd> rev-parse`と`remote.origin.url`を使う）。
 - 中央APIの社員token（`POST /v1/events`・`POST /v1/collector/setup`のBearer）。案件は設定の`project_id`ではなく、hook cwdのcanonical repositoryでsetup APIが解決する。
-- 対応版: Codex Desktopは`cli_version=0.155.0-alpha.9.2`と`0.155.0-alpha.16.4`、Claude Codeは`2.1.220`。明示した版だけを許可し、外部Codex CLI `0.156.1`はDesktop transcriptの確認根拠がないため対象に含めない。未知版のログは本文を取り込まず診断にだけ記録して保留する。旧版形式へのフォールバックはしない。
+- 確認済み版: Codex Desktopは`cli_version=0.155.0-alpha.9.2`と`0.155.0-alpha.16.4`、Claude Codeは`2.1.220`。版番号は互換性の診断情報であり、未知版でも確認済み構造に一致するrecordは取り込む。構造が変わったrecordは本文を推測せず診断する。
 - 外部へ送る先は設定の中央APIだけ。Jev/Voyage等の呼出しはない。
 
 ## 設定
@@ -44,10 +44,10 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 }
 ```
 
-- Codex/Claude Codeとも同じcommon input（`session_id`、`cwd`、`transcript_path`）を使う。`hook.prompt`や`last_assistant_message`から別IDを発明しない。
+- Codexはcommon input（`session_id`、`cwd`、`transcript_path`）に加え、`UserPromptSubmit`の`turn_id`/`prompt`と`Stop`の`turn_id`/`last_assistant_message`を通常収集の正本にする。IDは`turn:<turn_id>:user|assistant`へ決定的に変換し、同じhookの再実行とtranscript backfillを重複させない。Claude Codeと旧hook入力はtranscript差分へfallbackする。
 - 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`の`notify`は内部でcollectも行うため、同じeventへ別のcollectを並列登録しない。今回のcollectで新規または改訂されたuser発言を特定できた場合だけ、検索結果を1回最大5秒・累計最大10秒待つ。
 - `notify`は完了結果を`hookSpecificOutput.additionalContext`として返す。Codexは現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。hook完了だけで新しいturnを強制開始しない。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
-- Stop直後に未書込の最終発言は、次のhookまたは明示flushで回収する。入力直後の自動検索と現在入力のID照合はM6で実装済み。
+- Codexの`Stop.last_assistant_message`は、タスク完了に限らずAgentがそのturnを終えてユーザーへ制御を返すときの最新assistant messageとして収集する。commentary・tool call/output・reasoningは収集しない。入力直後の自動検索は`UserPromptSubmit.prompt`から確定したturn identityを使う。
 - 1回の入力処理はcursor・message・outboxを同一SQLite transactionで更新する。ネットワーク待機中はtransactionを保持しない。
 
 ## CLI
@@ -62,7 +62,7 @@ npm run collector:flush -- --config ~/.yori-collector.json
 npm run collector:diagnostics -- --config ~/.yori-collector.json
 ```
 
-- `collect`: hook JSONをstdinから読み、指定transcriptの差分だけを処理する。全履歴は走査しない。
+- `collect`: hook JSONをstdinから読み、Codexの安定hook fieldを1件処理する。fieldがない旧hookとClaude Codeでは指定transcriptの差分を処理する。全履歴は走査しない。
 - `notify`: collect後、今回確定したuser入力の検索結果だけを待ち、安全な次のmodel入力へ渡すJSONをstdoutへ出す。未完了・入力不明では何も出さない。
 - `flush`: 保留sourceの対応表を再確認して未読分を取り込み、未送信eventを同じbody・同じ識別子で再送する。
 - `diagnostics`: 資格情報のnamespaceに保存された診断を`[{"code":"...","byteOffset":123}]`のJSON配列でstdoutへ出す。本文・通知コンテキスト・raw errorは出さない。
@@ -80,10 +80,10 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 - 本文の秘匿値（秘密鍵・各社APIキー・JWT・URL資格情報・`PASSWORD=`等の代入値・Authorizationヘッダ）は、既知形式の値と代入形の値だけを`[REDACTED:<種類>]`へ置換してからoutboxと送信bodyへ入れる。会社のbusiness ruleは`fields`（ASCII identifier・case-insensitiveのexact key一致・最大128コードポイント）と`terms`（exact・case-sensitive・最長一致・最大512コードポイント）の2種で合計最大100件。`fields`はkey表記・空白・区切りを保持してvalueだけを`[REDACTED:business_value]`へ、`terms`は一致文字列を`[REDACTED:business_term]`へ置換する（regexなし、keyのみ・空値・環境変数参照・placeholderは変更しない）。登録済みfieldとexact一致する代入keyはbuilt-inの代入形検出よりfieldを優先する。built-inは`PASS`/`pass`の代入値と全角colonも`[REDACTED:env_value]`へ置換する。collectorを経ないAPI直接送信でも受付側で同じpolicyを適用する。名前・区切り・他の文字は変えず、空値と`${VAR}`参照は置換しない。置換した発言は固定code`message_redacted`と参照byte offsetだけを診断へ記録し、値も種類も残さない。置換は決定的なので、同じ本文を読み直しても同じcontent hashになりrevisionを増やさない。置換するのは新しく取り込む本文だけで、既に保存済みの過去revisionの原文は書き換えない（削除・backfillは別作業）。
 - known secretはcollector processのlocal環境変数`YORI_KNOWN_SECRETS_JSON`（strict JSON string array、8〜4096コードポイント・最大100件・exact重複拒否）で受け取り、完全一致値を最長一致で`[REDACTED:known_secret]`へ置換する。未設定は空配列、設定済みの不正は固定code`invalid_known_secrets`で本文を読まずにfail-closedとし、parse後は`process.env`から削除する。known secretの生値はstate・outbox・log・送信bodyへ残さない。
 - suspicion gate（detector `initial-v1`）はbuilt-in・known secret・fields・terms適用後の本文から32〜256コードポイントのtoken風候補を検出し、既知placeholder・UUID・7〜64桁hex/git SHA/checksum・semver・repository path・通常identifierを除外する。`suspicion_mode=observe`は候補を本文へ残して送信し固定code`message_suspected_secret`を診断へ記録、`block`はmessage/outboxを保存せず固定code`message_blocked_suspected_secret`と参照byte offsetだけを残してcursorを進め、後続messageの処理は継続する。
-- 未完行は次回へ回す。JSON破損・未知record・未知版・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。本文長の判定は置換後に行う。
-- Codex Desktopから収集するのは`event_msg/item_completed`の`UserMessage`と`AgentMessage`だけ。`response_item`、`turn_context`、`token_usage_record`、`world_state`、`compacted`は既知の非会話top-level recordとして無診断で無視する。`Reasoning`、`CommandExecution`、`FileChange`、`Extension`、tool call/outputも収集しない。未知のtop-level typeは`transcript_unknown_record`として診断する。
+- 未完行は次回へ回す。JSON破損・未知record・1MiB超の行・NUL/単独サロゲート・本文65536コードポイント超・識別子1024 UTF-8 bytes超は、本文を送信せず固定codeと参照byte offsetだけを診断へ記録する。未知versionは`transcript_unverified_version`として診断するが、構造検証を通った発言は取り込む。行長はチャンク境界に依存せず、未完分と今回chunkの完成行bytesの合計で判定する（1MiBちょうどは取り込む）。本文長の判定は置換後に行う。
+- Codex transcriptからbackfillするのは`event_msg/item_completed`の`UserMessage`と`phase=final_answer`の`AgentMessage`だけ。`phase=commentary`、`response_item`、`turn_context`、`token_usage_record`、`world_state`、`compacted`は無視する。`Reasoning`、`CommandExecution`、`FileChange`、`Extension`、tool call/outputも収集しない。未知のtop-level typeは`transcript_unknown_record`として診断する。
 - 完成行を文字列へ変換する前にUTF-8を検証する。不正バイトを含む行は置換せず除外し、`transcript_invalid_utf8`とoffsetを記録する。正常なUnicodeと後続行は保持する。未完行の途中で切れた文字は完成まで判定しない。
-- 未知版・session不一致で保留したscanは、そのscanで積んだmessage/outbox/採番/cursorを一体でrollbackし、保留原因の診断だけを残す。原因が解消すると同じ行を先頭から同じ順で読み直し、重複しないsequenceを採番する。
+- session不一致で保留したscanは、そのscanで積んだmessage/outbox/採番/cursorを一体でrollbackし、保留原因の診断だけを残す。原因が解消すると同じ行を先頭から同じ順で読み直し、重複しないsequenceを採番する。
 - 1MiB超の行は本文を保持せず改行まで読み捨てる。読み捨て中の元行startと読取済みoffsetは`file_cursors`へ保存し、次回は途中から再開する。4MiBの読取予算は読み捨て中の読取も含む。inode交換・短縮・fingerprint不一致の再読込時は読み捨て状態も捨てる。旧schemaのstateには列を後方互換で追加する。
 - 識別子はserver契約と同じく空・NUL・単独サロゲート・1024 UTF-8 bytes超を拒否する。不正な`source_message_id`はoutboxへ入れず診断し、不正な`session_id`は収集境界で診断してsource/sessionを保存しない。
 - 同じmessage IDの本文変更はrevisionを増やし、完全一致の再録は無視する。role・発言時刻を変える更新は保留して診断する。
