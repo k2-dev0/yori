@@ -630,7 +630,7 @@ describe('M7 POST /v1/session-links', () => {
     }
   });
 
-  it('未認証は401、案件memberでないtokenは403にする', async () => {
+  it('未認証は401、別会社tokenは403にする', async () => {
     const otherWorkspace = await seedWorkspace(pool, { name: 'company-b', repositoryIdentifier: 'repo-b' });
     const body = buildLinkBody({
       from: { source: 'codex', source_scope: SCOPE, source_session_id: 'auth-from' },
@@ -649,7 +649,7 @@ describe('M7 POST /v1/session-links', () => {
     assert.equal(errorCode(unauthorized), 'unauthorized');
 
     const forbidden = await postSessionLink({ token: otherWorkspace.token, body });
-    assert.equal(forbidden.statusCode, 403, `非memberを403にしない: ${forbidden.statusCode} ${forbidden.body}`);
+    assert.equal(forbidden.statusCode, 403, `別会社tokenを403にしない: ${forbidden.statusCode} ${forbidden.body}`);
     assert.equal(errorCode(forbidden), 'forbidden');
   });
 });
