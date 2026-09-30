@@ -17,6 +17,7 @@ import {
   collectorSetupResponseSchema,
   companyResponseSchema,
   employeeCreateResponseSchema,
+  employeeRenameResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -34,8 +35,9 @@ import {
 import {
   collectorSetupRequestSchema,
   eventsRequestSchema,
-  employeeTokenParamsSchema,
   employeeCreateRequestSchema,
+  employeeParamsSchema,
+  employeeRenameRequestSchema,
   evidenceQuerySchema,
   projectRegistrationRequestSchema,
   searchByInputQuerySchema,
@@ -59,6 +61,7 @@ import {
   LastCompanyAdminError,
   loadCompany,
   loadMe,
+  renameCompanyEmployee,
   revokeCompanyToken,
 } from './account.js';
 
@@ -132,6 +135,35 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     }
   });
 
+  app.patch('/v1/employees/:employee_id', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    const params = employeeParamsSchema.safeParse(request.params);
+    const body = employeeRenameRequestSchema.safeParse(request.body);
+    if (!params.success || !body.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const renamed = await renameCompanyEmployee(
+        deps.pool,
+        auth,
+        params.data.employee_id,
+        body.data.display_name,
+      );
+      return reply.code(200).send(employeeRenameResponseSchema.parse(renamed));
+    } catch (error) {
+      if (error instanceof AccountTargetNotFoundError) {
+        return reply.code(404).send(errorBody('not_found'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
   app.post('/v1/employees/:employee_id/tokens', async (request, reply) => {
     const auth = await authenticate(deps.pool, request.headers.authorization);
     if (!auth) {
@@ -140,7 +172,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (auth.tokenScope !== 'company_admin') {
       return reply.code(403).send(errorBody('forbidden'));
     }
-    const params = employeeTokenParamsSchema.safeParse(request.params);
+    const params = employeeParamsSchema.safeParse(request.params);
     const body = tokenIssueRequestSchema.safeParse(request.body);
     if (!params.success || !body.success) {
       return reply.code(400).send(errorBody('invalid_request'));
