@@ -1,6 +1,6 @@
 import type { TranscriptRecord } from '../transcript.js';
 
-// ローカルClaude Codeの確認済み対応版。未知版から本文を取り込まない。
+// ローカルClaude Codeの確認済み版。未知versionはpipelineで診断し、構造検証はこのadapterで行う。
 export const SUPPORTED_CLAUDE_CODE_VERSION = '2.1.220';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
