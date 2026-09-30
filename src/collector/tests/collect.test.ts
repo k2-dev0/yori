@@ -27,7 +27,7 @@ import {
 } from './support.js';
 
 describe('会話の収集', () => {
-  it('Codexのuser/AI発言を本文・日時・順序を保持して送信し、再読込で再送しない', async () => {
+  it('Codexのuser/turn最終AI発言を本文・日時・順序を保持して送信し、commentaryと再読込を送らない', async () => {
     const projectId = randomUUID();
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: projectId } });
     const mock = installFetchMock(ackResponse);
@@ -62,23 +62,23 @@ describe('会話の収集', () => {
       assert.equal(batch.project_id, projectId);
       assert.deepEqual(
         batch.events.map((event) => event.sequence_no),
-        [1, 2, 3],
+        [1, 2],
       );
       assert.deepEqual(
         batch.events.map((event) => event.role),
-        ['user', 'assistant', 'assistant'],
+        ['user', 'assistant'],
       );
       assert.deepEqual(
         batch.events.map((event) => event.text),
-        ['ユーザー本文', '途中経過', '最終回答'],
+        ['ユーザー本文', '最終回答'],
       );
       assert.deepEqual(
         batch.events.map((event) => event.source_message_id),
-        ['item-user', 'item-commentary', 'item-final'],
+        ['item-user', 'item-final'],
       );
       assert.deepEqual(
         batch.events.map((event) => new Date(event.occurred_at).toISOString()),
-        ['2026-09-21T01:00:01.000Z', '2026-09-21T00:00:01.000Z', '2026-09-21T00:00:01.000Z'],
+        ['2026-09-21T01:00:01.000Z', '2026-09-21T00:00:01.000Z'],
       );
       for (const event of batch.events) {
         assert.equal(event.source, 'codex');
@@ -87,7 +87,7 @@ describe('会話の収集', () => {
         assert.equal(event.revision, 1);
         assert.ok(event.idempotency_key.length > 0 && event.idempotency_key.length <= 512);
       }
-      assert.equal(new Set(batch.events.map((event) => event.idempotency_key)).size, 3);
+      assert.equal(new Set(batch.events.map((event) => event.idempotency_key)).size, 2);
 
       await collectFromHook(options);
       assert.equal(mock.requests.length, 1, '追記がない再読込で再送している');
