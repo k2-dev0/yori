@@ -298,7 +298,7 @@ if (outputPath !== null) {
   process.stdout.write(body);
 }
 if (writeOut) {
-  process.stdout.write(status + String.fromCharCode(10));
+  process.stdout.write((outputPath === null ? String.fromCharCode(10) : '') + status + String.fromCharCode(10));
 }
 process.exit(Number(process.env.FAKE_CURL_STATUS || '0'));
 `;
@@ -499,6 +499,8 @@ if (sub === 'config') {
   status = has('db') ? Number(process.env.FAKE_DOCKER_DB_STATUS || '0') : Number(process.env.FAKE_DOCKER_RECREATE_STATUS || '0');
 } else if (sub === 'run') {
   status = Number(process.env.FAKE_DOCKER_MIGRATE_STATUS || '0');
+} else if (sub === 'exec') {
+  status = Number(has('worker') ? process.env.FAKE_DOCKER_WORKER_RELEASE_STATUS || '0' : process.env.FAKE_DOCKER_API_RELEASE_STATUS || '0');
 } else if (sub === 'rm') {
   for (const service of ['api', 'worker']) {
     if (has(service)) {
@@ -1152,6 +1154,13 @@ describe('remote deployment/deploy.sh (Red)', () => {
         (line, index) => index > caddyUpIndex && line.startsWith('docker ') && line.includes(' ps ') && line.includes(' -q '),
       );
       assert.ok(newIdIndex !== -1, `新container ID取得が実行されていない:\n${lines.join('\n')}`);
+      const apiReleaseIndex = lines.findIndex(
+        (line, index) => index > newIdIndex && line.startsWith('docker ') && line.includes(' exec ') && line.includes(' api '),
+      );
+      const workerReleaseIndex = lines.findIndex(
+        (line, index) => index > newIdIndex && line.startsWith('docker ') && line.includes(' exec ') && line.includes(' worker '),
+      );
+      assert.ok(apiReleaseIndex !== -1 && workerReleaseIndex !== -1, `api/workerの稼働SHAを確認していない:\n${lines.join('\n')}`);
       const portIndex = findLine('compose port api 3210', (line) => line.startsWith('docker ') && line.includes(' port ') && line.includes('3210'));
       const healthIndex = findLine('curl health/ready', (line) => line.startsWith('curl ') && line.includes('/health/ready'));
       const smokeIndex = findLine('collector setup smoke', (line) => line.startsWith('curl ') && line.includes('/v1/collector/setup'));
@@ -1171,6 +1180,8 @@ describe('remote deployment/deploy.sh (Red)', () => {
         workerUpIndex,
         caddyUpIndex,
         newIdIndex,
+        apiReleaseIndex,
+        workerReleaseIndex,
         portIndex,
         healthIndex,
         smokeIndex,
@@ -1380,6 +1391,19 @@ describe('remote deployment/deploy.sh (Red)', () => {
       try {
         const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv(overrides));
         assert.notEqual(result.status, 0, `${label}なのに0で終了した:\n${describeResult(result)}`);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('E6f: apiまたはworkerの稼働SHA確認が失敗すればdeployを失敗させる', () => {
+    requireRemoteScript();
+    for (const key of ['FAKE_DOCKER_API_RELEASE_STATUS', 'FAKE_DOCKER_WORKER_RELEASE_STATUS']) {
+      const stateDir = makeStateDir();
+      try {
+        const result = runRemote(stateDir, TARGET_SHA, remoteHappyEnv({ [key]: '1' }));
+        assert.notEqual(result.status, 0, `${key}失敗なのに0で終了した:\n${describeResult(result)}`);
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
       }
