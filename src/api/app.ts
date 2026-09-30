@@ -16,6 +16,7 @@ import {
 import {
   collectorSetupResponseSchema,
   companyResponseSchema,
+  employeeCreateResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
@@ -34,6 +35,7 @@ import {
   collectorSetupRequestSchema,
   eventsRequestSchema,
   employeeTokenParamsSchema,
+  employeeCreateRequestSchema,
   evidenceQuerySchema,
   projectRegistrationRequestSchema,
   searchByInputQuerySchema,
@@ -52,6 +54,7 @@ import {
 import { ProjectRepositoryConflictError, registerProject } from './projects.js';
 import {
   AccountTargetNotFoundError,
+  createCompanyEmployee,
   issueCompanyToken,
   LastCompanyAdminError,
   loadCompany,
@@ -104,6 +107,26 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     }
     try {
       return reply.code(200).send(companyResponseSchema.parse(await loadCompany(deps.pool, auth)));
+    } catch {
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.post('/v1/employees', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    const parsed = employeeCreateRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const created = await createCompanyEmployee(deps.pool, auth, parsed.data.display_name);
+      return reply.code(201).send(employeeCreateResponseSchema.parse(created));
     } catch {
       return reply.code(500).send(errorBody('internal_error'));
     }
