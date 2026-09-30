@@ -1,0 +1,183 @@
+import assert from 'node:assert/strict';
+import { after, before, beforeEach, describe, it } from 'node:test';
+import { buildApp } from '../app.js';
+import { projectMemberResponseSchema, projectRegistrationResponseSchema } from '../response-schema.js';
+import { createPool, requireDatabaseUrl } from '../../db/pool.js';
+import { runMigrations } from '../../db/migrator.js';
+import {
+  countRows,
+  insertCompany,
+  insertEmployee,
+  insertProject,
+  issueAuthToken,
+  resetDatabase,
+  seedWorkspace,
+  type WorkspaceFixture,
+} from '../../db/tests/fixtures.js';
+
+const pool = createPool(requireDatabaseUrl());
+const app = buildApp({ pool });
+let workspace: WorkspaceFixture;
+
+before(async () => {
+  await runMigrations(pool);
+});
+
+beforeEach(async () => {
+  await resetDatabase(pool);
+  workspace = await seedWorkspace(pool);
+});
+
+after(async () => {
+  await app.close();
+  await pool.end();
+});
+
+function authorization(token: string): Record<string, string> {
+  return { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+}
+
+function errorCode(response: { json<T>(): T }): string | undefined {
+  return response.json<{ error?: { code?: string } }>().error?.code;
+}
+
+describe('project登録API', () => {
+  it('通常tokenで新規登録し、同じrepositoryの再実行は同じprojectをalreadyで返して行を増やさない', async () => {
+    const repository = 'github.com/Org/New-Repo';
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authorization(workspace.token),
+      payload: { repository },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+    const created = projectRegistrationResponseSchema.parse(first.json());
+    assert.deepEqual(created, { status: 'done', project_id: created.project_id, repository });
+    assert.equal(await countRows(pool, 'projects'), 2);
+    assert.equal(await countRows(pool, 'project_members'), 1, 'project登録時にmemberを自動追加している');
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authorization(workspace.token),
+      payload: { repository },
+    });
+    assert.equal(second.statusCode, 200, second.body);
+    assert.deepEqual(projectRegistrationResponseSchema.parse(second.json()), {
+      status: 'already',
+      project_id: created.project_id,
+      repository,
+    });
+    assert.equal(await countRows(pool, 'projects'), 2);
+    assert.equal(await countRows(pool, 'project_members'), 1);
+
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authorization(workspace.token),
+      payload: { repository, company_id: workspace.companyId },
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(errorCode(invalid), 'invalid_request');
+  });
+
+  it('別companyのprimaryまたはaliasとrepositoryが衝突したら情報非開示のrepository_conflictを返す', async () => {
+    const otherCompanyId = await insertCompany(pool, 'other-company');
+    const primaryProjectId = await insertProject(pool, otherCompanyId, 'github.com/Other/Primary');
+    await pool.query(
+      'INSERT INTO project_repositories (project_id, company_id, repository_identifier) VALUES ($1, $2, $3)',
+      [primaryProjectId, otherCompanyId, 'github.com/Other/Alias'],
+    );
+    const before = await countRows(pool, 'projects');
+
+    for (const repository of ['github.com/Other/Primary', 'github.com/Other/Alias']) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/projects',
+        headers: authorization(workspace.token),
+        payload: { repository },
+      });
+      assert.equal(response.statusCode, 409, response.body);
+      assert.equal(errorCode(response), 'repository_conflict');
+      assert.deepEqual(Object.keys(response.json()), ['error']);
+      assert.ok(!response.body.includes(otherCompanyId), '衝突先companyを開示している');
+      assert.ok(!response.body.includes(primaryProjectId), '衝突先projectを開示している');
+    }
+    assert.equal(await countRows(pool, 'projects'), before);
+  });
+});
+
+describe('project member追加API', () => {
+  it('company_admin tokenは同じcompanyのmemberを冪等追加する', async () => {
+    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
+    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Member-Target');
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const before = await countRows(pool, 'project_members');
+
+    const first = await app.inject({
+      method: 'PUT',
+      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
+      headers: authorization(adminToken),
+    });
+    assert.equal(first.statusCode, 200, first.body);
+    assert.deepEqual(projectMemberResponseSchema.parse(first.json()), {
+      status: 'done',
+      project_id: projectId,
+      employee_id: targetEmployeeId,
+    });
+    assert.equal(await countRows(pool, 'project_members'), before + 1);
+
+    const second = await app.inject({
+      method: 'PUT',
+      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
+      headers: authorization(adminToken),
+    });
+    assert.equal(second.statusCode, 200, second.body);
+    assert.deepEqual(projectMemberResponseSchema.parse(second.json()), {
+      status: 'already',
+      project_id: projectId,
+      employee_id: targetEmployeeId,
+    });
+    assert.equal(await countRows(pool, 'project_members'), before + 1);
+  });
+
+  it('通常employee tokenは403でmemberを追加しない', async () => {
+    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
+    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Forbidden-Member');
+    const before = await countRows(pool, 'project_members');
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
+      headers: authorization(workspace.token),
+    });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(errorCode(response), 'forbidden');
+    assert.equal(await countRows(pool, 'project_members'), before);
+  });
+
+  it('admin tokenでも別companyまたは不存在のproject/employeeは404でmemberを追加しない', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
+    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Admin-Target');
+    const otherCompanyId = await insertCompany(pool, 'other-company');
+    const otherEmployeeId = await insertEmployee(pool, otherCompanyId, 'other-employee');
+    const otherProjectId = await insertProject(pool, otherCompanyId, 'github.com/Other/Project');
+    const before = await countRows(pool, 'project_members');
+
+    for (const [candidateProjectId, candidateEmployeeId] of [
+      [otherProjectId, targetEmployeeId],
+      [projectId, otherEmployeeId],
+      ['00000000-0000-4000-8000-000000000000', targetEmployeeId],
+    ]) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: `/v1/projects/${candidateProjectId}/members/${candidateEmployeeId}`,
+        headers: authorization(adminToken),
+      });
+      assert.equal(response.statusCode, 404, response.body);
+      assert.equal(errorCode(response), 'not_found');
+    }
+    assert.equal(await countRows(pool, 'project_members'), before);
+  });
+});
