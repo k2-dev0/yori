@@ -13,6 +13,7 @@ x-node-service: &node-service
     DATABASE_URL: postgres://yori:yori@db:5432/yori
     API_HOST: 0.0.0.0
     API_PORT: "3210"
+    YORI_RELEASE_SHA: "0000000000000000000000000000000000000000"
   depends_on:
     db:
       condition: service_healthy
