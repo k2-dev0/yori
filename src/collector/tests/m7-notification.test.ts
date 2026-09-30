@@ -9,7 +9,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { v7 as uuidv7 } from 'uuid';
 import {
-  appendTranscript,
   assertStateDoesNotContain,
   buildCollectorConfig,
   buildHook,
@@ -146,7 +145,7 @@ interface NotificationFixture {
 // UserPromptSubmit hookと同じ引数・stdinで通知CLIを起動できる最小環境を作る。
 async function createNotificationFixture(
   central: FakeCentral,
-  options: { userMessage?: boolean; prompt?: string } = {},
+  options: { includePrompt?: boolean; prompt?: string } = {},
 ): Promise<NotificationFixture> {
   const fixture = await createCollectorFixture({
     remoteUrl: 'https://github.com/Org/Repo.git',
@@ -155,9 +154,6 @@ async function createNotificationFixture(
   const projectId = fixture.config.projects[0]?.project_id as string;
   const transcriptPath = path.join(fixture.root, 'codex.jsonl');
   const lines = [codexSessionLine('session-1')];
-  if (options.userMessage ?? true) {
-    lines.push(codexMessageLine({ sessionId: 'session-1', messageId: 'item-user-1', role: 'user', text: '通知対象の質問本文' }));
-  }
   lines.push(codexMessageLine({ sessionId: 'session-1', messageId: 'item-assistant-1', role: 'assistant', text: '回答本文' }));
   await writeTranscript(transcriptPath, lines);
 
@@ -175,9 +171,8 @@ async function createNotificationFixture(
     cwd: fixture.repoDir,
     extra: {
       hook_event_name: 'UserPromptSubmit',
-      // prompt本文に見える別IDを発明しないことを検証する。
-      prompt: options.prompt ?? 'PROMPT-INVENTED-ID を含むprompt',
       turn_id: 'turn-1',
+      ...((options.includePrompt ?? true) ? { prompt: options.prompt ?? '通知対象の質問本文' } : {}),
     },
   });
   return {
@@ -259,7 +254,7 @@ async function withCentral<T>(byInput: ByInputResponder, fn: (central: FakeCentr
 
 async function withFixture<T>(
   central: FakeCentral,
-  options: { userMessage?: boolean; prompt?: string },
+  options: { includePrompt?: boolean; prompt?: string },
   fn: (fixture: NotificationFixture) => Promise<T>,
 ): Promise<T> {
   const fixture = await createNotificationFixture(central, options);
@@ -288,7 +283,7 @@ describe('M7 collector補助通知', () => {
       await withCentral(
         () => ({ status: 200, body: searchView() }),
         async (central) => {
-          await withFixture(central, { prompt: 'PROMPT-INVENTED-ID' }, async (fixture) => {
+          await withFixture(central, { prompt: '現在の質問本文' }, async (fixture) => {
             const configBefore = await readFile(fixture.configPath, 'utf8');
             const result = await runNotify(fixture, { token, homeDir });
             assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
@@ -313,11 +308,11 @@ describe('M7 collector補助通知', () => {
             assert.equal(params.get('source'), 'codex');
             assert.equal(params.get('source_scope'), 'github.com/Org/Repo');
             assert.equal(params.get('source_session_id'), 'session-1');
-            assert.equal(params.get('source_message_id'), 'item-user-1', 'promptからIDを発明している');
+            assert.equal(params.get('source_message_id'), 'turn:turn-1:user', 'turn identityを使っていない');
             assert.equal(params.get('revision'), '1');
             const waitMs = Number(params.get('wait_ms'));
             assert.ok(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 5_000, `wait_msが1回5秒を超えている: ${params.get('wait_ms')}`);
-            assert.ok(!JSON.stringify(central.requests).includes('PROMPT-INVENTED-ID'), 'prompt本文のIDを通知へ使っている');
+            assert.ok(JSON.stringify(central.requests).includes('現在の質問本文'), 'hookのprompt本文を収集していない');
           });
         },
       );
@@ -379,7 +374,7 @@ describe('M7 collector補助通知', () => {
     const central = await startFakeCentral(
       (request) => {
         const messageId = queryParams(request).get('source_message_id');
-        const marker = messageId === 'item-user-2' ? 'M7-SECOND-INPUT-TEXT' : 'M7-FIRST-INPUT-TEXT';
+        const marker = messageId === 'turn:turn-2:user' ? 'M7-SECOND-INPUT-TEXT' : 'M7-FIRST-INPUT-TEXT';
         return {
           status: 200,
           body: searchView({
@@ -418,10 +413,8 @@ describe('M7 collector補助通知', () => {
       await withFixture(central, {}, async (fixture) => {
         const first = runNotify(fixture);
         await firstEventsStarted;
-        await appendTranscript(
-          fixture.transcriptPath,
-          `${codexMessageLine({ sessionId: 'session-1', messageId: 'item-user-2', role: 'user', text: '後続の質問本文' })}\n`,
-        );
+        fixture.hook.turn_id = 'turn-2';
+        fixture.hook.prompt = '後続の質問本文';
         const second = await runNotify(fixture);
         releaseFirstEvents?.();
         const firstResult = await first;
@@ -439,7 +432,7 @@ describe('M7 collector補助通知', () => {
           const params = queryParams(request);
           return `${params.get('source_message_id')}:${params.get('revision')}`;
         });
-        assert.deepEqual(queried.sort(), ['item-user-1:1', 'item-user-2:1'], `by-inputのidentityが違う: ${JSON.stringify(queried)}`);
+        assert.deepEqual(queried.sort(), ['turn:turn-1:user:1', 'turn:turn-2:user:1'], `by-inputのidentityが違う: ${JSON.stringify(queried)}`);
       });
     } finally {
       await central.close();
@@ -456,17 +449,13 @@ describe('M7 collector補助通知', () => {
           assert.equal(central.byInputRequests.length, 1, '初回のby-input呼出しがない');
           assert.equal(queryParams(central.byInputRequests[0] as RecordedHttpRequest).get('revision'), '1');
 
-          // 同じmessage IDの本文を変更し、collector stateへrevision 2として再取込させる。
-          await writeTranscript(fixture.transcriptPath, [
-            codexSessionLine('session-1'),
-            codexMessageLine({ sessionId: 'session-1', messageId: 'item-user-1', role: 'user', text: '更新された質問本文' }),
-            codexMessageLine({ sessionId: 'session-1', messageId: 'item-assistant-1', role: 'assistant', text: '回答本文' }),
-          ]);
+          // 同じturn IDのprompt本文を変更し、collector stateへrevision 2として再取込させる。
+          fixture.hook.prompt = '更新された質問本文';
           const second = await runNotify(fixture);
           assert.equal(second.code, 0, `notifyが失敗した: ${second.stderr}`);
           assert.equal(central.byInputRequests.length, 2, 'revision更新でby-inputを呼んでいない');
           const params = queryParams(central.byInputRequests[1] as RecordedHttpRequest);
-          assert.equal(params.get('source_message_id'), 'item-user-1');
+          assert.equal(params.get('source_message_id'), 'turn:turn-1:user');
           assert.equal(params.get('revision'), '2', '更新後revisionでby-inputを呼んでいない');
           assert.ok(hookContext(second.stdout).includes('matched'), 'revision更新の追加contextがない');
         });
@@ -498,12 +487,11 @@ describe('M7 collector補助通知', () => {
     await withCentral(
       () => ({ status: 200, body: searchView() }),
       async (central) => {
-        await withFixture(central, { userMessage: false, prompt: 'source_message_id=invented-user-message' }, async (fixture) => {
+        await withFixture(central, { includePrompt: false }, async (fixture) => {
           const result = await runNotify(fixture);
           assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
           assert.equal(result.stdout.trim(), '', 'identity不明なのに追加contextを出力している');
           assert.equal(central.byInputRequests.length, 0, 'identity不明なのにby-inputを呼んでいる');
-          assert.ok(!JSON.stringify(central.requests).includes('invented-user-message'), 'promptからmessage IDを発明している');
         });
       },
     );
