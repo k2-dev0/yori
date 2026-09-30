@@ -282,6 +282,24 @@ function m5ChoiceSelector(mode: M5JevMode): JevChoiceSelector {
   };
 }
 
+function rankingChoiceSelector(
+  statusFor: (text: string) => 'proposal' | 'reported_completed' | 'reported_verified' | 'unknown',
+  relevanceFor: (text: string) => 'useful' | 'direct' = () => 'direct',
+): JevChoiceSelector {
+  return (question, request) => {
+    const field = question.id.split(':')[0] ?? question.id;
+    const candidateId = /candidate_id=([^\s]+)/.exec(question.instructions)?.[1];
+    const text = request.state.candidates?.find((candidate) => candidate.candidate_id === candidateId)?.text ?? '';
+    if (field === 'candidate_relevance') {
+      return relevanceFor(text);
+    }
+    if (field === 'candidate_statement_status') {
+      return statusFor(text);
+    }
+    return Object.keys(question.criteria).includes('yes') ? 'yes' : undefined;
+  };
+}
+
 // ---- 外部待ちgate。候補取得後の状態変更をJev応答タイミングで起こす。 ----
 
 interface ExternalGate {
@@ -1691,6 +1709,180 @@ describe('M5 独立候補判定', () => {
     assert.deepEqual(match?.relevance_kind, ['target_match', 'similar_constraints', 'reusable_procedure']);
     assert.equal(match?.statement_status, 'reported_verified');
     assert.equal(match?.claim_status, 'agent_reported', 'reported_verifiedをエージェント報告のclaim_statusへ格上げした');
+  });
+
+  it('同じrelevanceでは検証済み報告を古い提案より優先し、低relevanceの新情報は昇格させない', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector(
+      (text) => (text.includes('OLD-PROPOSAL') ? 'proposal' : 'reported_verified'),
+      (text) => (text.includes('LOWER-USEFUL') ? 'useful' : 'direct'),
+    );
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    const fixtures = [
+      { marker: 'OLD-PROPOSAL', occurredAt: new Date('2026-09-01T00:00:00.000Z'), embedding: similarityVector(1) },
+      { marker: 'NEW-VERIFIED', occurredAt: new Date('2026-09-02T00:00:00.000Z'), embedding: similarityVector(2) },
+      { marker: 'LOWER-USEFUL', occurredAt: new Date('2026-09-03T00:00:00.000Z'), embedding: similarityVector(3) },
+    ];
+    const messageIds = new Map<string, string>();
+    for (const [index, fixture] of fixtures.entries()) {
+      const text = `${fixture.marker} 同じ対象についての候補`;
+      const message = await seedMessage(pool, {
+        sessionId: sourceSession,
+        sequenceNo: index + 1,
+        role: 'assistant',
+        text,
+        occurredAt: fixture.occurredAt,
+      });
+      messageIds.set(fixture.marker, message.messageId);
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `conclusion-priority-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: fixture.embedding,
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, {
+      workspace,
+      sessionId: inputSession,
+      sequenceNo: 1,
+      text: '同じ対象について現在有効な結論を確認する',
+    });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.ok(evidenceIds.includes(messageIds.get('NEW-VERIFIED') as string), '同じrelevanceの検証済み報告を優先していない');
+    assert.ok(!evidenceIds.includes(messageIds.get('OLD-PROPOSAL') as string), '古い提案を検証済み報告より優先している');
+    assert.ok(!evidenceIds.includes(messageIds.get('LOWER-USEFUL') as string), '低relevance候補を新しさだけで昇格させている');
+  });
+
+  it('同じrelevance・statement statusでは新しい発言をRRF上位の古い発言より優先する', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector(() => 'reported_completed');
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    const oldText = 'OLD-COMPLETED 同じ状態の古い完了報告';
+    const oldMessage = await seedMessage(pool, {
+      sessionId: sourceSession,
+      sequenceNo: 1,
+      role: 'assistant',
+      text: oldText,
+      occurredAt: new Date('2026-09-01T00:00:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'old-completed',
+      content: oldText,
+      generationId: generation.id,
+      embedding: similarityVector(1),
+      sources: [{ messageId: oldMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: oldText.length }],
+    });
+    const newText = 'NEW-COMPLETED 同じ状態の新しい完了報告';
+    const newMessage = await seedMessage(pool, {
+      sessionId: sourceSession,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: newText,
+      occurredAt: new Date('2026-09-02T00:00:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'new-completed',
+      content: newText,
+      generationId: generation.id,
+      embedding: similarityVector(2),
+      sources: [{ messageId: newMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: newText.length }],
+    });
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, {
+      workspace,
+      sessionId: inputSession,
+      sequenceNo: 1,
+      text: '最新の完了報告を確認する',
+    });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.deepEqual(evidenceIds, [newMessage.messageId], '同条件で新しい完了報告を優先していない');
+  });
+
+  it('statement statusがunknown同士なら新しさで並べ替えず従来のRRF順位を維持する', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector(() => 'unknown');
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    const oldText = 'OLD-UNKNOWN status不明でRRF上位';
+    const oldMessage = await seedMessage(pool, {
+      sessionId: sourceSession,
+      sequenceNo: 1,
+      role: 'assistant',
+      text: oldText,
+      occurredAt: new Date('2026-09-01T00:00:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'old-unknown',
+      content: oldText,
+      generationId: generation.id,
+      embedding: similarityVector(1),
+      sources: [{ messageId: oldMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: oldText.length }],
+    });
+    const newText = 'NEW-UNKNOWN status不明でRRF下位';
+    const newMessage = await seedMessage(pool, {
+      sessionId: sourceSession,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: newText,
+      occurredAt: new Date('2026-09-02T00:00:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'new-unknown',
+      content: newText,
+      generationId: generation.id,
+      embedding: similarityVector(2),
+      sources: [{ messageId: newMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: newText.length }],
+    });
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, {
+      workspace,
+      sessionId: inputSession,
+      sequenceNo: 1,
+      text: 'status不明候補の順位を確認する',
+    });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.deepEqual(evidenceIds, [oldMessage.messageId], 'status不明候補で従来のRRF順位を変えている');
+    assert.ok(!evidenceIds.includes(newMessage.messageId));
   });
 });
 
