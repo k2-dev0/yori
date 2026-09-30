@@ -327,7 +327,7 @@ describe('transcript差分と診断', () => {
     }
   });
 
-  it('未知版のCodexは取り込まず保留し、対応版への書換え後に回収する', async () => {
+  it('未知版のCodexも既知構造なら取り込み、versionを診断して再読込で重複しない', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -344,26 +344,29 @@ describe('transcript差分と診断', () => {
         token: 'token-a',
       };
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 0, '未知版から本文を取り込んでいる');
-
-      const state = openCollectorState(fixture.stateDir);
-      const diagnostics = listCollectorDiagnostics(state);
-      closeCollectorState(state);
-      assert.ok(diagnostics.some((diagnostic) => diagnostic.byteOffset === 0), '未知版の診断offsetがない');
-
-      await writeTranscript(transcript, [supportedVersion, message]);
-      await collectFromHook(options);
       assert.deepEqual(
         sentEvents(mock.requests).map((event) => event.source_message_id),
         ['item-1'],
       );
+
+      const state = openCollectorState(fixture.stateDir);
+      const diagnostics = listCollectorDiagnostics(state);
+      closeCollectorState(state);
+      assert.ok(
+        diagnostics.some((diagnostic) => diagnostic.code === 'transcript_unverified_version' && diagnostic.byteOffset === 0),
+        '未検証versionの診断offsetがない',
+      );
+
+      await writeTranscript(transcript, [supportedVersion, message]);
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 1, 'version確認後に同じ本文を再送している');
     } finally {
       mock.restore();
       await fixture.cleanup();
     }
   });
 
-  it('未知版のClaude Codeは取り込まず保留し、対応版への書換え後に回収する', async () => {
+  it('未知版のClaude Codeも既知構造なら取り込み、versionを診断して再読込で重複しない', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -379,14 +382,22 @@ describe('transcript差分と診断', () => {
         token: 'token-a',
       };
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 0, '未知版から本文を取り込んでいる');
-
-      await writeTranscript(transcript, [supported]);
-      await collectFromHook(options);
       assert.deepEqual(
         sentEvents(mock.requests).map((event) => event.text),
         ['対応版の本文'],
       );
+
+      const state = openCollectorState(fixture.stateDir);
+      const diagnostics = listCollectorDiagnostics(state);
+      closeCollectorState(state);
+      assert.ok(
+        diagnostics.some((diagnostic) => diagnostic.code === 'transcript_unverified_version' && diagnostic.byteOffset === 0),
+        '未検証versionの診断offsetがない',
+      );
+
+      await writeTranscript(transcript, [supported]);
+      await collectFromHook(options);
+      assert.equal(mock.requests.length, 1, 'version確認後に同じ本文を再送している');
     } finally {
       mock.restore();
       await fixture.cleanup();
@@ -486,7 +497,7 @@ describe('transcript差分と診断', () => {
     }
   });
 
-  it('保留scanは先行発言をrollbackし、対応版修正後に同じ順で一意のsequenceへ回収する', async () => {
+  it('scan途中の未知versionも既知構造なら同じ順で収集し、対応版への書換えで再送しない', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -503,20 +514,6 @@ describe('transcript差分と診断', () => {
       };
 
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 0, '保留したscanの先行発言を送信している');
-
-      const state = openCollectorState(fixture.stateDir);
-      const diagnostics = listCollectorDiagnostics(state);
-      closeCollectorState(state);
-      assert.ok(
-        diagnostics.some(
-          (diagnostic) => diagnostic.code === 'transcript_unknown_version' && diagnostic.byteOffset === lineByteOffset([first, unknown], 1),
-        ),
-        '保留診断のoffsetがない',
-      );
-
-      await writeTranscript(transcript, [first, supported]);
-      await collectFromHook(options);
       const events = sentEvents(mock.requests);
       assert.deepEqual(
         events.map((event) => [event.source_message_id, event.sequence_no]),
@@ -525,10 +522,21 @@ describe('transcript差分と診断', () => {
           ['u-2', 2],
         ],
       );
-      assert.equal(new Set(events.map((event) => event.sequence_no)).size, 2, 'sequenceが重複している');
 
+      const state = openCollectorState(fixture.stateDir);
+      const diagnostics = listCollectorDiagnostics(state);
+      closeCollectorState(state);
+      assert.ok(
+        diagnostics.some(
+          (diagnostic) => diagnostic.code === 'transcript_unverified_version' && diagnostic.byteOffset === lineByteOffset([first, unknown], 1),
+        ),
+        '未検証version診断のoffsetがない',
+      );
+
+      await writeTranscript(transcript, [first, supported]);
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 1, '修正後に同じ発言を再送している');
+      assert.equal(new Set(events.map((event) => event.sequence_no)).size, 2, 'sequenceが重複している');
+      assert.equal(mock.requests.length, 1, 'version修正後に同じ発言を再送している');
     } finally {
       mock.restore();
       await fixture.cleanup();
@@ -924,7 +932,7 @@ describe('transcript差分と診断', () => {
     }
   });
 
-  it('Desktop確認版0.155.0-alpha.16.4のsessionとUserMessage/AgentMessage commentary/finalを収集する', async () => {
+  it('Desktop確認版0.155.0-alpha.16.4のUserMessageとturn最終AgentMessageだけを収集する', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -946,8 +954,7 @@ describe('transcript差分と診断', () => {
         sentEvents(mock.requests).map((event) => [event.source_message_id, event.source_session_id, event.role, event.text, event.occurred_at, event.sequence_no]),
         [
           ['item-user', 'session-1', 'user', 'fixture-user-text', '2026-09-21T01:00:01.000Z', 1],
-          ['item-commentary', 'session-1', 'assistant', 'fixture-assistant-commentary-text', '2026-09-21T00:00:01.000Z', 2],
-          ['item-final', 'session-1', 'assistant', 'fixture-assistant-final-text', '2026-09-21T00:00:01.000Z', 3],
+          ['item-final', 'session-1', 'assistant', 'fixture-assistant-final-text', '2026-09-21T00:00:01.000Z', 2],
         ],
       );
       await collectFromHook(options);
@@ -1041,12 +1048,12 @@ describe('transcript差分と診断', () => {
             event.text,
           ]),
           [
-            ['codex', 'github.com/Org/Repo', 'session-1', 'item-user', 1, 1, 'user', '2026-09-21T00:00:02.000Z', 'fixture-user-text'],
-            ['codex', 'github.com/Org/Repo', 'session-1', 'item-assistant', 2, 1, 'assistant', '2026-09-21T00:00:03.000Z', 'fixture-assistant-text'],
+            ['codex', 'github.com/Org/Repo', 'session-1', 'turn:FIXTURE_TURN_ID:user', 1, 1, 'user', '2026-09-21T00:00:02.000Z', 'fixture-user-text'],
+            ['codex', 'github.com/Org/Repo', 'session-1', 'turn:FIXTURE_TURN_ID:assistant', 2, 1, 'assistant', '2026-09-21T00:00:03.000Z', 'fixture-assistant-text'],
           ],
         );
         const sentBody = JSON.stringify(mock.requests.map((request) => request.body));
-        for (const marker of ['FIXTURE_TURN_ID', 'FIXTURE_USER_EXTRA', 'FIXTURE_TOP_EXTRA', 'FIXTURE_ASSISTANT_EXTRA']) {
+        for (const marker of ['FIXTURE_USER_EXTRA', 'FIXTURE_TOP_EXTRA', 'FIXTURE_ASSISTANT_EXTRA']) {
           assert.ok(!sentBody.includes(marker), `${cliVersion}で${marker}を送信している`);
         }
       } finally {
@@ -1100,7 +1107,7 @@ describe('transcript差分と診断', () => {
     }
   });
 
-  it('未知版Codexへ切り替わるscanは送信・cursor・message/outbox/sequenceをrollbackし、診断だけ残す', async () => {
+  it('scan途中で未知版Codexへ切り替わっても既知構造を収集し、versionだけを診断する', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -1122,7 +1129,7 @@ describe('transcript差分と診断', () => {
         [['item-1', 1]],
       );
 
-      // 同一scanに確認済み版の切替後発言と未知版metadataを置き、切替前の確定分だけが残ることを見る。
+      // 同一scanに確認済み版と未知版metadataを混在させ、構造が同じ発言は継続して取り込む。
       const switched = codexSessionLine('session-1', NEW_CODEX_CLI_VERSION);
       const nextMessage = codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'user', text: 'fixture-user-text-2' });
       const unknown = codexSessionLine('session-1', '0.155.0-alpha.16.5');
@@ -1131,7 +1138,7 @@ describe('transcript差分と診断', () => {
       const lines = [...prefix, switched, nextMessage, unknown, laterMessage];
       await writeTranscript(transcript, lines);
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 1, '未知版scanの後続発言を送信している');
+      assert.equal(mock.requests.length, 2, '未知版scanの既知構造を送信していない');
 
       const namespace = collectorNamespace(fixture.config.api_url, 'token-a');
       const state = openCollectorState(fixture.stateDir);
@@ -1144,22 +1151,26 @@ describe('transcript差分と診断', () => {
         .map((row) => [String(row.source_message_id), Number(row.sequence_no)]);
       const outboxCount = Number((state.db.prepare('SELECT COUNT(*) AS count FROM outbox WHERE namespace = ?').get(namespace) as { count: number }).count);
       closeCollectorState(state);
-      assert.deepEqual(diagnostics, [{ code: 'transcript_unknown_version', byteOffset: lineByteOffset(lines, 4) }]);
-      assert.equal(cursor?.byte_offset, lineByteOffset(lines, 2), '保留scanでcursorが進んでいる');
-      assert.equal(session?.next_sequence, 2, '保留scanでsequenceが進んでいる');
-      assert.deepEqual(stored, [['item-1', 1]], '保留scanのmessageが残っている');
-      assert.equal(outboxCount, 0, '保留scanのoutboxが残っている');
-
-      // 未知版行だけを対応版へ書き換えると、保留していた発言を同じsequence順で回収する。
-      await writeTranscript(transcript, [...prefix, switched, nextMessage, codexSessionLine('session-1', NEW_CODEX_CLI_VERSION), laterMessage]);
-      await collectFromHook(options);
+      assert.deepEqual(diagnostics, [
+        { code: 'transcript_unverified_version', byteOffset: lineByteOffset(lines, 4) },
+        { code: 'transcript_unverified_version', byteOffset: lineByteOffset(lines, 5) },
+      ]);
+      assert.equal(cursor?.byte_offset, lineByteOffset(lines, lines.length), 'scan後のcursorが末尾へ進んでいない');
+      assert.equal(session?.next_sequence, 4, '未知version後のsequenceを更新していない');
       assert.deepEqual(
-        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.sequence_no]),
+        stored,
         [
+          ['item-1', 1],
           ['item-2', 2],
           ['item-3', 3],
         ],
+        '未知version後の既知構造messageを保持していない',
       );
+      assert.equal(outboxCount, 0, 'ack済みoutboxが残っている');
+
+      // 未知版行だけを対応版へ書き換えても、同じ発言は再送しない。
+      await writeTranscript(transcript, [...prefix, switched, nextMessage, codexSessionLine('session-1', NEW_CODEX_CLI_VERSION), laterMessage]);
+      await collectFromHook(options);
       assert.equal(mock.requests.length, 2);
     } finally {
       mock.restore();
