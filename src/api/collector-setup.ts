@@ -9,7 +9,7 @@ export interface CollectorSetup {
   redaction_policy: RedactionPolicy;
 }
 
-// canonical repositoryから、tokenのemployeeがmemberである同一会社projectを1件だけ解決する。
+// canonical repositoryから、tokenのemployeeと同じ会社のprojectを1件だけ解決する。
 // primary repository（projects.repository_identifier）と追加aliasの両方を受け、0件はnullにして存在を開示しない。
 export async function resolveCollectorSetup(
   pool: Pool,
@@ -19,7 +19,6 @@ export async function resolveCollectorSetup(
   const result = await pool.query<{ id: string }>(
     `SELECT p.id
        FROM projects p
-       JOIN project_members pm ON pm.project_id = p.id AND pm.employee_id = $3
       WHERE p.company_id = $1
         AND (p.repository_identifier = $2
              OR EXISTS (SELECT 1
@@ -28,7 +27,7 @@ export async function resolveCollectorSetup(
                            AND pr.company_id = $1
                            AND pr.repository_identifier = $2))
       LIMIT 1`,
-    [auth.companyId, repository, auth.employeeId],
+    [auth.companyId, repository],
   );
   const project = result.rows[0];
   if (project === undefined) {
