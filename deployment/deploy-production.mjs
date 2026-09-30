@@ -80,17 +80,83 @@ function parseHealthUrl() {
 }
 
 // curlをPATHから起動する。--failで非200を非0にし、--silentでbodyを表示せず、--show-errorで失敗理由だけstderrへ出す。
-function checkPublicHealth(url) {
+function parseJsonObject(text) {
+  try {
+    const value = JSON.parse(text);
+    return typeof value === 'object' && value !== null && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+// 公開healthの配布SHA・契約versionとsetup routeの正規401を確認する。
+function checkPublicDeployment(url, target) {
   const result = spawnSync(
     'curl',
     ['--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20', url.href],
-    { stdio: ['ignore', 'ignore', 'inherit'] },
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
   );
   if (result.error) {
     fail(`公開healthを確認できない: ${result.error.message}`);
   }
   if (result.status !== 0) {
     fail(`公開healthを確認できない (curl exit ${result.status})`);
+  }
+  const health = parseJsonObject(result.stdout ?? '');
+  if (
+    health === null ||
+    Object.keys(health).sort().join(',') !== 'api_contract_version,release_sha,status' ||
+    health.status !== 'ready' ||
+    health.release_sha !== target ||
+    health.api_contract_version !== 1
+  ) {
+    fail('公開healthのrelease SHAまたはAPI契約versionが一致しない');
+  }
+
+  const setupUrl = new URL('/v1/collector/setup', url);
+  const smoke = spawnSync(
+    'curl',
+    [
+      '--silent',
+      '--show-error',
+      '--connect-timeout',
+      '5',
+      '--max-time',
+      '20',
+      '--request',
+      'POST',
+      '--header',
+      'content-type: application/json',
+      '--data',
+      '{"repository":"github.com/yori/deployment-smoke"}',
+      '--write-out',
+      '\n%{http_code}',
+      setupUrl.href,
+    ],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  if (smoke.error) {
+    fail(`公開collector setup smokeを確認できない: ${smoke.error.message}`);
+  }
+  if (smoke.status !== 0) {
+    fail(`公開collector setup smokeを確認できない (curl exit ${smoke.status})`);
+  }
+  const smokeOutput = (smoke.stdout ?? '').trimEnd();
+  const split = smokeOutput.lastIndexOf('\n');
+  const body = split === -1 ? '' : smokeOutput.slice(0, split);
+  const status = split === -1 ? '' : smokeOutput.slice(split + 1).trim();
+  const parsed = parseJsonObject(body);
+  if (
+    status !== '401' ||
+    parsed === null ||
+    Object.keys(parsed).join(',') !== 'error' ||
+    typeof parsed.error !== 'object' ||
+    parsed.error === null ||
+    Array.isArray(parsed.error) ||
+    Object.keys(parsed.error).join(',') !== 'code' ||
+    parsed.error.code !== 'unauthorized'
+  ) {
+    fail('公開collector setup smokeが正規401を返さない');
   }
 }
 
@@ -134,9 +200,9 @@ function main() {
     fail(`remote deployが失敗した (exit ${remote.status})`);
   }
 
-  // remote成功後だけ公開healthを確認し、200なら終了0。
-  checkPublicHealth(healthUrl);
-  console.log(`deploy: ${target} を配布し、公開health ${healthUrl.href} が200`);
+  // remote成功後だけ公開healthのSHAとsetup routeを確認する。
+  checkPublicDeployment(healthUrl, target);
+  console.log(`deploy: ${target} を配布し、公開health SHAとcollector setup routeを確認`);
 }
 
 main();
