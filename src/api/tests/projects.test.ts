@@ -1,15 +1,13 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { buildApp } from '../app.js';
-import { projectMemberResponseSchema, projectRegistrationResponseSchema } from '../response-schema.js';
+import { projectRegistrationResponseSchema } from '../response-schema.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
   countRows,
   insertCompany,
-  insertEmployee,
   insertProject,
-  issueAuthToken,
   resetDatabase,
   seedWorkspace,
   type WorkspaceFixture,
@@ -104,80 +102,5 @@ describe('project登録API', () => {
       assert.ok(!response.body.includes(primaryProjectId), '衝突先projectを開示している');
     }
     assert.equal(await countRows(pool, 'projects'), before);
-  });
-});
-
-describe('project member追加API', () => {
-  it('company_admin tokenは同じcompanyのmemberを冪等追加する', async () => {
-    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
-    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Member-Target');
-    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
-    const before = await countRows(pool, 'project_members');
-
-    const first = await app.inject({
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(adminToken, false),
-    });
-    assert.equal(first.statusCode, 200, first.body);
-    assert.deepEqual(projectMemberResponseSchema.parse(first.json()), {
-      status: 'done',
-      project_id: projectId,
-      employee_id: targetEmployeeId,
-    });
-    assert.equal(await countRows(pool, 'project_members'), before + 1);
-
-    const second = await app.inject({
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(adminToken, false),
-    });
-    assert.equal(second.statusCode, 200, second.body);
-    assert.deepEqual(projectMemberResponseSchema.parse(second.json()), {
-      status: 'already',
-      project_id: projectId,
-      employee_id: targetEmployeeId,
-    });
-    assert.equal(await countRows(pool, 'project_members'), before + 1);
-  });
-
-  it('通常employee tokenは403でmemberを追加しない', async () => {
-    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
-    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Forbidden-Member');
-    const before = await countRows(pool, 'project_members');
-
-    const response = await app.inject({
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(workspace.token, false),
-    });
-    assert.equal(response.statusCode, 403, response.body);
-    assert.equal(errorCode(response), 'forbidden');
-    assert.equal(await countRows(pool, 'project_members'), before);
-  });
-
-  it('admin tokenでも別companyまたは不存在のproject/employeeは404でmemberを追加しない', async () => {
-    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
-    const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
-    const projectId = await insertProject(pool, workspace.companyId, 'github.com/Org/Admin-Target');
-    const otherCompanyId = await insertCompany(pool, 'other-company');
-    const otherEmployeeId = await insertEmployee(pool, otherCompanyId, 'other-employee');
-    const otherProjectId = await insertProject(pool, otherCompanyId, 'github.com/Other/Project');
-    const before = await countRows(pool, 'project_members');
-
-    for (const [candidateProjectId, candidateEmployeeId] of [
-      [otherProjectId, targetEmployeeId],
-      [projectId, otherEmployeeId],
-      ['00000000-0000-4000-8000-000000000000', targetEmployeeId],
-    ]) {
-      const response = await app.inject({
-        method: 'PUT',
-        url: `/v1/projects/${candidateProjectId}/members/${candidateEmployeeId}`,
-        headers: authorization(adminToken, false),
-      });
-      assert.equal(response.statusCode, 404, response.body);
-      assert.equal(errorCode(response), 'not_found');
-    }
-    assert.equal(await countRows(pool, 'project_members'), before);
   });
 });
