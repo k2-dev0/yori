@@ -650,4 +650,41 @@ describe('M7 collector補助通知', () => {
       },
     );
   });
+
+  it('late processが失われても次の入力で前回の完了結果を回収する', async () => {
+    let firstInputLookups = 0;
+    await withCentral(
+      (request) => {
+        const messageId = queryParams(request).get('source_message_id');
+        if (messageId === 'turn:turn-1:user') {
+          firstInputLookups += 1;
+          if (firstInputLookups === 1) {
+            return { status: 200, body: searchView({ status: 'running', outcome: null, matches: [] }) };
+          }
+          return { status: 200, body: searchView() };
+        }
+        return { status: 200, body: searchView({ status: 'running', outcome: null, matches: [] }) };
+      },
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const first = await runNotify(fixture);
+          assert.equal(first.code, 0, `初回notifyが失敗した: ${first.stderr}`);
+          assert.equal(first.stdout.trim(), '', '初回の未完了結果を出力している');
+
+          fixture.hook.turn_id = 'turn-2';
+          fixture.hook.prompt = '次の質問本文';
+          const second = await runNotify(fixture);
+          assert.equal(second.code, 0, `次回notifyが失敗した: ${second.stderr}`);
+          assert.ok(hookContext(second.stdout).includes('M7-EVIDENCE-TEXT'), '前回の完了結果を次回入力で回収していない');
+
+          const firstInputRequests = central.byInputRequests.filter(
+            (request) => queryParams(request).get('source_message_id') === 'turn:turn-1:user',
+          );
+          assert.equal(firstInputRequests.length, 2, '前回入力をfast path後に再取得していない');
+          assert.equal(queryParams(firstInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '3000');
+          assert.equal(queryParams(firstInputRequests[1] as RecordedHttpRequest).get('wait_ms'), '0');
+        });
+      },
+    );
+  });
 });
