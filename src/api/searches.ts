@@ -190,14 +190,10 @@ async function loadSearchRow(pool: Pool, auth: AuthContext, requestId: string): 
   const result = await pool.query<SearchRequestRow>(
     `SELECT ${SEARCH_REQUEST_COLUMNS}
        FROM search_requests sr
-       JOIN projects p ON p.id = sr.project_id AND p.company_id = $2
-       JOIN sessions s ON s.id = sr.session_id AND s.project_id = sr.project_id
-      WHERE sr.id = $1 AND sr.company_id = $2
-        AND EXISTS (
-          SELECT 1 FROM project_members pm
-           WHERE pm.project_id = sr.project_id AND pm.employee_id = $3
-        )`,
-    [requestId, auth.companyId, auth.employeeId],
+      JOIN projects p ON p.id = sr.project_id AND p.company_id = $2
+      JOIN sessions s ON s.id = sr.session_id AND s.project_id = sr.project_id
+      WHERE sr.id = $1 AND sr.company_id = $2`,
+    [requestId, auth.companyId],
   );
   const row = result.rows[0];
   if (row === undefined) {
@@ -794,7 +790,7 @@ interface EvidenceRow {
   text: string;
 }
 
-// 保存済みrevisionの原文を同一会社・案件membershipで取得する。別案件・別会社・未保存revisionはnullにする。
+// 保存済みrevisionの原文を同一会社・案件で取得する。別案件・別会社・未保存revisionはnullにする。
 export async function loadEvidence(
   pool: Pool,
   auth: AuthContext,
@@ -808,12 +804,8 @@ export async function loadEvidence(
        JOIN sessions s ON s.id = m.session_id
        JOIN projects p ON p.id = s.project_id
        JOIN message_revisions r ON r.message_id = m.id AND r.revision = $4
-      WHERE m.id = $1 AND p.company_id = $2 AND s.project_id = $3
-        AND EXISTS (
-          SELECT 1 FROM project_members pm
-           WHERE pm.project_id = $3 AND pm.employee_id = $5
-        )`,
-    [messageId, auth.companyId, projectId, revision, auth.employeeId],
+      WHERE m.id = $1 AND p.company_id = $2 AND s.project_id = $3`,
+    [messageId, auth.companyId, projectId, revision],
   );
   const row = result.rows[0];
   if (row === undefined) {
