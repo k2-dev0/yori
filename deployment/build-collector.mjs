@@ -3,6 +3,7 @@
 // esbuildはdevDependencyとして直接固定し、transitive依存へ暗黙依存しない。
 // Node >= 24のnode:ビルトインだけをexternalにし、zod・uuid等は1ファイルへbundleする。
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,10 +29,15 @@ await build({
 });
 
 const bytes = readFileSync(ARTIFACT_PATH);
-const { version } = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+const { version } = JSON.parse(readFileSync(path.join(REPO_ROOT, 'src', 'collector', 'package.json'), 'utf8'));
+const git = spawnSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: REPO_ROOT, encoding: 'utf8' });
+if (git.status !== 0 || !/^[0-9a-f]{40}$/.test(git.stdout.trim())) {
+  throw new Error('collector artifact: Git SHAを解決できません');
+}
 const manifest = {
   version,
   file: ARTIFACT_NAME,
+  git_sha: git.stdout.trim(),
   checksum: createHash('sha256').update(bytes).digest('hex'),
 };
 writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
