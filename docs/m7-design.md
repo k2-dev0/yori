@@ -15,7 +15,7 @@ M8の再索引・世代切替・配置・性能検証は対象外。検索の開
 5. `revoke`・`change`の後続関係を最大3ホップで追跡し、元根拠を残したまま訂正・撤回原文と関係種別を返す。訪問済みmessage ID＋revisionで循環を検出する。
 6. 最終コンテキストは既存のVoyage tokenizerで約6,000 tokenを上限とし、代表根拠、訂正・撤回、明示リンク、推定リンクの順で採用する。代表根拠の原文は切り詰めない。候補数・hop・session数・token予算・外部判定失敗で探索を打ち切った場合は`truncated=true`と機械可読なwarningを返す。
 7. 保存直前と結果取得時に、原文のcurrent revision、案件所属、検索対象入力のrevision、relation/linkの有効状態を再検証する。現在入力以降の同一セッション発言は周辺・引き継ぎ・訂正のどの経路でも返さない。
-8. 補助通知CLIは`UserPromptSubmit`の非同期hookから収集・最大10秒の結果待機を行い、完了結果だけを安全な次のmodel入力へ追加する。現在入力をtranscriptまたはcollector stateで特定できない場合は通知しない。hookのprompt本文から別IDを発明せず、利用者のhook設定を自動編集せず、強制的に新しいturnを開始しない。
+8. 補助通知CLIは`UserPromptSubmit`の非同期hookから`turn_id`と`prompt`を収集し、最大10秒の結果待機後、完了結果だけを安全な次のmodel入力へ追加する。message IDは`turn:<turn_id>:user`として決定的に生成し、現在入力を特定できない場合は通知しない。利用者のhook設定を自動編集せず、強制的に新しいturnを開始しない。
 9. migration、API、MCP、worker、collector、案件境界、循環、上限、revision競合、既存M1〜M6の回帰を実PostgreSQLとloopback fixtureで検証する。実Jev・実Voyage・実会話は送信しない。
 
 ## `session_links`の保存契約
