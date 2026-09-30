@@ -127,6 +127,7 @@ describe('migration管理', () => {
       '0008_m8.sql',
       '0009_column_names.sql',
       '0010_custom_redaction.sql',
+      '0011_cursor.sql',
     ]);
   });
 
@@ -135,7 +136,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '10');
+    assert.equal(versions.rows[0].count, '11');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -150,6 +151,7 @@ describe('migration管理', () => {
     assert.ok(files.includes('0008_m8.sql'), '0008_m8.sql がない');
     assert.ok(files.includes('0009_column_names.sql'), '0009_column_names.sql がない');
     assert.ok(files.includes('0010_custom_redaction.sql'), '0010_custom_redaction.sql がない');
+    assert.ok(files.includes('0011_cursor.sql'), '0011_cursor.sql がない');
     assert.ok(files.every((file) => file.endsWith('.sql')), 'SQL以外のファイルがmigrationsに混在している');
   });
 
