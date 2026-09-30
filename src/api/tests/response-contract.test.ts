@@ -158,7 +158,8 @@ function failingPool(message: string): Pool {
 }
 
 const pool = createPool(requireDatabaseUrl());
-const app = buildApp({ pool });
+const RELEASE_SHA = '1111111111111111111111111111111111111111';
+const app = buildApp({ pool, releaseSha: RELEASE_SHA });
 let workspace: WorkspaceFixture;
 
 before(async () => {
@@ -263,17 +264,24 @@ describe('HTTP公開応答のresponse schema適合', () => {
     assert.equal(ready.statusCode, 200, ready.body);
     assert.deepEqual(parseWith(schemas.healthReadyResponseSchema, ready.json(), 'GET /health/ready 200'), {
       status: 'ready',
+      release_sha: RELEASE_SHA,
+      api_contract_version: 1,
     });
   });
 
   it('GET /health/readyの503応答がschemaへ適合し、接続情報・SQLを漏らさない', async () => {
     const schemas = await responseSchemas();
-    const failing = buildApp({ pool: failingPool('接続失敗: SELECT 1 postgres://yori:yori_secret@db/yori') });
+    const failing = buildApp({
+      pool: failingPool('接続失敗: SELECT 1 postgres://yori:yori_secret@db/yori'),
+      releaseSha: RELEASE_SHA,
+    });
     try {
       const response = await failing.inject({ method: 'GET', url: '/health/ready' });
       assert.equal(response.statusCode, 503, response.body);
       assert.deepEqual(parseWith(schemas.healthReadyResponseSchema, response.json(), 'GET /health/ready 503'), {
         status: 'unavailable',
+        release_sha: RELEASE_SHA,
+        api_contract_version: 1,
       });
       assert.ok(!response.body.includes('yori_secret') && !response.body.includes('SELECT'), 'ready失敗で内部情報を漏らしている');
     } finally {
