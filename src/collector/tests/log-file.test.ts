@@ -589,7 +589,7 @@ describe('transcript差分と診断', () => {
     }
   });
 
-  it('保留scanは以前の確定データを削除せず、原因解消後の後続だけを回収する', async () => {
+  it('未知version診断は以前の確定データを変えず、後続だけを回収する', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -606,10 +606,10 @@ describe('transcript差分と診断', () => {
       await collectFromHook(options);
       assert.deepEqual(sentEvents(mock.requests).map((event) => event.source_message_id), ['item-1']);
 
-      // 確定後に未知版metadataが現れても、先行分は保持したまま保留する。
+      // 確定後に未知版metadataが現れても、先行分は保持してversionだけを診断する。
       await writeTranscript(transcript, [sessionLine, confirmed, codexSessionLine('session-1', '0.155.0-alpha.9.3')]);
       await collectFromHook(options);
-      assert.equal(mock.requests.length, 1, '保留中に確定済みの発言を再送している');
+      assert.equal(mock.requests.length, 1, 'version診断時に確定済みの発言を再送している');
 
       // 対応版へ修正すると、確定済みitem-1は再送せず後続だけを一意のsequenceで回収する。
       const next = codexMessageLine({ sessionId: 'session-1', messageId: 'item-2', role: 'assistant', text: '保留後の本文' });
