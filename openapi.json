@@ -1165,10 +1165,20 @@
               "status": {
                 "type": "string",
                 "const": "ready"
+              },
+              "release_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "api_contract_version": {
+                "type": "number",
+                "const": 1
               }
             },
             "required": [
-              "status"
+              "status",
+              "release_sha",
+              "api_contract_version"
             ],
             "additionalProperties": false
           },
@@ -1178,10 +1188,20 @@
               "status": {
                 "type": "string",
                 "const": "unavailable"
+              },
+              "release_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "api_contract_version": {
+                "type": "number",
+                "const": 1
               }
             },
             "required": [
-              "status"
+              "status",
+              "release_sha",
+              "api_contract_version"
             ],
             "additionalProperties": false
           }
