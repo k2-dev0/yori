@@ -113,6 +113,15 @@ describe('hookの安定fieldを使う会話収集', () => {
       );
       assert.ok(sentEvents(mock.requests).every((event) => Number.isFinite(Date.parse(event.occurred_at))));
 
+      await collectFromHook({
+        source: 'codex',
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      });
+      assert.equal(mock.requests.length, 2, '同じturnをtranscript backfillで二重送信している');
+      assert.ok(!JSON.stringify(mock.requests).includes('影響範囲を調査します'), 'commentaryを送信している');
+
       await runCollectorCli(['collect', '--source', 'codex', '--config', configPath], {
         stdin: JSON.stringify(stopHook),
         env: { YORI_TEST_TOKEN: 'token-a' },
@@ -127,15 +136,6 @@ describe('hookの安定fieldを使う会話収集', () => {
         sentEvents(mock.requests.slice(2)).map((event) => [event.source_message_id, event.text, event.revision]),
         [['turn:turn-1:assistant', '追加修正も完了しました', 2]],
       );
-
-      await collectFromHook({
-        source: 'codex',
-        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir }),
-        config: fixture.config,
-        token: 'token-a',
-      });
-      assert.equal(mock.requests.length, 3, '同じturnをtranscript backfillで二重送信している');
-      assert.ok(!JSON.stringify(mock.requests).includes('影響範囲を調査します'), 'commentaryを送信している');
     } finally {
       mock.restore();
       await fixture.cleanup();
