@@ -7,7 +7,7 @@ import { buildApp } from '../app.js';
 import { MAX_EVENT_BODY_BYTES } from '../contract.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
-import { insertProject, resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
+import { insertCompany, insertProject, resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
 import { buildEventBatch, buildEventInput, postEvents } from './support.js';
 import { buildMatchedResult, getSearchById, getSearchByInput, postSearch, updateSearchRequest } from './m6-support.js';
 
@@ -26,6 +26,11 @@ const RESPONSE_SCHEMA_EXPORTS = [
   'healthReadyResponseSchema',
   'errorResponseSchema',
   'eventsResponseSchema',
+  'projectRegistrationResponseSchema',
+  'meResponseSchema',
+  'companyResponseSchema',
+  'tokenIssueResponseSchema',
+  'tokenRevokeResponseSchema',
   'searchAcceptedResponseSchema',
   'searchViewResponseSchema',
   'notReceivedResponseSchema',
@@ -332,13 +337,14 @@ describe('HTTP公開応答のresponse schema適合', () => {
     assert.equal(unauthorized.statusCode, 401, unauthorized.body);
     assertErrorResponse(schemas.errorResponseSchema, unauthorized, 'unauthorized', 'events 未認証');
 
-    const foreignProjectId = await insertProject(pool, workspace.companyId, 'contract-foreign-repo');
+    const foreignCompanyId = await insertCompany(pool, 'contract-foreign-company');
+    const foreignProjectId = await insertProject(pool, foreignCompanyId, 'contract-foreign-repo');
     const forbidden = await postEvents(app, {
       token: workspace.token,
       body: buildEventBatch(foreignProjectId, [base]),
     });
     assert.equal(forbidden.statusCode, 403, forbidden.body);
-    assertErrorResponse(schemas.errorResponseSchema, forbidden, 'forbidden', 'events 非member');
+    assertErrorResponse(schemas.errorResponseSchema, forbidden, 'forbidden', 'events 別会社project');
 
     const first = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [base]) });
     assert.equal(first.statusCode, 202, first.body);
