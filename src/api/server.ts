@@ -4,7 +4,7 @@ import { buildApp } from './app.js';
 
 const env = loadEnv();
 const pool = createPool(env.DATABASE_URL);
-const app = buildApp({ pool });
+const app = buildApp({ pool, releaseSha: env.YORI_RELEASE_SHA });
 
 // コンテナ停止時に接続を閉じる。SIGKILL時はDB側の接続断で解放される。
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
