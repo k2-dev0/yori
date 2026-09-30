@@ -4,7 +4,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { backfillCollector } from '../backfill.js';
+import { BackfillExecutionError, backfillCollector } from '../backfill.js';
 import {
   ackResponse,
   buildCollectorConfig,
@@ -199,6 +199,37 @@ describe('collector backfill', { concurrency: false }, () => {
           ['deepseek_harness', 'assistant', 'deepseek final', 2, 1],
         ],
       );
+    } finally {
+      process.env.HOME = previousHome;
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('project未登録・非memberの本実行は本文を処理せずcollector_setup_unavailableで失敗し、送信しない', async () => {
+    const fixture = await createCollectorFixture();
+    const home = path.join(fixture.root, 'home');
+    const previousHome = process.env.HOME;
+    const mock = installFetchMock((request) =>
+      isSetup(request) ? jsonResponse(404, { error: { code: 'not_found' } }) : ackResponse(request),
+    );
+    try {
+      await installHistory(home, realpathSync(fixture.repoDir));
+      process.env.HOME = home;
+      await assert.rejects(
+        backfillCollector({
+          repository: fixture.repoDir,
+          config: buildCollectorConfig({ state_dir: fixture.stateDir }),
+          token: 'token-a',
+          knownSecrets: [],
+          dryRun: false,
+          source: 'codex',
+        }),
+        (error: unknown) => error instanceof BackfillExecutionError && error.code === 'collector_setup_unavailable',
+      );
+      assert.equal(mock.requests.filter(isSetup).length, 1);
+      assert.equal(mock.requests.filter((request) => request.url === `${API_URL}/v1/events`).length, 0);
+      assert.equal(existsSync(fixture.stateDir), false, 'setup失敗前にSQLite stateを作っている');
     } finally {
       process.env.HOME = previousHome;
       mock.restore();
