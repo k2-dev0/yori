@@ -66,7 +66,7 @@ describe('本人・社員・token管理API', () => {
     const targetEmployeeId = await insertEmployee(pool, workspace.companyId, 'target');
     const tokenId = await tokenIdOf(workspace.token);
     const before = await countRows(pool, 'auth_tokens');
-    const requests = [
+    const requests: Array<{ method: 'GET' | 'POST' | 'DELETE'; url: string; payload?: { scope: 'employee' } }> = [
       { method: 'GET', url: '/v1/company' },
       { method: 'POST', url: `/v1/employees/${targetEmployeeId}/tokens`, payload: { scope: 'employee' } },
       { method: 'DELETE', url: `/v1/tokens/${tokenId}` },
