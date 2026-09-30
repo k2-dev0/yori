@@ -206,7 +206,7 @@ describe('collector backfill', { concurrency: false }, () => {
     }
   });
 
-  it('project未登録・非memberの本実行は本文を処理せずcollector_setup_unavailableで失敗し、送信しない', async () => {
+  it('project未登録・policy解決不能の本実行は本文を処理せずcollector_setup_unavailableで失敗し、送信しない', async () => {
     const fixture = await createCollectorFixture();
     const home = path.join(fixture.root, 'home');
     const previousHome = process.env.HOME;
