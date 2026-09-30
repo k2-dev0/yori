@@ -3,7 +3,7 @@ import type { Pool } from 'pg';
 import { z } from 'zod';
 import { MAX_EVENT_BODY_BYTES, type ErrorBody, type ErrorCode } from './contract.js';
 import { resolveCollectorSetup } from './collector-setup.js';
-import { authenticate, EventConflictError, ingestEvents, isProjectMember, SuspectedSecretError } from './events.js';
+import { authenticate, EventConflictError, ingestEvents, isCompanyProject, SuspectedSecretError } from './events.js';
 import {
   createSearch,
   loadEvidence,
@@ -15,24 +15,33 @@ import {
 } from './searches.js';
 import {
   collectorSetupResponseSchema,
+  companyResponseSchema,
   errorResponseSchema,
   eventsResponseSchema,
   evidenceResponseSchema,
   healthLiveResponseSchema,
   healthReadyResponseSchema,
+  meResponseSchema,
+  projectRegistrationResponseSchema,
   searchAcceptedResponseSchema,
   searchLookupResponseSchema,
   searchViewResponseSchema,
   sessionLinkResponseSchema,
+  tokenIssueResponseSchema,
+  tokenRevokeResponseSchema,
 } from './response-schema.js';
 import {
   collectorSetupRequestSchema,
   eventsRequestSchema,
+  employeeTokenParamsSchema,
   evidenceQuerySchema,
+  projectRegistrationRequestSchema,
   searchByInputQuerySchema,
   searchDetailQuerySchema,
   searchRequestSchema,
   sessionLinkRequestSchema,
+  tokenIssueRequestSchema,
+  tokenParamsSchema,
 } from './schema.js';
 import {
   SessionLinkConflictError,
@@ -40,6 +49,15 @@ import {
   SessionLinkNotFoundError,
   createSessionLink,
 } from './session-links.js';
+import { ProjectRepositoryConflictError, registerProject } from './projects.js';
+import {
+  AccountTargetNotFoundError,
+  issueCompanyToken,
+  LastCompanyAdminError,
+  loadCompany,
+  loadMe,
+  revokeCompanyToken,
+} from './account.js';
 
 // 認証・入力検証・project権限・保存をHTTP境界としてまとめる。DB失敗の詳細は応答へ出さない。
 export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInstance {
@@ -64,6 +82,103 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     }
   });
 
+  app.get('/v1/me', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    try {
+      return reply.code(200).send(meResponseSchema.parse(await loadMe(deps.pool, auth)));
+    } catch {
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.get('/v1/company', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    try {
+      return reply.code(200).send(companyResponseSchema.parse(await loadCompany(deps.pool, auth)));
+    } catch {
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.post('/v1/employees/:employee_id/tokens', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    const params = employeeTokenParamsSchema.safeParse(request.params);
+    const body = tokenIssueRequestSchema.safeParse(request.body);
+    if (!params.success || !body.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const issued = await issueCompanyToken(deps.pool, auth, params.data.employee_id, body.data.scope);
+      return reply.code(201).send(tokenIssueResponseSchema.parse(issued));
+    } catch (error) {
+      if (error instanceof AccountTargetNotFoundError) {
+        return reply.code(404).send(errorBody('not_found'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.delete('/v1/tokens/:token_id', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    const params = tokenParamsSchema.safeParse(request.params);
+    if (!params.success || request.body !== undefined) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const revoked = await revokeCompanyToken(deps.pool, auth, params.data.token_id);
+      return reply.code(200).send(tokenRevokeResponseSchema.parse(revoked));
+    } catch (error) {
+      if (error instanceof AccountTargetNotFoundError) {
+        return reply.code(404).send(errorBody('not_found'));
+      }
+      if (error instanceof LastCompanyAdminError) {
+        return reply.code(409).send(errorBody('conflict'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.post('/v1/projects', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    const parsed = projectRegistrationRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const created = await registerProject(deps.pool, auth, parsed.data.repository);
+      return reply.code(created.statusCode).send(projectRegistrationResponseSchema.parse(created.response));
+    } catch (error) {
+      if (error instanceof ProjectRepositoryConflictError || isUniqueViolation(error)) {
+        return reply.code(409).send(errorBody('repository_conflict'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
   app.post('/v1/events', async (request, reply) => {
     const auth = await authenticate(deps.pool, request.headers.authorization);
     if (!auth) {
@@ -73,7 +188,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (!parsed.success) {
       return reply.code(400).send(errorBody('invalid_request'));
     }
-    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+    if (!(await isCompanyProject(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
     try {
@@ -99,7 +214,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (!parsed.success) {
       return reply.code(400).send(errorBody('invalid_request'));
     }
-    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+    if (!(await isCompanyProject(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
     try {
@@ -154,7 +269,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (!parsed.success) {
       return reply.code(400).send(errorBody('invalid_request'));
     }
-    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+    if (!(await isCompanyProject(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
     try {
@@ -184,7 +299,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (!parsed.success) {
       return reply.code(400).send(errorBody('invalid_request'));
     }
-    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+    if (!(await isCompanyProject(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
     const view = await lookupSearchByInput(deps.pool, auth, parsed.data, parsed.data.wait_ms ?? 0);
@@ -230,7 +345,7 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     if (!parsed.success) {
       return reply.code(400).send(errorBody('invalid_request'));
     }
-    if (!(await isProjectMember(deps.pool, auth, parsed.data.project_id))) {
+    if (!(await isCompanyProject(deps.pool, auth, parsed.data.project_id))) {
       return reply.code(403).send(errorBody('forbidden'));
     }
     const evidence = await loadEvidence(deps.pool, auth, messageId.data.toLowerCase(), parsed.data.project_id, parsed.data.revision);
