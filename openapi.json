@@ -530,7 +530,8 @@
               "enum": [
                 "codex",
                 "claude_code",
-                "cursor"
+                "cursor",
+                "deepseek_harness"
               ]
             }
           },
@@ -887,7 +888,8 @@
                   "enum": [
                     "codex",
                     "claude_code",
-                    "cursor"
+                    "cursor",
+                    "deepseek_harness"
                   ]
                 },
                 "source_scope": {
@@ -1055,7 +1057,8 @@
                 "enum": [
                   "codex",
                   "claude_code",
-                  "cursor"
+                  "cursor",
+                  "deepseek_harness"
                 ]
               },
               "source_scope": {
@@ -1086,7 +1089,8 @@
                 "enum": [
                   "codex",
                   "claude_code",
-                  "cursor"
+                  "cursor",
+                  "deepseek_harness"
                 ]
               },
               "source_scope": {
@@ -1117,7 +1121,8 @@
                 "enum": [
                   "codex",
                   "claude_code",
-                  "cursor"
+                  "cursor",
+                  "deepseek_harness"
                 ]
               },
               "source_scope": {
