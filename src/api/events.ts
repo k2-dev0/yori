@@ -1,15 +1,27 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
-import { AUTO_SEARCH_POLICY_VERSION, EVENT_WRITE_LOCK_NAMESPACE, RECEIPT_PAYLOAD_KEYS, type EventResult, type EventsResponse } from './contract.js';
+import {
+  AUTO_SEARCH_POLICY_VERSION,
+  EVENT_WRITE_LOCK_NAMESPACE,
+  RECEIPT_PAYLOAD_KEYS,
+  type EventResult,
+  type EventsResponse,
+  type TokenScope,
+} from './contract.js';
 import { CLASSIFY_MESSAGE_PRIORITY, ROUTE_SEARCH_PRIORITY, enqueueJob } from '../jobs/queue.js';
 import { loadCompanyRedactionPolicy } from './redaction-policy.js';
 import { redactConversationText, sanitizeConversationText } from './redaction.js';
-import type { EventsRequest, ParsedEvent } from './schema.js';
+import { tokenScopeSchema, type EventsRequest, type ParsedEvent } from './schema.js';
 
 export interface AuthContext {
   companyId: string;
   employeeId: string;
+  displayName: string;
+  tokenId: string;
+  tokenScope: TokenScope;
+  tokenCreatedAt: string;
+  tokenRevokedAt: null;
 }
 
 export class EventConflictError extends Error {
@@ -31,25 +43,45 @@ export async function authenticate(pool: Pool, authorization: string | undefined
   if (!token) {
     return null;
   }
-  const result = await pool.query<{ company_id: string; employee_id: string }>(
-    `SELECT t.company_id, t.employee_id
+  const result = await pool.query<{
+    company_id: string;
+    employee_id: string;
+    display_name: string;
+    token_id: string;
+    scope: string;
+    created_at: Date;
+  }>(
+    `SELECT t.company_id, t.employee_id, e.display_name, t.id AS token_id, t.scope, t.created_at
        FROM auth_tokens t
        JOIN employees e ON e.id = t.employee_id AND e.company_id = t.company_id
       WHERE t.token_hash = $1 AND t.revoked_at IS NULL`,
     [sha256Utf8(token)],
   );
   const row = result.rows[0];
-  return row ? { companyId: row.company_id, employeeId: row.employee_id } : null;
+  if (row === undefined) {
+    return null;
+  }
+  const scope = tokenScopeSchema.safeParse(row.scope);
+  return scope.success
+    ? {
+        companyId: row.company_id,
+        employeeId: row.employee_id,
+        displayName: row.display_name,
+        tokenId: row.token_id,
+        tokenScope: scope.data,
+        tokenCreatedAt: row.created_at.toISOString(),
+        tokenRevokedAt: null,
+      }
+    : null;
 }
 
-// 認証済み社員が、同じ会社に属するプロジェクトのメンバーであることを要求する。
-export async function isProjectMember(pool: Pool, auth: AuthContext, projectId: string): Promise<boolean> {
+// 認証済み社員の会社に属するprojectかを判定する。会社内の全社員が全projectを共有する。
+export async function isCompanyProject(pool: Pool, auth: AuthContext, projectId: string): Promise<boolean> {
   const result = await pool.query(
     `SELECT 1
        FROM projects p
-       JOIN project_members pm ON pm.project_id = p.id
-      WHERE p.id = $1 AND p.company_id = $2 AND pm.employee_id = $3`,
-    [projectId, auth.companyId, auth.employeeId],
+      WHERE p.id = $1 AND p.company_id = $2`,
+    [projectId, auth.companyId],
   );
   return result.rows.length > 0;
 }
