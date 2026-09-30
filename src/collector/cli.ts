@@ -2,7 +2,13 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { EventSource } from '../api/contract.js';
-import { BACKFILL_SOURCES, BackfillArgumentError, backfillCollector, type BackfillSource } from './backfill.js';
+import {
+  BACKFILL_SOURCES,
+  BackfillArgumentError,
+  BackfillExecutionError,
+  backfillCollector,
+  type BackfillSource,
+} from './backfill.js';
 import { collectFromHook, flushCollector } from './collect.js';
 import { notifyFromHook, notifyLateFromHook } from './notify.js';
 import { parseCursorHookInput } from './adapters/cursor.js';
@@ -147,6 +153,9 @@ async function main(): Promise<void> {
       } catch (error) {
         if (error instanceof BackfillArgumentError) {
           fail('invalid_arguments');
+        }
+        if (error instanceof BackfillExecutionError) {
+          fail(error.code);
         }
         throw error;
       }
