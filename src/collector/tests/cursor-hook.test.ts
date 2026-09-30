@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { flushCollector } from '../collect.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from '../state.js';
 import {
   ackResponse,
@@ -53,6 +54,7 @@ describe('Cursor公式hookの会話収集', () => {
       const assistant = cursorHook({ event: 'afterAgentResponse', workspaceRoots: [fixture.repoDir], text: 'Cursorからの回答' });
       assert.equal((await run(user)).code, 0);
       assert.equal((await run(assistant)).code, 0);
+      await flushCollector({ config: fixture.config, token: 'token-a' });
 
       assert.deepEqual(
         sentEvents(mock.requests).map((event) => [
@@ -81,7 +83,8 @@ describe('Cursor公式hookの会話収集', () => {
       );
 
       assert.equal((await run(assistant)).code, 0);
-      assert.equal(mock.requests.length, 2, '同じassistant hookを再送している');
+      await flushCollector({ config: fixture.config, token: 'token-a' });
+      assert.equal(mock.requests.length, 1, '同じassistant hookを再送している');
 
       assert.equal(
         (
@@ -96,8 +99,9 @@ describe('Cursor公式hookの会話収集', () => {
         ).code,
         0,
       );
+      await flushCollector({ config: fixture.config, token: 'token-a' });
       assert.deepEqual(
-        sentEvents(mock.requests.slice(2)).map((event) => [event.source_message_id, event.text, (event as unknown as { model_id?: string }).model_id, event.revision]),
+        sentEvents(mock.requests.slice(1)).map((event) => [event.source_message_id, event.text, (event as unknown as { model_id?: string }).model_id, event.revision]),
         [['generation:generation-1:assistant', 'Cursorからの修正版回答', 'openai/gpt-5', 2]],
       );
 
@@ -114,8 +118,9 @@ describe('Cursor公式hookの会話収集', () => {
         ).code,
         0,
       );
+      await flushCollector({ config: fixture.config, token: 'token-a' });
       assert.deepEqual(
-        sentEvents(mock.requests.slice(3)).map((event) => [event.text, (event as unknown as { model_id?: string }).model_id, event.revision]),
+        sentEvents(mock.requests.slice(2)).map((event) => [event.text, (event as unknown as { model_id?: string }).model_id, event.revision]),
         [['Cursorからの修正版回答', 'google/gemini-pro', 3]],
       );
     } finally {
