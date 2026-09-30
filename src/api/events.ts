@@ -157,7 +157,7 @@ async function applyEvent(
        VALUES ($1, $2, $3, $4, $5, $6, 1)`,
       [messageId, sessionId, event.source_message_id, event.sequence_no, event.role, occurredAt],
     );
-    await insertRevision(client, messageId, event.revision, event.text, event.model_id);
+    await insertRevision(client, messageId, event.revision, event.text, event.model_id, event.client_version);
   }
 
   const requestId = event.role === 'user' ? await resolveAutoSearchRequest(client, auth, projectId, sessionId, messageId, event) : null;
@@ -237,28 +237,37 @@ async function applyRevision(client: PoolClient, message: StoredMessage, event: 
     throw new EventConflictError();
   }
   if (event.revision === message.current_revision + 1) {
-    await insertRevision(client, message.id, event.revision, event.text, event.model_id);
+    await insertRevision(client, message.id, event.revision, event.text, event.model_id, event.client_version);
     await client.query('UPDATE messages SET current_revision = $2, updated_at = now() WHERE id = $1', [message.id, event.revision]);
     return;
   }
-  const existing = await client.query<{ text: string; model_id: string | null }>(
-    'SELECT text, model_id FROM message_revisions WHERE message_id = $1 AND revision = $2',
+  const existing = await client.query<{ text: string; model_id: string | null; client_version: string | null }>(
+    'SELECT text, model_id, client_version FROM message_revisions WHERE message_id = $1 AND revision = $2',
     [message.id, event.revision],
   );
   const revision = existing.rows[0];
-  if (!revision || revision.text !== event.text || revision.model_id !== (event.model_id ?? null)) {
+  if (
+    !revision ||
+    revision.text !== event.text ||
+    revision.model_id !== (event.model_id ?? null) ||
+    revision.client_version !== (event.client_version ?? null)
+  ) {
     throw new EventConflictError();
   }
 }
 
-async function insertRevision(client: PoolClient, messageId: string, revision: number, text: string, modelId: string | undefined): Promise<void> {
-  await client.query('INSERT INTO message_revisions (message_id, revision, text, content_hash, model_id) VALUES ($1, $2, $3, $4, $5)', [
-    messageId,
-    revision,
-    text,
-    sha256Utf8(text),
-    modelId ?? null,
-  ]);
+async function insertRevision(
+  client: PoolClient,
+  messageId: string,
+  revision: number,
+  text: string,
+  modelId: string | undefined,
+  clientVersion: string | undefined,
+): Promise<void> {
+  await client.query(
+    'INSERT INTO message_revisions (message_id, revision, text, content_hash, model_id, client_version) VALUES ($1, $2, $3, $4, $5, $6)',
+    [messageId, revision, text, sha256Utf8(text), modelId ?? null, clientVersion ?? null],
+  );
 }
 
 // user発言の自動検索受付をrevision単位で1件だけ作成し、再送では既存request_idを返す。
@@ -313,6 +322,7 @@ function receiptHash(input: ReceiptHashInput): Buffer {
     role: input.event.role,
     occurred_at: input.event.occurred_at,
     model_id: input.event.model_id,
+    client_version: input.event.client_version,
     text: input.event.text,
   };
   const ordered = RECEIPT_PAYLOAD_KEYS.map((key) => [key, values[key]] as const);
