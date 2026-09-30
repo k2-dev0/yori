@@ -18,10 +18,15 @@ const errorCodeSchema = z.enum([
 
 export const healthLiveResponseSchema = z.strictObject({ status: z.literal('ok') });
 
-// readyは受付可否だけを返す。依存障害でも内部情報を追加しない。
+const releaseMetadataShape = {
+  release_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  api_contract_version: z.literal(1),
+};
+
+// readyは受付可否と配布識別子だけを返す。依存障害でも内部情報を追加しない。
 export const healthReadyResponseSchema = z.union([
-  z.strictObject({ status: z.literal('ready') }),
-  z.strictObject({ status: z.literal('unavailable') }),
+  z.strictObject({ status: z.literal('ready'), ...releaseMetadataShape }),
+  z.strictObject({ status: z.literal('unavailable'), ...releaseMetadataShape }),
 ]);
 
 // 応答のエラー本文はcodeだけにし、説明文やDB errorを契約へ追加しない。
