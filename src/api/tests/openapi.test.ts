@@ -339,7 +339,7 @@ describe('OpenAPI 3.1契約の生成', () => {
     }
 
     // events bodyはcontract.tsの上限をZod変換後も保持する。
-    const events = operationOf(document, ROUTES[2]);
+    const events = operationOf(document, ROUTES[4]);
     const eventsSchema = requestBodySchema(document, events.operation);
     assert.deepEqual(requiredNames(eventsSchema).sort(), ['events', 'project_id']);
     assert.equal(eventsSchema?.properties?.events?.maxItems, MAX_BATCH_SIZE, 'eventsのbatch上限がZod契約と一致しない');
@@ -361,7 +361,7 @@ describe('OpenAPI 3.1契約の生成', () => {
       'text',
     ]);
 
-    const searches = operationOf(document, ROUTES[3]);
+    const searches = operationOf(document, ROUTES[5]);
     const searchSchema = requestBodySchema(document, searches.operation);
     assert.deepEqual(requiredNames(searchSchema).sort(), [
       'force_refresh',
@@ -372,7 +372,7 @@ describe('OpenAPI 3.1契約の生成', () => {
       'query',
     ]);
 
-    const sessionLinks = operationOf(document, ROUTES[4]);
+    const sessionLinks = operationOf(document, ROUTES[6]);
     const linkSchema = requestBodySchema(document, sessionLinks.operation);
     assert.deepEqual(requiredNames(linkSchema).sort(), ['evidence', 'from', 'idempotency_key', 'project_id', 'to']);
     const fromSchema = resolveSchema(document, linkSchema?.properties?.from);
@@ -391,7 +391,7 @@ describe('OpenAPI 3.1契約の生成', () => {
     const { document } = await generatedOpenApi();
 
     // 本文のUnicodeコードポイント上限とidentifierのUTF-8 byte上限は標準keywordで表せないためx-yori拡張で示す。
-    const eventsSchema = requestBodySchema(document, operationOf(document, ROUTES[2]).operation);
+    const eventsSchema = requestBodySchema(document, operationOf(document, ROUTES[4]).operation);
     const eventItem = resolveSchema(document, eventsSchema?.properties?.events?.items);
     const textSchema = resolveSchema(document, eventItem?.properties?.text);
     assert.equal(textSchema?.maxLength, MAX_TEXT_LENGTH, 'events本文のmaxLengthがZod契約と一致しない');
@@ -402,12 +402,12 @@ describe('OpenAPI 3.1契約の生成', () => {
       assert.equal(fieldSchema?.['x-yori-max-utf8-bytes'], MAX_SOURCE_IDENTIFIER_BYTES, `${field}のUTF-8 byte上限がない`);
       assert.ok(String(fieldSchema?.description).includes(String(MAX_SOURCE_IDENTIFIER_BYTES)), `${field}のbyte上限説明がない`);
     }
-    const searchSchema = requestBodySchema(document, operationOf(document, ROUTES[3]).operation);
+    const searchSchema = requestBodySchema(document, operationOf(document, ROUTES[5]).operation);
     assert.equal(searchSchema?.properties?.query?.maxLength, MAX_TEXT_LENGTH, '検索queryのmaxLengthがない');
     assert.equal(searchSchema?.properties?.query?.['x-yori-max-code-points'], MAX_TEXT_LENGTH, '検索queryの本文上限がない');
 
     // query parameterはwireが文字列でも、意味上のinteger/min/maxを表す。
-    const byInputOperation = operationOf(document, ROUTES[5]).operation;
+    const byInputOperation = operationOf(document, ROUTES[7]).operation;
     const byInputParams = new Map((byInputOperation.parameters ?? []).map((item) => [item.name, item]));
     assert.deepEqual(byInputParams.get('wait_ms')?.schema, {
       type: 'integer',
@@ -421,7 +421,7 @@ describe('OpenAPI 3.1契約の生成', () => {
       assert.equal(schema?.minimum, 1);
       assert.equal(schema?.maximum, MAX_REVISION);
     }
-    const detailParams = new Map((operationOf(document, ROUTES[6]).operation.parameters ?? []).map((item) => [item.name, item]));
+    const detailParams = new Map((operationOf(document, ROUTES[8]).operation.parameters ?? []).map((item) => [item.name, item]));
     assert.equal((detailParams.get('wait_ms')?.schema as OpenApiSchema | undefined)?.maximum, MAX_WAIT_MS);
 
     // by-inputの2 branchは標準keywordで表せないため、descriptionとx-yori拡張で排他を機械可読に固定する。
