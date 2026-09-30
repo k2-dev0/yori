@@ -288,8 +288,8 @@ function rankingChoiceSelector(
 ): JevChoiceSelector {
   return (question, request) => {
     const field = question.id.split(':')[0] ?? question.id;
-    const candidateId = /candidate_id=([^\s]+)/.exec(question.instructions)?.[1];
-    const text = request.state.candidates?.find((candidate) => candidate.candidate_id === candidateId)?.text ?? '';
+    const candidate = request.state.candidates?.find((item) => question.instructions.includes(`candidate_id=${item.candidate_id}`));
+    const text = candidate?.text ?? '';
     if (field === 'candidate_relevance') {
       return relevanceFor(text);
     }
@@ -1766,7 +1766,7 @@ describe('M5 独立候補判定', () => {
     assert.ok(!evidenceIds.includes(messageIds.get('LOWER-USEFUL') as string), '低relevance候補を新しさだけで昇格させている');
   });
 
-  it('同じrelevance・statement statusでは新しい発言をRRF上位の古い発言より優先する', async () => {
+  it('同じrelevance・statement status・RRFでは新しい発言を安定ID順より優先する', async () => {
     const queryVector = basisVector(0, 1);
     const select = rankingChoiceSelector(() => 'reported_completed');
     const { config } = await startProviders(pool, workspace.companyId, {
@@ -1775,6 +1775,9 @@ describe('M5 独立候補判定', () => {
     });
     const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const sourceSession = await seedSession(pool, workspace);
+    const entityKey = 'SharedConclusion.ts';
+    const oldDocumentId = '00000000-0000-4000-8000-000000000001';
+    const newDocumentId = '00000000-0000-4000-8000-000000000002';
     const oldText = 'OLD-COMPLETED 同じ状態の古い完了報告';
     const oldMessage = await seedMessage(pool, {
       sessionId: sourceSession,
@@ -1784,15 +1787,21 @@ describe('M5 独立候補判定', () => {
       occurredAt: new Date('2026-09-01T00:00:00.000Z'),
     });
     await seedReadyDocument(pool, {
+      id: oldDocumentId,
       companyId: workspace.companyId,
       projectId: workspace.projectId,
       sessionId: sourceSession,
       documentKey: 'old-completed',
       content: oldText,
       generationId: generation.id,
-      embedding: similarityVector(1),
+      embedding: similarityVector(2),
       sources: [{ messageId: oldMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: oldText.length }],
     });
+    await pool.query(
+      `INSERT INTO document_entities (id, document_id, revision, company_id, project_id, entity_type, entity_key)
+       VALUES ($1, $2, 1, $3, $4, 'file', $5)`,
+      [uuidv7(), oldDocumentId, workspace.companyId, workspace.projectId, entityKey],
+    );
     const newText = 'NEW-COMPLETED 同じ状態の新しい完了報告';
     const newMessage = await seedMessage(pool, {
       sessionId: sourceSession,
@@ -1802,21 +1811,27 @@ describe('M5 独立候補判定', () => {
       occurredAt: new Date('2026-09-02T00:00:00.000Z'),
     });
     await seedReadyDocument(pool, {
+      id: newDocumentId,
       companyId: workspace.companyId,
       projectId: workspace.projectId,
       sessionId: sourceSession,
       documentKey: 'new-completed',
       content: newText,
       generationId: generation.id,
-      embedding: similarityVector(2),
+      embedding: similarityVector(1),
       sources: [{ messageId: newMessage.messageId, messageRevision: 1, startOffset: 0, endOffset: newText.length }],
     });
+    await pool.query(
+      `INSERT INTO document_entities (id, document_id, revision, company_id, project_id, entity_type, entity_key)
+       VALUES ($1, $2, 1, $3, $4, 'file', $5)`,
+      [uuidv7(), newDocumentId, workspace.companyId, workspace.projectId, entityKey],
+    );
     const inputSession = await seedSession(pool, workspace);
     const seeded = await seedExecuteSearch(pool, {
       workspace,
       sessionId: inputSession,
       sequenceNo: 1,
-      text: '最新の完了報告を確認する',
+      text: `${entityKey} の最新の完了報告を確認する`,
     });
     await runExecuteSearch(pool, { jobId: seeded.jobId, config });
 
