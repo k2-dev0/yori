@@ -218,7 +218,7 @@ describe('collector backfill', { concurrency: false }, () => {
         if (source !== undefined) {
           args.push('--source', source);
         }
-        const result = await runCollectorCli(args, { env: { HOME: home, YORI_TEST_TOKEN: 'token-a' } });
+        const result = await runCollectorCli(args, { env: source === undefined ? { HOME: home, YORI_TEST_TOKEN: '' } : { HOME: home, YORI_TEST_TOKEN: 'token-a' } });
         assert.equal(result.code, 0, `${source ?? 'all'}: ${result.stderr}`);
         const output = JSON.parse(result.stdout) as { sources: Record<string, unknown> };
         assert.deepEqual(Object.keys(output.sources), source === undefined ? ['codex', 'claude_code', 'deepseek_harness'] : [source]);
