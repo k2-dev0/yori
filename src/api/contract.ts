@@ -29,7 +29,7 @@ export const AUTO_SEARCH_POLICY_VERSION = 'initial-v1';
 // 同一社員のイベント保存と再利用確定を直列化するtransaction advisory lockの名前空間。
 export const EVENT_WRITE_LOCK_NAMESPACE = 20260922;
 
-export const EVENT_SOURCES = ['codex', 'claude_code', 'cursor'] as const;
+export const EVENT_SOURCES = ['codex', 'claude_code', 'cursor', 'deepseek_harness'] as const;
 export type EventSource = (typeof EVENT_SOURCES)[number];
 
 export const EVENT_ROLES = ['user', 'assistant', 'agent_report'] as const;
