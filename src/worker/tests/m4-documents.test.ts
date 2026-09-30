@@ -26,7 +26,7 @@ import {
   VOYAGE_TOKENIZER_VERSION,
   WORKER_POLICY_VERSION,
 } from '../contract.js';
-import { applyDocumentPlan, loadSessionMessages, planDocumentChunks } from '../documents.js';
+import { applyDocumentPlan, loadDocumentBuildPlan, loadSessionMessages, planDocumentChunks } from '../documents.js';
 import { ensureActiveGeneration, VoyageEmbeddingProvider } from '../embedding.js';
 import { LeaseLostError, StaleApplyError } from '../errors.js';
 import { processJob, retryJob } from '../process.js';
@@ -2508,7 +2508,7 @@ describe('M4 Green追加契約', () => {
 });
 
 describe('incremental build consistency', () => {
-  it('末尾追加と集約済み要求では確定済み先頭文書を書き直さず全体構築と一致する', async () => {
+  it('末尾追加と集約済み要求では確定済み先頭文書を書き直さず全体構築と一致する', async (t) => {
     const { config } = await startApprovedVoyage(pool, workspace.companyId);
     const sessionId = await seedSession(pool, workspace);
     const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: 'src/original.ts alpha beta gamma\n'.repeat(400) });
@@ -2519,11 +2519,16 @@ describe('incremental build consistency', () => {
     assert.ok(before.rows.length > 0, 'identifier fixtureがない');
     const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: 'append src/new.ts' });
     const third = await seedSearchableMessage(pool, { sessionId, sequenceNo: 3, text: 'append src/last.ts' });
+    const appendPlan = await loadDocumentBuildPlan(pool, sessionId);
+    assert.equal(appendPlan.checkpoint.incremental, true);
+    assert.ok(appendPlan.chunks.length <= 2, '追記で確定済みの先頭chunkを再計画した');
     await runBuildJob(pool, { buildJobId: second.buildJobId, config });
     const afterBuild = await snapshotSearchState(pool, workspace.projectId);
     await runBuildJob(pool, { buildJobId: third.buildJobId, config });
+    assert.equal((await loadDocumentBuildPlan(pool, sessionId)).chunks.length, 0, '反映済み要求で再計画した');
     assert.deepEqual(await snapshotSearchState(pool, workspace.projectId), afterBuild);
     const expected = await planDocumentChunks(sessionId, (await loadSessionMessages(pool, sessionId)).messages);
+    t.diagnostic(`全体再構築=${expected.length} chunks、差分構築=${appendPlan.chunks.length} chunks、反映済み要求=0 chunks`);
     const actual = await pool.query<{ document_key: string; content: string }>(
       `SELECT d.document_key, r.content FROM search_documents d
        JOIN document_publications p ON p.document_id = d.id
@@ -2602,6 +2607,7 @@ describe('incremental build consistency', () => {
     try {
       assert.ok(await waitUntil(() => server.requests.length > 0, EXTERNAL_WAIT_TIMEOUT_MS));
       second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: '処理中に到着した発言' });
+      await seedSearchableMessage(pool, { sessionId, sequenceNo: 3, text: '了解', retention: 'progress_only', isSearchable: false });
     } finally { block = false; gate.resolve(); }
     await processing;
     assert.equal((await readJob(pool, first.buildJobId)).status, 'completed');
@@ -2611,6 +2617,23 @@ describe('incremental build consistency', () => {
       `SELECT r.content FROM document_publications p JOIN search_document_revisions r
        ON r.document_id = p.document_id AND r.revision = p.revision`);
     assert.ok(published.rows.some((r) => r.content.includes('処理中に到着した発言')));
+  });
+
+  it('新規jobがない再分類もworker再起動時に回収し、別sessionを変更しない', async () => {
+    const { config } = await startApprovedVoyage(pool, workspace.companyId);
+    const sessionId = await seedSession(pool, workspace);
+    const message = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '再分類後に索引へ戻す' });
+    await runBuildJob(pool, { buildJobId: message.buildJobId, config });
+    await upsertAnalysis(pool, { messageId: message.messageId, revision: 1, retention: 'progress_only', isSearchable: false });
+    await upsertAnalysis(pool, { messageId: message.messageId, revision: 1 });
+    const controller = new AbortController();
+    const running = runWorker({ pool, config, pollIntervalMs: 10, signal: controller.signal });
+    try {
+      assert.ok(await waitUntil(async () => (await readPublications(pool, workspace.projectId)).length > 0, BUILD_JOB_TIMEOUT_MS),
+        '永続化した未反映更新を回収できない');
+    } finally { controller.abort(); await running; }
+    const remaining = await pool.query('SELECT 1 FROM document_build_states WHERE session_id = $1 AND dirty_sequence IS NOT NULL', [sessionId]);
+    assert.equal(remaining.rowCount, 0);
   });
 });
 
