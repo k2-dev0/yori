@@ -5,6 +5,7 @@ export const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   API_HOST: z.string().min(1).default('0.0.0.0'),
   API_PORT: z.coerce.number().int().min(1).max(65535).default(3210),
+  YORI_RELEASE_SHA: z.string().regex(/^[0-9a-f]{40}$/),
 });
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env) {
