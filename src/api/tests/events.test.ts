@@ -45,6 +45,38 @@ function assertUuidV7(value: unknown): void {
 }
 
 describe('POST /v1/events 正常保存', () => {
+  it('Cursorイベントのsourceと選択modelをmessage revisionへ保存する', async () => {
+    const event = {
+      ...buildEventInput({
+        idempotency_key: 'cursor-model-1',
+        source_message_id: 'generation:generation-1:assistant',
+        role: 'assistant',
+        text: 'Cursorの回答',
+      }),
+      source: 'cursor',
+      source_session_id: 'conversation-1',
+      model_id: 'anthropic/claude-sonnet-4',
+    };
+
+    const response = await postEvents(app, { token: workspace.token, body: { project_id: workspace.projectId, events: [event] } });
+
+    assert.equal(response.statusCode, 202, response.body);
+    const session = await pool.query<{ source: string; source_session_id: string }>('SELECT source, source_session_id FROM sessions');
+    assert.deepEqual(session.rows, [{ source: 'cursor', source_session_id: 'conversation-1' }]);
+    const revision = await pool.query<{ text: string; model_id: string | null }>('SELECT text, model_id FROM message_revisions');
+    assert.deepEqual(revision.rows, [{ text: 'Cursorの回答', model_id: 'anthropic/claude-sonnet-4' }]);
+  });
+
+  it('model_idを持たない既存clientのイベントを従来どおり保存する', async () => {
+    const event = buildEventInput({ idempotency_key: 'without-model-1', text: '既存clientの本文' });
+
+    const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
+
+    assert.equal(response.statusCode, 202, response.body);
+    const revision = await pool.query<{ model_id: string | null }>('SELECT model_id FROM message_revisions');
+    assert.deepEqual(revision.rows, [{ model_id: null }]);
+  });
+
   it('userイベントを202で受理し、原文・classify job・自動検索受付を同一TXで保存する', async () => {
     const userText = '改行\nと日本語テキスト\r\nと行末空白  ';
     const assistantText = ' 前後空白を保持するAI発言 ';
