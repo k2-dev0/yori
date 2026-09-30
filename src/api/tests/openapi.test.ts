@@ -70,7 +70,7 @@ interface OpenApiDocument {
 
 interface RouteContract {
   path: string;
-  method: 'get' | 'post' | 'delete';
+  method: 'get' | 'post' | 'patch' | 'delete';
   secured: boolean;
   success: string[];
   errors: string[];
@@ -102,6 +102,16 @@ const ROUTES: RouteContract[] = [
     success: ['201'],
     errors: ['400', '401', '403', '413', '500'],
     pathParams: [],
+    queryParams: [],
+    hasBody: true,
+  },
+  {
+    path: '/v1/employees/{employee_id}',
+    method: 'patch',
+    secured: true,
+    success: ['200'],
+    errors: ['400', '401', '403', '404', '413', '500'],
+    pathParams: ['employee_id'],
     queryParams: [],
     hasBody: true,
   },
@@ -316,7 +326,7 @@ function effectiveSecurity(document: OpenApiDocument, pathItem: OpenApiPathItem,
 }
 
 describe('OpenAPI 3.1契約の生成', () => {
-  it('OpenAPI 3.1として15 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
+  it('OpenAPI 3.1として16 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
     const { document } = await generatedOpenApi();
     assert.match(String(document.openapi), /^3\.1\.\d+$/, 'OpenAPI 3.1.xではない');
     assert.equal(document.info?.version, '1.0.0', 'API契約版が1.0.0ではない');
@@ -413,6 +423,11 @@ describe('OpenAPI 3.1契約の生成', () => {
       'source_scope',
       'source_session_id',
     ]);
+
+    const employeeRename = operationOf(document, routeContract('/v1/employees/{employee_id}', 'patch'));
+    const employeeRenameSchema = requestBodySchema(document, employeeRename.operation);
+    assert.deepEqual(requiredNames(employeeRenameSchema), ['display_name']);
+    assert.equal(employeeRenameSchema?.additionalProperties, false, 'employee renameのunknown fieldがstrictでない');
   });
 
   it('入力上限とby-input排他的branchをZod契約と同じ値でOpenAPIへ表現する', async () => {
