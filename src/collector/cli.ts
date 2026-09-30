@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { EventSource } from '../api/contract.js';
-import { BACKFILL_SOURCES, backfillCollector, type BackfillSource } from './backfill.js';
+import { BACKFILL_SOURCES, BackfillArgumentError, backfillCollector, type BackfillSource } from './backfill.js';
 import { collectFromHook, flushCollector } from './collect.js';
 import { notifyFromHook, notifyLateFromHook } from './notify.js';
 import { parseCursorHookInput } from './adapters/cursor.js';
@@ -144,8 +144,11 @@ async function main(): Promise<void> {
           dryRun,
           ...(source === undefined ? {} : { source: source as BackfillSource }),
         });
-      } catch {
-        fail('invalid_arguments');
+      } catch (error) {
+        if (error instanceof BackfillArgumentError) {
+          fail('invalid_arguments');
+        }
+        throw error;
       }
       process.stdout.write(`${JSON.stringify(summary)}\n`);
       return;
