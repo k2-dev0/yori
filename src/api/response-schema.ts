@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { MAX_BUSINESS_FIELD_CODE_POINTS, MAX_BUSINESS_REDACTION_RULES, MAX_BUSINESS_TERM_CODE_POINTS } from './contract.js';
-import { occurredAtSchema, revisionSchema, storableString } from './schema.js';
+import { canonicalRepository, occurredAtSchema, revisionSchema, storableString } from './schema.js';
 
 // HTTP公開応答の実行時正本。サーバーが返す形はstrictに固定し、
 // OpenAPI生成・contract test・MCP consumerの公開型はここから導出する。
@@ -11,6 +11,7 @@ const errorCodeSchema = z.enum([
   'forbidden',
   'not_found',
   'conflict',
+  'repository_conflict',
   'payload_too_large',
   'internal_error',
   'suspected_secret',
@@ -42,6 +43,64 @@ const eventResultSchema = z.strictObject({
 });
 
 export const eventsResponseSchema = z.strictObject({ results: z.array(eventResultSchema).min(1) });
+
+export const projectRegistrationResponseSchema = z.strictObject({
+  status: z.enum(['done', 'already']),
+  project_id: z.uuid(),
+  repository: canonicalRepository,
+});
+
+const companySummaryResponseSchema = z.strictObject({
+  company_id: z.uuid(),
+  name: storableString,
+});
+
+const employeeSummaryResponseSchema = z.strictObject({
+  employee_id: z.uuid(),
+  display_name: storableString,
+  created_at: occurredAtSchema,
+});
+
+const projectSummaryResponseSchema = z.strictObject({
+  project_id: z.uuid(),
+  repository: storableString,
+  created_at: occurredAtSchema,
+});
+
+const tokenMetadataResponseSchema = z.strictObject({
+  token_id: z.uuid(),
+  employee_id: z.uuid(),
+  scope: z.enum(['employee', 'company_admin']),
+  created_at: occurredAtSchema,
+  revoked_at: occurredAtSchema.nullable(),
+});
+
+export const meResponseSchema = z.strictObject({
+  company: companySummaryResponseSchema,
+  employee: employeeSummaryResponseSchema,
+  token: tokenMetadataResponseSchema.omit({ employee_id: true }),
+  projects: z.array(projectSummaryResponseSchema),
+});
+
+export const companyResponseSchema = z.strictObject({
+  company: companySummaryResponseSchema,
+  employees: z.array(employeeSummaryResponseSchema),
+  projects: z.array(projectSummaryResponseSchema),
+  tokens: z.array(tokenMetadataResponseSchema),
+});
+
+export const tokenIssueResponseSchema = z.strictObject({
+  status: z.literal('done'),
+  token_id: z.uuid(),
+  employee_id: z.uuid(),
+  scope: z.enum(['employee', 'company_admin']),
+  token: z.string().regex(/^yori_[A-Za-z0-9_-]+$/),
+});
+
+export const tokenRevokeResponseSchema = z.strictObject({
+  status: z.enum(['done', 'already']),
+  token_id: z.uuid(),
+});
 
 export const searchAcceptedResponseSchema = z.strictObject({ request_id: z.uuid() });
 
@@ -146,6 +205,11 @@ export type ErrorCode = z.infer<typeof errorCodeSchema>;
 export type ErrorBody = z.infer<typeof errorResponseSchema>;
 export type EventResult = z.infer<typeof eventResultSchema>;
 export type EventsResponse = z.infer<typeof eventsResponseSchema>;
+export type ProjectRegistrationResponse = z.infer<typeof projectRegistrationResponseSchema>;
+export type MeResponse = z.infer<typeof meResponseSchema>;
+export type CompanyResponse = z.infer<typeof companyResponseSchema>;
+export type TokenIssueResponse = z.infer<typeof tokenIssueResponseSchema>;
+export type TokenRevokeResponse = z.infer<typeof tokenRevokeResponseSchema>;
 export type SearchView = z.infer<typeof searchViewResponseSchema>;
 export type NotReceivedView = z.infer<typeof notReceivedResponseSchema>;
 export type SearchLookupView = z.infer<typeof searchLookupResponseSchema>;
