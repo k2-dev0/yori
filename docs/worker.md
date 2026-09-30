@@ -4,6 +4,8 @@
 
 ## 前提
 
+- 差分文書構築には`0014_document_build_state.sql`までのmigrationが必要。適用時はAPI・worker・再索引処理を停止し、migration後に同じ新版で再開する。旧workerとの混在運転は行わない。本migrationは原文を削除しない。
+
 - `0005_m5.sql`適用済みのPostgreSQL（M3/M4 migrationを含む）。workerはmigrationを実行しない。
 - 本番は`/etc/yori/yori.env`（root:root 0600）の`YORI_POSTGRES_*`/`JEV_*`/`VOYAGE_*`を使い、起動前に`deployment/check-production-config.mjs`で検査する。詳細は[deployment/README.md](../deployment/README.md)。
 - `JEV_API_KEY`/`JEV_ACCOUNT_REF`と`VOYAGE_API_KEY`/`VOYAGE_ACCOUNT_REF`。未設定・不正なら偽の判定・送信へ進まず`invalid_worker_config`で起動に失敗する。
@@ -120,13 +122,19 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 ### build_documents
 
+- `document_build_states`にsessionの変更番号・未反映sequence・構築済み位置・最終chunkのpartsを保存する。原文追加/改訂、現行分類、撤回/変更relationのDB triggerが書込TXと同時に更新する。通常追記は最終chunkと追加分だけを再計画する。初回・旧データ・chunker/policy版変更・過去の編集/再分類は全体再構築へ戻す。
+- 適用前の競合確認は変更番号をlockして行い、session全原文のfingerprint再計算を行わない。構築待ちの複数jobは同じ最新状態を共有し、反映済みの後続jobは文書再計画なしで完了する。job行自体は監査・retry用に残す。集約用の待機時間は追加しない。
+- 公開解除は原文改訂・除外分類・有効な撤回/変更relationの保存TXで行う。処理中に届く通常追記は次回へ残し、既に開始した公開を妨げない。編集や除外で無効化された応答は公開しない。未反映変更だけが残ったsessionはrunner起動時と30秒ごとの回収で既存queueへ戻す。failed/blocked_policyが残るsessionは自動再試行せず明示retryを使う。
+- 撤回/変更では`document_correction_anchors`に旧公開のID・revision・generationだけを残す。通常公開ではなく訂正探索専用で、同案件の現行relationと原文revisionを確認し、該当する訂正本文が結果に含まれる場合だけ元根拠と組で返す。訂正が入力境界外・失効・予算外なら旧根拠を単独で採用しない。原文改訂や除外分類はこの入口も削除する。
+- `document_entity_repairs`で識別子の削除を追跡し、差分構築でも旧文書の識別子補完を維持する。通常の追記で確定済み先頭文書の識別子を再書き込みしない。
+
 - sessionの現行message revisionと`initial-v1`の現行analysisだけを使い、is_searchable=false/progress_onlyを除外して決定的な検索文書を作る。現行policyで有効なrevoke/change relationのtarget message revision（sourceとtargetがともに現行revisionで、同一案件・会社内のmessage間）も索引対象から除外し、原文・relationは保持する。詳細は[m4-design.md](m4-design.md)。
 - 目標800・上限1200・重複100トークン（provider document prefix予約32トークン込み）。message→paragraph→code block境界を優先し、上限超過blockだけをUTF-16 range付きで分割する。単一blockのatom上限は、次chunkが重複windowと区切りを保持しても上限内に収まる値にし、改行なし長文でも隣接chunkのoverlapを破棄しない。
 - projectの初回だけactive generationを作成/再利用して紐付ける。既存世代がconfigと不一致なら`embedding_generation_mismatch`の恒久失敗。
 - 文書構築TXの後、承認済みVoyageへ`voyage-4-lite`/input_type=document/1024/float/truncation=falseで送信する。応答index・件数・model・次元・finite・非ゼロを検証し、不正は`provider_contract_invalid`、他の4xxは`provider_rejected`でfailedにする。恒久エラー時はそのjobが保持するpending/embedding revisionだけをfailedにし、明示retryで同じrevisionをpendingへ戻して再埋め込みする。
 - 文書revisionの明示識別子は本文から毎回決定的に同期する。本文不変のready文書も対象にし、M5 migration前から存在する文書を通常のbuild再処理でbackfillするが、revision・publication・embeddingは作り直さない。
 - 旧公開revisionの全source identity（message_id/message_revision/UTF-16 range/source_kind）が新計画の先頭に残る通常の末尾追加だけ、旧公開revisionをis_stale=true（旧版利用可・警告付き）で残す。source消失・message revision変更・range変更を含む制限的変更や計画から消えた文書は、外部HTTP前の文書構築TXでpublication行を削除して即時検索不能にし、成功時に作り直す。is_searchableは新desired revisionの埋め込み用にtrueを維持する。
-- processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession fingerprint（全messageのcurrent_revision、現行policyのanalysis状態、有効revoke/change relation状態）をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionとfingerprintをDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
+- processBuild開始時に対象messageのcurrent revisionがjobのtarget revisionと不一致なら、文書計画を変更せずlease条件付きcompletedにする。build開始時のsession変更番号をapplyDocumentPlanへ渡し、session advisory lock取得後・書込前にjobのrunning/lease_token/期限/target_revisionと変更番号をDBで再確認する。不一致はLeaseLostError/StaleApplyErrorでrollbackし、desired_revision・publication・revisionを変更しない。
 - 文書計画はactive generationのspec検証より先に適用する。pending revisionがある場合だけ世代を作成/検証し、spec不一致・retired/failedは`embedding_generation_mismatch`でfailedにする（自動切替しない）。pendingが無ければ世代の作成/検証は不要として完了する。世代不一致でもprogress_only・有効revoke/change relationなどによる除外とpublication削除は外部HTTP前に反映する。
 - 適用TXでmessage current revision・desired_revision・generation・input hash・leaseを再検証し、一致時だけembedding保存・publication更新・revision ready・job完了を同一TXで行う。外部待ち中の改訂・lease喪失では公開しない。新revision公開時にis_stale=falseへ戻し、以前のready revisionはsupersededにする。
 - `embedding_cache`（company+generation+operation+input hash）はvector結果だけを再利用し、document/sourceのidentityを統合しない。cache hitでも承認を再確認し、未承認はblocked_policyにする。
@@ -155,7 +163,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev、execute_searchは両方）。
 - Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）と、HTTP statusを得られないDNS・接続・TLS・本文受信切断等のtransport failure: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
 - 外部待ち中に原文revision・desired_revision・generation・leaseが変化した応答は保存・公開せず、lease期限後の回収へ委ねる。
-- 停止・回収後に再開した旧workerのapplyDocumentPlanは、jobのlease所有・期限・target_revisionとsession fingerprintを書込前に再確認し、不一致なら何も変更せず拒否する（lease期限後の回収へ委ねる）。回収後の別workerが公開した文書状態を上書きしない。
+- 停止・回収後に再開した旧workerのapplyDocumentPlanは、jobのlease所有・期限・target_revisionとsession変更番号を書込前に再確認し、不一致なら何も変更せず拒否する（lease期限後の回収へ委ねる）。回収後の別workerが公開した文書状態を上書きしない。
 - 検索受付の`failed`は`no_match`ではない。`execute_search`の`running`は処理中、`expired/input_revision_stale`は入力改訂による旧受付の終端である。
 
 ## 既知の保留事項
