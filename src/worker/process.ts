@@ -44,9 +44,8 @@ import { resolveReuse } from './reuse.js';
 import {
   applyDocumentEmbeddings,
   applyDocumentPlan,
-  loadSessionMessages,
+  loadDocumentBuildPlan,
   markPendingRevisionsFailed,
-  planDocumentChunks,
 } from './documents.js';
 import { ensureActiveGeneration, VoyageEmbeddingProvider } from './embedding.js';
 import { processExecuteSearch, searchRequestIdFromPayload } from './search.js';
@@ -538,14 +537,14 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
   }
   // 文書planの制限的変更（publication削除・is_searchable・revision状態）は、世代spec検証より先に
   // 外部HTTP前のTXで反映する。世代不一致・retired/failedでも除外対象を残さない。
-  const { messages, snapshot } = await loadSessionMessages(pool, target.sessionId);
-  const chunks = await planDocumentChunks(target.sessionId, messages);
+  const { chunks, snapshot, checkpoint } = await loadDocumentBuildPlan(pool, target.sessionId);
   const pending = await applyDocumentPlan(
     pool,
     job,
     { companyId: target.companyId, projectId: target.projectId, sessionId: target.sessionId },
     snapshot,
     chunks,
+    checkpoint,
   );
   if (pending.length === 0) {
     // 埋め込み待ちが無ければ世代の作成/検証は不要。lease条件付きで完了する。
@@ -576,7 +575,7 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     }
     throw error;
   }
-  await applyDocumentEmbeddings(pool, job, target, generation, pending, vectors);
+  await applyDocumentEmbeddings(pool, job, target, generation, pending, vectors, snapshot);
 }
 
 async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): Promise<void> {
