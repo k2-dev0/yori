@@ -29,6 +29,7 @@ const RESPONSE_SCHEMA_EXPORTS = [
   'projectRegistrationResponseSchema',
   'meResponseSchema',
   'companyResponseSchema',
+  'employeeCreateResponseSchema',
   'tokenIssueResponseSchema',
   'tokenRevokeResponseSchema',
   'searchAcceptedResponseSchema',
