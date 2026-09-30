@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS project_policies (
   rules TEXT NOT NULL,
   PRIMARY KEY (namespace, repository)
 );
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  namespace TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_scope TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  source_message_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  sequence_no INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  PRIMARY KEY (namespace, source, source_session_id, source_message_id, revision)
+);
+CREATE INDEX IF NOT EXISTS notification_deliveries_pending
+  ON notification_deliveries (namespace, source, source_session_id, delivered_at, sequence_no);
 `;
 
 // endpointとtoken hashからstate namespaceを決める。資格情報変更で旧queueを新社員へ送らない。
@@ -233,6 +248,94 @@ export interface OutboxRow {
   role: EventRole;
   occurred_at: string;
   text: string;
+}
+
+export interface PendingNotificationRow {
+  project_id: string;
+  source_scope: string;
+  source_session_id: string;
+  source_message_id: string;
+  revision: number;
+  sequence_no: number;
+}
+
+// 検索結果をまだmodelへ渡していない入力だけを本文なしで永続化する。
+export function registerPendingNotification(
+  state: CollectorState,
+  input: {
+    namespace: string;
+    projectId: string;
+    source: EventSource;
+    sourceScope: string;
+    sourceSessionId: string;
+    sourceMessageId: string;
+    revision: number;
+    sequenceNo: number;
+  },
+): void {
+  state.db
+    .prepare(
+      `INSERT INTO notification_deliveries
+         (namespace, project_id, source, source_scope, source_session_id, source_message_id, revision, sequence_no, created_at, delivered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+       ON CONFLICT (namespace, source, source_session_id, source_message_id, revision) DO NOTHING`,
+    )
+    .run(
+      input.namespace,
+      input.projectId,
+      input.source,
+      input.sourceScope,
+      input.sourceSessionId,
+      input.sourceMessageId,
+      input.revision,
+      input.sequenceNo,
+      Date.now(),
+    );
+}
+
+// 同じ会話で未配信の検索対象を発言順に返す。
+export function listPendingNotifications(
+  state: CollectorState,
+  namespace: string,
+  source: EventSource,
+  sourceSessionId: string,
+): PendingNotificationRow[] {
+  return state.db
+    .prepare(
+      `SELECT project_id, source_scope, source_session_id, source_message_id, revision, sequence_no
+         FROM notification_deliveries
+        WHERE namespace = ? AND source = ? AND source_session_id = ? AND delivered_at IS NULL
+        ORDER BY sequence_no, revision`,
+    )
+    .all(namespace, source, sourceSessionId)
+    .map((row) => ({
+      project_id: String(row.project_id),
+      source_scope: String(row.source_scope),
+      source_session_id: String(row.source_session_id),
+      source_message_id: String(row.source_message_id),
+      revision: Number(row.revision),
+      sequence_no: Number(row.sequence_no),
+    }));
+}
+
+// 並行するfast/late通知のうち最初の1処理だけが配信権を得る。
+export function claimPendingNotification(
+  state: CollectorState,
+  namespace: string,
+  source: EventSource,
+  sourceSessionId: string,
+  sourceMessageId: string,
+  revision: number,
+): boolean {
+  const result = state.db
+    .prepare(
+      `UPDATE notification_deliveries
+          SET delivered_at = ?
+        WHERE namespace = ? AND source = ? AND source_session_id = ? AND source_message_id = ? AND revision = ?
+          AND delivered_at IS NULL`,
+    )
+    .run(Date.now(), namespace, source, sourceSessionId, sourceMessageId, revision);
+  return Number(result.changes) === 1;
 }
 
 export function getSession(state: CollectorState, namespace: string, source: EventSource, sessionId: string): SessionRow | undefined {
