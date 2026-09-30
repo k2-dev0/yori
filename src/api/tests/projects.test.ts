@@ -33,8 +33,8 @@ after(async () => {
   await pool.end();
 });
 
-function authorization(token: string): Record<string, string> {
-  return { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+function authorization(token: string, json = true): Record<string, string> {
+  return { authorization: `Bearer ${token}`, ...(json ? { 'content-type': 'application/json' } : {}) };
 }
 
 function errorCode(response: { json<T>(): T }): string | undefined {
@@ -117,7 +117,7 @@ describe('project member追加API', () => {
     const first = await app.inject({
       method: 'PUT',
       url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(adminToken),
+      headers: authorization(adminToken, false),
     });
     assert.equal(first.statusCode, 200, first.body);
     assert.deepEqual(projectMemberResponseSchema.parse(first.json()), {
@@ -130,7 +130,7 @@ describe('project member追加API', () => {
     const second = await app.inject({
       method: 'PUT',
       url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(adminToken),
+      headers: authorization(adminToken, false),
     });
     assert.equal(second.statusCode, 200, second.body);
     assert.deepEqual(projectMemberResponseSchema.parse(second.json()), {
@@ -149,7 +149,7 @@ describe('project member追加API', () => {
     const response = await app.inject({
       method: 'PUT',
       url: `/v1/projects/${projectId}/members/${targetEmployeeId}`,
-      headers: authorization(workspace.token),
+      headers: authorization(workspace.token, false),
     });
     assert.equal(response.statusCode, 403, response.body);
     assert.equal(errorCode(response), 'forbidden');
@@ -173,7 +173,7 @@ describe('project member追加API', () => {
       const response = await app.inject({
         method: 'PUT',
         url: `/v1/projects/${candidateProjectId}/members/${candidateEmployeeId}`,
-        headers: authorization(adminToken),
+        headers: authorization(adminToken, false),
       });
       assert.equal(response.statusCode, 404, response.body);
       assert.equal(errorCode(response), 'not_found');
