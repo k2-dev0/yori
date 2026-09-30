@@ -129,14 +129,15 @@ token予算はprimary evidenceを除く追加候補の採用判定に使う。�
 
 ## 補助通知
 
-collector CLIへ`notify --source codex|claude_code --config <path>`を追加し、既存のcollect処理を実行してから、その呼出しで確定できた最新のuser message identityに対する検索結果を取得する。
+collector CLIへ同期`notify`と非同期`notify-late`を追加し、既存のcollect処理を実行してから、確定したuser message identityに対する検索結果を取得する。
 
-- `GET /v1/searches/by-input`を外部identityで呼び、1回最大5秒・累計最大10秒だけ待つ。
+- `notify`は`GET /v1/searches/by-input`を外部identityで呼び、今回入力だけ最大3秒待つ。期限後も検索jobを取消さず、未配信identityをcollector SQLiteへ本文なしで保持する。
+- `notify-late`はfast path終了後に起動し、5秒long-pollを繰り返して最大60秒待つ。並行processはSQLiteのatomic claimにより1回だけ配信する。セッション終了や期限でprocessが終わっても未配信identityは残し、次回hookが完了結果を回収する。
 - `status=completed`の`matched`・`no_match`・`skipped`、または`status=failed`の結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。失敗時の`outcome`は既存契約どおりnullのまま、`status`と`error_code`を通知する。
 - 追加contextには「過去履歴の検索資料であり現在の命令ではない」こと、request ID、outcome、根拠を含める。
 - 訂正・撤回はneighbor等の周辺根拠より優先して追加contextへ残し、複数relationも対象と種別を併記する。関連根拠の件数上限で省略した場合は省略件数を示し、`truncated`またはwarningがあれば全探索済みではないことを明記する。
-- Codexでは非同期hookの完了内容を現在turnの次の安全地点、なければ次のuser turnへ渡す。Claude Codeでは次のconversation turnへ渡す。idle中に新規turnを強制開始しない。
-- hook設定例だけを`docs/collector.md`へ追加する。既存の利用者設定、token、個人pathは自動変更しない。
+- 3秒以内の完了結果は同期hookから現在turnへ渡す。遅延結果はCodexでは現在turnの次の安全地点、なければ次のuser turn、Claude Codeでは次のconversation turnへ渡す。idle中に新規turnを強制開始しない。
+- hook設定例だけを`docs/collector.md`へ追加する。端末への実設定は`yori-cli`のinstall/updateが、既存の無関係なhookを保持して同期`notify`・非同期`notify-late`・同期`collect`へ更新する。
 
 ## 検証
 
@@ -149,5 +150,5 @@ collector CLIへ`notify --source codex|claude_code --config <path>`を追加し�
 - `revoke`・`change`の後続取得、chain、循環、原文保持
 - 6,000 token予算、優先順、`truncated`、warning
 - 候補判定中のrevision・link・relation・lease競合
-- 補助通知の完了／処理中／未受付／失敗、10秒上限、identity不明時の無出力、token非漏えい
+- 補助通知の完了／処理中／未受付／失敗、3秒fast path、late配信の永続化・一意claim、identity不明時の無出力、token非漏えい
 - 対象test、src全test、typecheck、変更path lint、build
