@@ -226,7 +226,10 @@ export const employeeCreateRequestSchema = z.strictObject({
   display_name: storableString,
 });
 
-export const employeeTokenParamsSchema = z.strictObject({ employee_id: normalizedUuid });
+export const employeeRenameRequestSchema = employeeCreateRequestSchema;
+
+export const employeeParamsSchema = z.strictObject({ employee_id: normalizedUuid });
+export const employeeTokenParamsSchema = employeeParamsSchema;
 export const tokenParamsSchema = z.strictObject({ token_id: normalizedUuid });
 
 export type ParsedProjectRegistrationRequest = z.infer<typeof projectRegistrationRequestSchema>;
