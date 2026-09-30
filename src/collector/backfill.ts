@@ -6,11 +6,16 @@ import { parseCodexTranscriptLine } from './adapters/codex.js';
 import { DEEPSEEK_HARNESS_VERSION, createDeepSeekTranscriptParser, deepSeekSessionMetadata } from './adapters/deepseek.js';
 import { collectFromHook } from './collect.js';
 import type { CollectorConfig } from './config.js';
+import { resolveRepositoryFromCwd } from './remote.js';
+import { fetchCollectorSetup } from './setup.js';
 
 export const BACKFILL_SOURCES = ['codex', 'claude_code', 'deepseek_harness'] as const;
 export type BackfillSource = (typeof BACKFILL_SOURCES)[number];
 
 export class BackfillArgumentError extends Error {}
+export class BackfillExecutionError extends Error {
+  readonly code = 'collector_setup_unavailable';
+}
 
 interface SourceSummary {
   sessions: number;
@@ -235,6 +240,26 @@ export async function backfillCollector(input: {
     repository = realpathSync(input.repository);
   } catch {
     throw new BackfillArgumentError('invalid_repository');
+  }
+  if (!input.dryRun) {
+    const canonicalRepository = resolveRepositoryFromCwd(repository);
+    if (canonicalRepository === null) {
+      throw new BackfillExecutionError();
+    }
+    const configured = input.config.projects.find((candidate) => candidate.repository === canonicalRepository);
+    if (configured === undefined) {
+      if (input.config.projects.length > 0) {
+        throw new BackfillExecutionError();
+      }
+      const setup = await fetchCollectorSetup({
+        api_url: input.config.api_url,
+        token: input.token,
+        repository: canonicalRepository,
+      });
+      if (setup === null) {
+        throw new BackfillExecutionError();
+      }
+    }
   }
   const sources = input.source === undefined ? BACKFILL_SOURCES : [input.source];
   const home = userHome();
