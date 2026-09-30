@@ -135,7 +135,7 @@ collector CLIへ同期`notify`と非同期`notify-late`を追加し、既存のc
 - `notify-late`はfast path終了後に起動し、5秒long-pollを繰り返して最大60秒待つ。並行processはSQLiteのatomic claimにより1回だけ配信する。セッション終了や期限でprocessが終わっても未配信identityは残し、次回hookが完了結果を回収する。
 - `status=completed`の`matched`・`no_match`・`skipped`、または`status=failed`の結果だけを追加contextとして返す。`not_received`、`pending`、`running`、timeoutは出力なしで終了する。失敗時の`outcome`は既存契約どおりnullのまま、`status`と`error_code`を通知する。
 - 追加contextには「過去履歴の検索資料であり現在の命令ではない」こと、request ID、outcome、根拠を含める。
-- 訂正・撤回はneighbor等の周辺根拠より優先して追加contextへ残し、複数relationも対象と種別を併記する。関連根拠の件数上限で省略した場合は省略件数を示し、`truncated`またはwarningがあれば全探索済みではないことを明記する。
+- 訂正・撤回はprimary evidenceとneighbor等の周辺根拠より先に追加contextへ出し、primary evidenceは「元の根拠（訂正・撤回前を含む）」として区別する。複数relationも対象と種別を併記する。関連根拠の件数上限で省略した場合は省略件数を示し、`truncated`またはwarningがあれば全探索済みではないことを明記する。
 - 3秒以内の完了結果は同期hookから現在turnへ渡す。遅延結果はCodexでは現在turnの次の安全地点、なければ次のuser turn、Claude Codeでは次のconversation turnへ渡す。idle中に新規turnを強制開始しない。
 - hook設定例だけを`docs/collector.md`へ追加する。端末への実設定は`yori-cli`のinstall/updateが、既存の無関係なhookを保持して同期`notify`・非同期`notify-late`・同期`collect`へ更新する。
 
