@@ -66,7 +66,7 @@ compose() {
 compose config --quiet
 compose pull
 compose up -d --wait db
-compose --profile tools run --rm -T migrate
+compose --profile tools run --rm -T migrate </dev/null
 
 # migration成功後だけ旧api・workerを明示削除する。--force-recreateの判定に依存せず旧Node processを停止する。
 OLD_API_ID="$(compose ps -q api)"
