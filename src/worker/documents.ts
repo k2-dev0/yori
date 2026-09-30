@@ -68,7 +68,7 @@ const MAX_LOCAL = CHUNK_MAX_TOKENS - VOYAGE_DOCUMENT_PREFIX_TOKEN_RESERVE;
 // atom単体をこの上限に抑え、overlap windowを破棄せずMAX_LOCAL内へ収める。
 const MAX_ATOM_LOCAL = MAX_LOCAL - CHUNK_OVERLAP_TOKENS - 1;
 
-// 文書計画の入力。snapshotは計画時点のsession全messageと現行policyのanalysis状態のfingerprint。
+// snapshotはDBの変更番号。本文全体のfingerprint再計算を適用TXへ持ち込まない。
 export interface SessionPlanInput {
   messages: SessionMessage[];
   snapshot: Buffer;
@@ -76,6 +76,7 @@ export interface SessionPlanInput {
 
 interface SessionStateRow {
   message_id: string;
+  sequence_no: string;
   current_revision: number;
   text: string | null;
   analysis_revision: number | null;
@@ -86,11 +87,11 @@ interface SessionStateRow {
   invalidating_relations: [string, string, number, number][];
 }
 
-// session全messageと、その現行revisionに対する現行policyのanalysis・有効revoke/change relationをsequence順に読む。
+// 指定sequenceより後のmessageと、その現行policyのanalysis・有効revoke/change relationを読む。
 // relationは同一案件（会社）内のmessage間に限定し、source/targetとも現行revision・現行policyの時だけ有効とする。
-// searchableな発言の抽出とsnapshot作成を同じ結果から行う。
+// 変更番号はこの読込と同じREPEATABLE READ snapshotで取得する。
 const SESSION_STATE_SQL = `
-  SELECT m.id AS message_id, m.current_revision, r.text,
+  SELECT m.id AS message_id, m.sequence_no, m.current_revision, r.text,
          a.revision AS analysis_revision, a.policy_version, a.state_hash, a.is_searchable, a.retention_category,
          COALESCE((
            SELECT jsonb_agg(jsonb_build_array(mr.relation, mr.from_message_id, mr.from_message_revision, mr.to_message_revision)
@@ -110,28 +111,41 @@ const SESSION_STATE_SQL = `
     LEFT JOIN message_revisions r ON r.message_id = m.id AND r.revision = m.current_revision
     LEFT JOIN message_analysis a ON a.message_id = m.id AND a.revision = m.current_revision AND a.policy_version = $2
    WHERE m.session_id = $1
+     AND m.sequence_no > $3
    ORDER BY m.sequence_no, m.id
 `;
 
-async function loadSessionState(client: PoolClient, sessionId: string): Promise<SessionStateRow[]> {
-  const result = await client.query<SessionStateRow>(SESSION_STATE_SQL, [sessionId, WORKER_POLICY_VERSION]);
+async function loadSessionState(client: PoolClient, sessionId: string, afterSequence = '-1'): Promise<SessionStateRow[]> {
+  const result = await client.query<SessionStateRow>(SESSION_STATE_SQL, [sessionId, WORKER_POLICY_VERSION, afterSequence]);
   return result.rows;
 }
 
-// 新規message追加・原文revision・analysisの再分類・有効revoke/change relationの追加/変更の
-// どれでも変化する決定的fingerprint。textは含めず、同じ計画前提ならbuildと適用直前の再確認で同じ値になる。
-function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
-  const state = rows.map((row) => ({
-    message_id: row.message_id,
-    current_revision: row.current_revision,
-    analysis_revision: row.analysis_revision,
-    policy_version: row.policy_version,
-    state_hash: row.state_hash === null ? null : row.state_hash.toString('hex'),
-    is_searchable: row.is_searchable,
-    retention_category: row.retention_category,
-    invalidating_relations: row.invalidating_relations,
-  }));
-  return createHash('sha256').update(JSON.stringify(state), 'utf8').digest();
+interface BuildState {
+  version: string;
+  invalidation_version: string;
+  dirty_sequence: string | null;
+  through_sequence: string;
+  tail: Part[] | null;
+  tail_document_key: string | null;
+  chunker_version: string | null;
+  policy_version: string | null;
+}
+
+function buildSnapshot(state: Pick<BuildState, 'version' | 'invalidation_version'>): Buffer {
+  return Buffer.from(`${state.version}:${state.invalidation_version}`);
+}
+
+// 初期状態だけ補完し、以後の更新は原文/分類/relationのDB triggerが同一TXで記録する。
+async function readBuildState(client: PoolClient, sessionId: string): Promise<BuildState> {
+  await client.query('INSERT INTO document_build_states(session_id, dirty_sequence) VALUES ($1, 0) ON CONFLICT DO NOTHING', [sessionId]);
+  const result = await client.query<BuildState>('SELECT * FROM document_build_states WHERE session_id = $1', [sessionId]);
+  return result.rows[0];
+}
+
+function searchableMessages(rows: readonly SessionStateRow[]): SessionMessage[] {
+  return rows.filter((row) => row.text !== null && row.text.length > 0 && row.is_searchable === true &&
+    row.retention_category !== 'progress_only' && row.invalidating_relations.length === 0)
+    .map((row) => ({ messageId: row.message_id, revision: row.current_revision, text: row.text! }));
 }
 
 // 現行revisionのsearchableな発言だけをsequence順に読む。progress_only/is_searchable=falseと
@@ -139,23 +153,57 @@ function snapshotSessionState(rows: readonly SessionStateRow[]): Buffer {
 export async function loadSessionMessages(pool: Pool, sessionId: string): Promise<SessionPlanInput> {
   const client = await pool.connect();
   try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    const state = await readBuildState(client, sessionId);
     const rows = await loadSessionState(client, sessionId);
-    const messages: SessionMessage[] = [];
-    for (const row of rows) {
-      if (
-        row.text !== null &&
-        row.text.length > 0 &&
-        row.is_searchable === true &&
-        row.retention_category !== 'progress_only' &&
-        row.invalidating_relations.length === 0
-      ) {
-        messages.push({ messageId: row.message_id, revision: row.current_revision, text: row.text });
-      }
-    }
-    return { messages, snapshot: snapshotSessionState(rows) };
+    await client.query('COMMIT');
+    return { messages: searchableMessages(rows), snapshot: buildSnapshot(state) };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
   } finally {
     client.release();
   }
+}
+
+interface BuildCheckpoint {
+  incremental: boolean;
+  throughSequence: string;
+  previousTailKey: string | null;
+  tail: Part[];
+  tailDocumentKey: string | null;
+}
+
+// 通常の追記は保存済み末尾と追加分だけを読む。過去変更/初回/版変更は全体構築へ戻す。
+export async function loadDocumentBuildPlan(pool: Pool, sessionId: string) {
+  const client = await pool.connect();
+  let state: BuildState;
+  let rows: SessionStateRow[];
+  let incremental: boolean;
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    state = await readBuildState(client, sessionId);
+    incremental = state.tail !== null && state.chunker_version === DOCUMENT_CHUNKER_VERSION &&
+      state.policy_version === WORKER_POLICY_VERSION &&
+      (state.dirty_sequence === null || BigInt(state.dirty_sequence) > BigInt(state.through_sequence));
+    rows = await loadSessionState(client, sessionId, incremental ? state.through_sequence : '-1');
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+  const messages = searchableMessages(rows);
+  const unchanged = incremental && messages.length === 0;
+  const planned = unchanged ? { chunks: [], tail: state.tail! } :
+    await planChunks(sessionId, messages, incremental ? state.tail! : []);
+  const tailDocumentKey = unchanged ? state.tail_document_key : planned.chunks.at(-1)?.documentKey ?? null;
+  const checkpoint: BuildCheckpoint = {
+    incremental, throughSequence: rows.filter((row) => row.is_searchable === true && row.retention_category !== 'progress_only' &&
+      row.invalidating_relations.length === 0).at(-1)?.sequence_no.toString() ?? (incremental ? state.through_sequence : '-1'),
+    previousTailKey: incremental && !unchanged ? state.tail_document_key : null,
+    tail: planned.tail, tailDocumentKey,
+  };
+  return { chunks: planned.chunks, snapshot: buildSnapshot(state), checkpoint };
 }
 
 function isHighSurrogate(code: number): boolean {
@@ -415,10 +463,15 @@ function documentKey(sessionId: string, anchor: PlannedSource, chunkerVersion: s
 
 // 決定的なchunk列を作る。同一session・同一原文・同一chunker版なら同一のkey/本文/rangeになる。
 export async function planDocumentChunks(sessionId: string, messages: readonly SessionMessage[]): Promise<PlannedChunk[]> {
+  return (await planChunks(sessionId, messages, [])).chunks;
+}
+
+// 最終chunkのpartsを保持すると、追記時にも全体構築と同じtoken予算・overlapを再現できる。
+async function planChunks(sessionId: string, messages: readonly SessionMessage[], tail: readonly Part[]) {
   const tokenizer = await loadVoyageTokenizer();
   const atoms = await buildAtoms(messages);
   const chunks: { parts: Part[] }[] = [];
-  let current: Part[] = [];
+  let current: Part[] = [...tail];
   let overlapSeeded = false;
 
   while (atoms.length > 0) {
@@ -460,7 +513,7 @@ export async function planDocumentChunks(sessionId: string, messages: readonly S
     chunks.push({ parts: current });
   }
 
-  return chunks.map((chunk) => {
+  const planned = chunks.map((chunk) => {
     const content = partsContent(chunk.parts);
     const sources: PlannedSource[] = chunk.parts.map((part) => ({
       messageId: part.messageId,
@@ -481,6 +534,7 @@ export async function planDocumentChunks(sessionId: string, messages: readonly S
       sources,
     };
   });
+  return { chunks: planned, tail: current };
 }
 
 export interface PendingRevision {
@@ -628,6 +682,7 @@ async function replaceEntities(
       [uuidv7(), input.documentId, input.revision, input.companyId, input.projectId, reference.entityType, reference.entityKey],
     );
   }
+  await client.query('DELETE FROM document_entity_repairs WHERE document_id = $1', [input.documentId]);
 }
 
 const SESSION_BUILD_LOCK_NAMESPACE = 20260926;
@@ -640,6 +695,7 @@ export async function applyDocumentPlan(
   input: { companyId: string; projectId: string; sessionId: string },
   snapshot: Buffer,
   chunks: readonly PlannedChunk[],
+  checkpoint?: BuildCheckpoint,
 ): Promise<PendingRevision[]> {
   const client = await pool.connect();
   try {
@@ -666,7 +722,8 @@ export async function applyDocumentPlan(
     if (leased.rows.length === 0) {
       throw new LeaseLostError('jobのlease所有を確認できません');
     }
-    if (!snapshot.equals(snapshotSessionState(await loadSessionState(client, input.sessionId)))) {
+    const state = await client.query<BuildState>('SELECT * FROM document_build_states WHERE session_id = $1 FOR UPDATE', [input.sessionId]);
+    if (state.rows[0] === undefined || !snapshot.equals(buildSnapshot(state.rows[0]))) {
       throw new StaleApplyError('sessionの状態が変化しました');
     }
 
@@ -674,8 +731,10 @@ export async function applyDocumentPlan(
       `SELECT id, document_key, desired_revision, is_searchable
          FROM search_documents
         WHERE project_id = $1 AND session_id = $2
+          AND ($3::text[] IS NULL OR document_key = ANY($3))
         FOR UPDATE`,
-      [input.projectId, input.sessionId],
+      [input.projectId, input.sessionId, checkpoint?.incremental ?
+        [...chunks.map((chunk) => chunk.documentKey), ...(checkpoint.previousTailKey === null ? [] : [checkpoint.previousTailKey])] : null],
     );
     const byKey = new Map(existing.rows.map((row) => [row.document_key, row]));
     const plannedKeys = new Set(chunks.map((chunk) => chunk.documentKey));
@@ -839,6 +898,11 @@ export async function applyDocumentPlan(
       );
     }
 
+    // 明示retryや集約された後続要求でも未完了の埋め込みを再開する。
+    await client.query(
+      `UPDATE search_document_revisions r SET status = 'pending', updated_at = now()
+       FROM search_documents d WHERE d.id = r.document_id AND d.desired_revision = r.revision
+         AND d.session_id = $1 AND d.is_searchable AND r.status = 'failed'`, [input.sessionId]);
     const pending = await client.query<{ document_id: string; revision: number; content: string; content_hash: Buffer }>(
       `SELECT d.id AS document_id, r.revision, r.content, r.content_hash
          FROM search_documents d
@@ -847,6 +911,22 @@ export async function applyDocumentPlan(
         ORDER BY d.document_key`,
       [input.sessionId],
     );
+    // identifierだけが欠落した旧文書は差分構築でも補完し、本文/公開revisionは変更しない。
+    const repairs = await client.query<{ id: string; desired_revision: number; content: string }>(
+      `SELECT d.id, d.desired_revision, r.content FROM document_entity_repairs q
+       JOIN search_documents d ON d.id = q.document_id
+       JOIN search_document_revisions r ON r.document_id = d.id AND r.revision = d.desired_revision
+       WHERE d.session_id = $1 FOR UPDATE OF d`, [input.sessionId]);
+    for (const repair of repairs.rows) {
+      await replaceEntities(client, { documentId: repair.id, revision: repair.desired_revision,
+        companyId: input.companyId, projectId: input.projectId, content: repair.content });
+    }
+    await client.query(
+      `UPDATE document_build_states SET built_version = version, dirty_sequence = NULL,
+         through_sequence = $2, tail = $3::jsonb, tail_document_key = $4,
+         chunker_version = $5, policy_version = $6, updated_at = now() WHERE session_id = $1`,
+      [input.sessionId, checkpoint?.throughSequence ?? '-1', checkpoint === undefined ? null : JSON.stringify(checkpoint.tail),
+        checkpoint?.tailDocumentKey ?? null, DOCUMENT_CHUNKER_VERSION, WORKER_POLICY_VERSION]);
     await client.query('COMMIT');
     return pending.rows.map((row) => ({
       documentId: row.document_id,
@@ -922,6 +1002,7 @@ export async function applyDocumentEmbeddings(
   generation: EmbeddingGeneration,
   pending: readonly PendingRevision[],
   vectors: readonly number[][],
+  snapshot: Buffer,
 ): Promise<void> {
   if (pending.length !== vectors.length) {
     throw new StaleApplyError('埋め込み件数と待機revisionが一致しません');
@@ -945,6 +1026,12 @@ export async function applyDocumentEmbeddings(
     );
     if (project.rows[0]?.active_generation_id !== generation.id) {
       throw new StaleApplyError('active generationが変化しました');
+    }
+
+    // 追記は次回分として残し、処理開始済み文書は公開できる。編集・除外は旧公開を拒否する。
+    const state = await client.query<BuildState>('SELECT * FROM document_build_states WHERE session_id = $1 FOR UPDATE', [target.sessionId]);
+    if (state.rows[0]?.invalidation_version !== snapshot.toString().split(':')[1]) {
+      throw new StaleApplyError('文書の有効性が変化しました');
     }
 
     for (let index = 0; index < pending.length; index += 1) {
@@ -979,7 +1066,7 @@ export async function applyDocumentEmbeddings(
       );
       const messageIds = [...new Set(sources.rows.map((row) => row.message_id))];
       const messages = await client.query<{ id: string; current_revision: number }>(
-        'SELECT id, current_revision FROM messages WHERE id = ANY($1::uuid[]) FOR SHARE',
+        'SELECT id, current_revision FROM messages WHERE id = ANY($1::uuid[])',
         [messageIds],
       );
       const currentById = new Map(messages.rows.map((row) => [row.id, row.current_revision]));
