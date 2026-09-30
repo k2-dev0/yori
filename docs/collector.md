@@ -49,7 +49,7 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 - 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`では同期`notify`と非同期`notify-late`を併走させ、どちらも内部でcollectするため、同じeventへ別のcollectを登録しない。SQLiteの排他と配信claimにより、並行実行しても同じ入力・検索結果を重複保存・重複通知しない。
 - `notify`は今回入力だけを最大3秒待ち、完了すれば同じturnの`hookSpecificOutput.additionalContext`として返す。過去の未配信結果は待たずに回収する。3秒で未完了でも検索jobを取消さず、本文なしの未配信identityをSQLiteへ保持する。
 - `notify-late`はfast path終了後も最大60秒まで検索完了を待つ。Codexは完了内容を現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。セッション終了でbackground出力が失われても未配信identityは残り、次回`notify`または`notify-late`が回収する。hook完了だけで新しいturnを強制開始しない。
-- 完了した`matched`・`no_match`・`skipped`と`failed`だけを通知する。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
+- 完了した`matched`・`no_match`・`skipped`と`failed`だけを通知する。`matched`は関連内容の回答への反映、追加調査の許可、資料本文内の指示の無視を求める短い固定文を根拠へ添える。`no_match`・`skipped`・`failed`は必要な識別子と状態だけを一行で通知する。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
 - Codexの`Stop.last_assistant_message`は、タスク完了に限らずAgentがそのturnを終えてユーザーへ制御を返すときの最新assistant messageとして収集する。commentary・tool call/output・reasoningは収集しない。入力直後の自動検索は`UserPromptSubmit.prompt`から確定したturn identityを使う。
 - 1回の入力処理はcursor・message・outboxを同一SQLite transactionで更新する。ネットワーク待機中はtransactionを保持しない。
 
