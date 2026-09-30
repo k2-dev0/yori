@@ -3,6 +3,7 @@ import {
   EVENT_ROLES,
   EVENT_SOURCES,
   MAX_BATCH_SIZE,
+  MAX_CLIENT_VERSION_BYTES,
   MAX_MODEL_IDENTIFIER_BYTES,
   MAX_SOURCE_IDENTIFIER_BYTES,
   MAX_TEXT_LENGTH,
@@ -47,6 +48,18 @@ export const modelIdentifier = storableString
     'x-yori-max-utf8-bytes': MAX_MODEL_IDENTIFIER_BYTES,
   });
 
+// collector clientのversion。任意のsemver外suffixを許し、保存可能な長さだけを制約する。
+export const clientVersion = storableString
+  .max(MAX_CLIENT_VERSION_BYTES)
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_CLIENT_VERSION_BYTES, {
+    message: `client versionはUTF-8で${MAX_CLIENT_VERSION_BYTES}バイト以内にしてください`,
+  })
+  .meta({
+    maxLength: MAX_CLIENT_VERSION_BYTES,
+    description: `client versionはUTF-8で${MAX_CLIENT_VERSION_BYTES}バイト以内`,
+    'x-yori-max-utf8-bytes': MAX_CLIENT_VERSION_BYTES,
+  });
+
 // UUIDは比較・保存の前に小文字の正規形へ揃える。HTTP body/queryとMCP入力を同じ規則にする。
 export const normalizedUuid = z.uuid().transform((value) => value.toLowerCase());
 
@@ -87,6 +100,7 @@ const eventSchema = z.strictObject({
   role: z.enum(EVENT_ROLES),
   occurred_at: occurredAtSchema,
   model_id: modelIdentifier.optional(),
+  client_version: clientVersion.optional(),
   text: conversationText,
 });
 
