@@ -10,6 +10,8 @@ import type { CollectorConfig } from './config.js';
 export const BACKFILL_SOURCES = ['codex', 'claude_code', 'deepseek_harness'] as const;
 export type BackfillSource = (typeof BACKFILL_SOURCES)[number];
 
+export class BackfillArgumentError extends Error {}
+
 interface SourceSummary {
   sessions: number;
   candidates: number;
@@ -226,9 +228,14 @@ export async function backfillCollector(input: {
   source?: BackfillSource;
 }): Promise<BackfillSummary> {
   if (!path.isAbsolute(input.repository)) {
-    throw new Error('invalid_repository');
+    throw new BackfillArgumentError('invalid_repository');
   }
-  const repository = realpathSync(input.repository);
+  let repository: string;
+  try {
+    repository = realpathSync(input.repository);
+  } catch {
+    throw new BackfillArgumentError('invalid_repository');
+  }
   const sources = input.source === undefined ? BACKFILL_SOURCES : [input.source];
   const home = userHome();
   const discovered = sources.map((source) => [source, discover(source, home, repository)] as const);
