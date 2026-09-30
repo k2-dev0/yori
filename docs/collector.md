@@ -35,7 +35,8 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js notify --source codex --config /Users/example/.yori-collector.json", "async": true }] }
+      { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js notify --source codex --config /Users/example/.yori-collector.json" }] },
+      { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js notify-late --source codex --config /Users/example/.yori-collector.json", "async": true }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "node /path/to/yori/dist/collector/cli.js collect --source codex --config /Users/example/.yori-collector.json" }] }
@@ -45,8 +46,10 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 ```
 
 - Codexはcommon input（`session_id`、`cwd`、`transcript_path`）に加え、`UserPromptSubmit`の`turn_id`/`prompt`と`Stop`の`turn_id`/`last_assistant_message`を通常収集の正本にする。IDは`turn:<turn_id>:user|assistant`へ決定的に変換し、同じhookの再実行とtranscript backfillを重複させない。Claude Codeと旧hook入力はtranscript差分へfallbackする。
-- 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`の`notify`は内部でcollectも行うため、同じeventへ別のcollectを並列登録しない。今回のcollectで新規または改訂されたuser発言を特定できた場合だけ、検索結果を1回最大5秒・累計最大10秒待つ。
-- `notify`は完了結果を`hookSpecificOutput.additionalContext`として返す。Codexは現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。hook完了だけで新しいturnを強制開始しない。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
+- 両エージェントに`UserPromptSubmit`と`Stop`を登録する。`UserPromptSubmit`では同期`notify`と非同期`notify-late`を併走させ、どちらも内部でcollectするため、同じeventへ別のcollectを登録しない。SQLiteの排他と配信claimにより、並行実行しても同じ入力・検索結果を重複保存・重複通知しない。
+- `notify`は今回入力だけを最大3秒待ち、完了すれば同じturnの`hookSpecificOutput.additionalContext`として返す。過去の未配信結果は待たずに回収する。3秒で未完了でも検索jobを取消さず、本文なしの未配信identityをSQLiteへ保持する。
+- `notify-late`はfast path終了後も最大60秒まで検索完了を待つ。Codexは完了内容を現在turnの次の安全地点、なければ次のuser turn、Claude Codeは次のconversation turnで受け取る。セッション終了でbackground出力が失われても未配信identityは残り、次回`notify`または`notify-late`が回収する。hook完了だけで新しいturnを強制開始しない。
+- 完了した`matched`・`no_match`・`skipped`と`failed`だけを通知する。処理中・未受付・timeoutは無出力で、明示的なMCP取得を置き換えない。訂正・撤回は他の周辺根拠より優先し、省略や探索打切りがあれば追加contextへ明記する。
 - Codexの`Stop.last_assistant_message`は、タスク完了に限らずAgentがそのturnを終えてユーザーへ制御を返すときの最新assistant messageとして収集する。commentary・tool call/output・reasoningは収集しない。入力直後の自動検索は`UserPromptSubmit.prompt`から確定したturn identityを使う。
 - 1回の入力処理はcursor・message・outboxを同一SQLite transactionで更新する。ネットワーク待機中はtransactionを保持しない。
 
@@ -58,15 +61,17 @@ M2の`src/collector/`は、Codex/Claude Codeのフックを契機に確定済み
 ```sh
 npm run collector:collect -- --source codex --config ~/.yori-collector.json < hook.json
 npm run collector:notify -- --source codex --config ~/.yori-collector.json < hook.json
+node dist/collector/cli.js notify-late --source codex --config ~/.yori-collector.json < hook.json
 npm run collector:flush -- --config ~/.yori-collector.json
 npm run collector:diagnostics -- --config ~/.yori-collector.json
 ```
 
 - `collect`: hook JSONをstdinから読み、Codexの安定hook fieldを1件処理する。fieldがない旧hookとClaude Codeでは指定transcriptの差分を処理する。全履歴は走査しない。
-- `notify`: collect後、今回確定したuser入力の検索結果だけを待ち、安全な次のmodel入力へ渡すJSONをstdoutへ出す。未完了・入力不明では何も出さない。
+- `notify`: collect後、今回確定したuser入力を最大3秒待ち、過去の未配信完了結果と合わせてmodelへ渡すJSONをstdoutへ出す。未完了・入力不明では何も出さない。
+- `notify-late`: fast path後も未配信結果を待ち、最初に配信claimできたprocessだけが追加contextをstdoutへ出す。期限後も未配信identityを削除しない。
 - `flush`: 保留sourceの対応表を再確認して未読分を取り込み、未送信eventを同じbody・同じ識別子で再送する。
 - `diagnostics`: 資格情報のnamespaceに保存された診断を`[{"code":"...","byteOffset":123}]`のJSON配列でstdoutへ出す。本文・通知コンテキスト・raw errorは出さない。
-- `collect`・`flush`の成功時はstdoutへ本文や通知コンテキストを出さない。`notify`だけが完了結果の追加context JSONをstdoutへ出す。不正な引数・設定・token欠落は固定codeをstderrへ出して非0で終了する。
+- `collect`・`flush`の成功時はstdoutへ本文や通知コンテキストを出さない。`notify`と`notify-late`だけが完了結果の追加context JSONをstdoutへ出す。不正な引数・設定・token欠落は固定codeをstderrへ出して非0で終了する。
 
 ## 再送とtoken rotation
 
