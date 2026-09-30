@@ -10,6 +10,7 @@ const DEV_VOLUMES = ['yori-pgdata', 'yori-node-modules', 'yori-npm-cache'];
 
 // 本番composeの設定を満たす合成env。passwordは合成の固定64桁hexで、実秘密・実domainは使わない。
 const PRODUCTION_ENV = {
+  YORI_RELEASE_SHA: '1111111111111111111111111111111111111111',
   YORI_POSTGRES_USER: 'yori',
   YORI_POSTGRES_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   YORI_POSTGRES_DB: 'yori',
@@ -38,6 +39,7 @@ const CONFIG_ENV_KEYS = [
   'COMPOSE_PROJECT_NAME',
   'COMPOSE_PROFILES',
   'YORI_POSTGRES_USER',
+  'YORI_RELEASE_SHA',
   'YORI_POSTGRES_PASSWORD',
   'YORI_POSTGRES_DB',
   'YORI_DOMAIN',
@@ -278,6 +280,11 @@ describe('production composeのDB資格情報', () => {
         expectedUrl,
         `${service}のDATABASE_URLがdbと同じYORI_POSTGRES_*を使っていない: ${String(config.services[service]?.environment?.DATABASE_URL)}`,
       );
+      assert.equal(
+        config.services[service]?.environment?.YORI_RELEASE_SHA,
+        PRODUCTION_ENV.YORI_RELEASE_SHA,
+        `${service}へYORI_RELEASE_SHAが渡っていない`,
+      );
     }
 
     assert.equal(JSON.stringify(config).includes('yori:yori'), false, 'production composeに固定資格情報yori:yoriが残っている');
@@ -297,6 +304,14 @@ describe('production composeのDB資格情報', () => {
 
 describe('production composeの必須設定', () => {
   const PRODUCTION_CONFIG_ARGS = ['--profile', 'tools', '-f', 'deployment/compose.yaml'];
+
+  it('YORI_RELEASE_SHAが未設定ならconfigが失敗する', async () => {
+    const missingRelease: NodeJS.ProcessEnv = { ...PRODUCTION_ENV };
+    delete missingRelease.YORI_RELEASE_SHA;
+    const result = await composeConfigCommand(PRODUCTION_CONFIG_ARGS, missingRelease);
+    assert.notEqual(result.code, 0, 'YORI_RELEASE_SHA未設定でもproduction composeのconfigが成功した');
+    assert.match(result.stderr, /YORI_RELEASE_SHA/, `不足がYORI_RELEASE_SHAとして報告されていない: ${result.stderr.trim()}`);
+  });
 
   it('YORI_POSTGRES_USER/DB/PASSWORDが未設定ならconfigが失敗する', async () => {
     const missingPostgres: NodeJS.ProcessEnv = { ...PRODUCTION_ENV };
@@ -405,8 +420,9 @@ describe('production設定検査script (deployment/check-production-config.mjs)'
   });
 
   it('PRODUCTION_ENVの全10キーを1つずつ未設定または空にすると拒否する', async () => {
+    const productionConfigKeys = Object.keys(PRODUCTION_ENV).filter((key) => key !== 'YORI_RELEASE_SHA');
     assert.deepEqual(
-      Object.keys(PRODUCTION_ENV).sort(),
+      productionConfigKeys.sort(),
       [
         'JEV_ACCOUNT_REF',
         'JEV_API_KEY',
@@ -422,7 +438,7 @@ describe('production設定検査script (deployment/check-production-config.mjs)'
       'PRODUCTION_ENVの必須キーが設計書の10キーと違う',
     );
 
-    for (const key of Object.keys(PRODUCTION_ENV)) {
+    for (const key of productionConfigKeys) {
       const missing: NodeJS.ProcessEnv = { ...PRODUCTION_ENV };
       delete missing[key];
       const missingResult = await runProductionConfigCheck(missing);
