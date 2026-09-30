@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { EVENT_SOURCES, type EventSource } from '../api/contract.js';
 import { collectFromHook, flushCollector } from './collect.js';
-import { notifyFromHook } from './notify.js';
+import { notifyFromHook, notifyLateFromHook } from './notify.js';
 import { loadCollectorConfig, type CollectorConfig } from './config.js';
 import { parseKnownSecretsEnv } from './known-secrets.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from './state.js';
@@ -26,7 +26,10 @@ function fail(code: string): never {
 
 function parseCommandLine(argv: string[]): { command: string; source?: string; configPath: string } {
   const [command, ...rest] = argv;
-  if (command === undefined || (command !== 'collect' && command !== 'notify' && command !== 'flush' && command !== 'diagnostics')) {
+  if (
+    command === undefined ||
+    (command !== 'collect' && command !== 'notify' && command !== 'notify-late' && command !== 'flush' && command !== 'diagnostics')
+  ) {
     fail('unknown_command');
   }
   let source: string | undefined;
@@ -48,7 +51,10 @@ function parseCommandLine(argv: string[]): { command: string; source?: string; c
   if (configPath === undefined) {
     fail('invalid_arguments');
   }
-  if ((command === 'collect' || command === 'notify') && (source === undefined || !EVENT_SOURCES.includes(source as EventSource))) {
+  if (
+    (command === 'collect' || command === 'notify' || command === 'notify-late') &&
+    (source === undefined || !EVENT_SOURCES.includes(source as EventSource))
+  ) {
     fail('invalid_source');
   }
   return { command, source, configPath };
@@ -72,7 +78,7 @@ async function main(): Promise<void> {
   }
   const token = readToken(config);
 
-  if (command === 'collect' || command === 'notify' || command === 'flush') {
+  if (command === 'collect' || command === 'notify' || command === 'notify-late' || command === 'flush') {
     // known secretは本文を読む前にlocal envから検証し、不正時はfixed codeでfail-closedにする。
     // parseに成功するとenvから削除され、SQLite・outbox・log・送信bodyへ生値を残さない。
     let knownSecrets: string[];
@@ -97,8 +103,10 @@ async function main(): Promise<void> {
     }
     if (command === 'collect') {
       await collectFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
-    } else {
+    } else if (command === 'notify') {
       await notifyFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
+    } else {
+      await notifyLateFromHook({ source: source as EventSource, hook: hook.data, config, token, knownSecrets });
     }
     return;
   }
