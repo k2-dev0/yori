@@ -77,6 +77,7 @@ interface CandidateSource {
   start_offset: number;
   end_offset: number;
   source_kind: string;
+  occurred_at: Date;
 }
 
 interface Candidate {
@@ -84,6 +85,7 @@ interface Candidate {
   revision: number;
   content: string;
   rrfScore: number;
+  entityMatched: boolean;
   sources: CandidateSource[];
 }
 
@@ -123,6 +125,12 @@ interface EvidenceRow {
 }
 
 const RELEVANCE_ORDER: Record<CandidateRelevance, number> = { unrelated: 0, peripheral: 1, useful: 2, direct: 3 };
+const STATEMENT_STATUS_ORDER: Record<CandidateStatementStatus, number> = {
+  unknown: 0,
+  proposal: 1,
+  reported_completed: 2,
+  reported_verified: 3,
+};
 
 // 各経路は固定世代・会社・案件・検索可能な公開revisionだけを対象にする。
 // 現在inputと同sessionのsequence_no >= input_sequence_noをsourceに含む文書は候補から除外する。
@@ -177,10 +185,12 @@ const ENTITY_CANDIDATES_SQL = `
 `;
 
 const CANDIDATE_SOURCES_SQL = `
-  SELECT document_id, document_revision, message_id, message_revision, start_offset, end_offset, source_kind
-    FROM search_document_sources
-   WHERE (document_id, document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
-   ORDER BY document_id, document_revision, display_order
+  SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
+         s.start_offset, s.end_offset, s.source_kind, m.occurred_at
+    FROM search_document_sources s
+    JOIN messages m ON m.id = s.message_id
+   WHERE (s.document_id, s.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+   ORDER BY s.document_id, s.document_revision, s.display_order
 `;
 
 function vectorLiteral(vector: readonly number[]): string {
@@ -207,7 +217,7 @@ interface CandidateRow {
 // route順位の1/(60+r)を加算し、同じdocument revisionを1件へまとめる。
 function mergeRoutes(vectorRows: readonly CandidateRow[], entityRows: readonly CandidateRow[]): Map<string, Candidate> {
   const candidates = new Map<string, Candidate>();
-  const addRoute = (rows: readonly CandidateRow[]): void => {
+  const addRoute = (rows: readonly CandidateRow[], entityMatched: boolean): void => {
     for (const [index, row] of rows.entries()) {
       const key = `${row.document_id}:${row.revision}`;
       const candidate = candidates.get(key) ?? {
@@ -215,14 +225,16 @@ function mergeRoutes(vectorRows: readonly CandidateRow[], entityRows: readonly C
         revision: row.revision,
         content: row.content,
         rrfScore: 0,
+        entityMatched: false,
         sources: [],
       };
       candidate.rrfScore += 1 / (SEARCH_RRF_RANK_CONSTANT + index + 1);
+      candidate.entityMatched ||= entityMatched;
       candidates.set(key, candidate);
     }
   };
-  addRoute(vectorRows);
-  addRoute(entityRows);
+  addRoute(vectorRows, false);
+  addRoute(entityRows, true);
   return candidates;
 }
 
@@ -342,6 +354,7 @@ async function loadCandidates(
           start_offset: row.start_offset,
           end_offset: row.end_offset,
           source_kind: row.source_kind,
+          occurred_at: row.occurred_at,
         });
       }
     }
@@ -558,16 +571,44 @@ async function evaluateCandidates(
   return [...assessments.values()];
 }
 
-// 判定段階を優先し、同じ段階ではRRF・document IDの安定順にする。useful/directだけを採用する。
+function latestSourceTime(candidate: Candidate): number {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const source of candidate.sources) {
+    latest = Math.max(latest, source.occurred_at.getTime());
+  }
+  return latest;
+}
+
+// relevanceを最優先し、同じrelevanceでは確定度・既知status内の新しさ・RRFの順にする。
+// status不明同士は新しさで推測せず、従来のRRF・document ID順を維持する。
 function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAssessment[] {
   return assessments
     .filter((assessment) => assessment.relevance === 'useful' || assessment.relevance === 'direct')
-    .sort(
-      (left, right) =>
-        RELEVANCE_ORDER[right.relevance] - RELEVANCE_ORDER[left.relevance] ||
-        right.candidate.rrfScore - left.candidate.rrfScore ||
-        compareCandidates(left.candidate, right.candidate),
-    );
+    .sort((left, right) => {
+      const relevance = RELEVANCE_ORDER[right.relevance] - RELEVANCE_ORDER[left.relevance];
+      if (relevance !== 0) {
+        return relevance;
+      }
+      const entityMatch = Number(right.candidate.entityMatched) - Number(left.candidate.entityMatched);
+      if (entityMatch !== 0) {
+        return entityMatch;
+      }
+      const status = STATEMENT_STATUS_ORDER[right.statementStatus] - STATEMENT_STATUS_ORDER[left.statementStatus];
+      if (status !== 0) {
+        return status;
+      }
+      const rrf = right.candidate.rrfScore - left.candidate.rrfScore;
+      if (rrf !== 0) {
+        return rrf;
+      }
+      if (left.statementStatus !== 'unknown') {
+        const recency = latestSourceTime(right.candidate) - latestSourceTime(left.candidate);
+        if (recency !== 0) {
+          return recency;
+        }
+      }
+      return compareCandidates(left.candidate, right.candidate);
+    });
 }
 
 // 保存直前に候補の公開状態と全sourceの現行revision・scopeを再検証する。無効ならnullを返す。
