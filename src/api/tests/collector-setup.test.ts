@@ -129,7 +129,7 @@ describe('POST /v1/collector/setup', () => {
     assert.equal((body.redaction_policy as Record<string, unknown>).rules, undefined, '旧rules fieldを返している');
   });
 
-  it('別会社・非member・未登録repositoryは存在を開示せず404にする', async () => {
+  it('同じ会社の全社員へsetupを返し、別会社・未登録repositoryは404にする', async () => {
     const otherCompanyId = await insertCompany(pool, 'company-setup-other');
     const otherEmployeeId = await insertEmployee(pool, otherCompanyId);
     await insertProject(pool, otherCompanyId, 'github.com/Other/Repo');
@@ -144,7 +144,8 @@ describe('POST /v1/collector/setup', () => {
     const nonMemberEmployeeId = await insertEmployee(pool, workspace.companyId);
     const nonMemberToken = await issueAuthToken(pool, workspace.companyId, nonMemberEmployeeId);
     const nonMemberResponse = await postSetup(app, { token: nonMemberToken, body: { repository: PRIMARY_REPOSITORY } });
-    assert.equal(nonMemberResponse.statusCode, 404, `非memberが404でない: ${nonMemberResponse.statusCode}`);
+    assert.equal(nonMemberResponse.statusCode, 200, `同じ会社の社員へsetupを返していない: ${nonMemberResponse.statusCode}`);
+    assert.equal(nonMemberResponse.json<{ project_id: string }>().project_id, workspace.projectId);
 
     const otherCompanyToken = await issueAuthToken(pool, otherCompanyId, otherEmployeeId);
     const crossCompanyResponse = await postSetup(app, { token: otherCompanyToken, body: { repository: PRIMARY_REPOSITORY } });
