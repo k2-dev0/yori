@@ -5,8 +5,9 @@ import {
   RETENTIONS,
   jevQuestionId,
   jevRelationExplicitQuestionId,
-  jevTechnicalLabelQuestionId,
-  TECHNICAL_LABELS,
+  jevStrategyQuestionId,
+  STRATEGY_AXIS_NAMES,
+  STRATEGY_NON_TERMS,
   type JevAnswer,
   type JevStatePart,
   type RelationAction,
@@ -26,6 +27,7 @@ export interface StoredPartResult {
   retention: string;
   primary_intent: string;
   technical_labels: string[];
+  strategy_terms: string[];
   decision_action: string;
   continuity: string;
   statement_status: string;
@@ -45,6 +47,8 @@ export interface AggregatedEvaluation {
   retention: Retention;
   primaryIntent: string;
   technicalLabels: string[];
+  // 設計方針fingerprint。`軸:値`の昇順・重複なし。none/unknown・低信頼は含めない。
+  strategyTerms: string[];
   decisionAction: string;
   continuity: string;
   statementStatus: string;
@@ -121,6 +125,20 @@ function aggregateResponseModels(parts: readonly PartEvaluation[]): string[] {
   return [...new Set(parts.map((part) => part.responseModel))];
 }
 
+// 全partの高信頼な設計方針回答を`軸:値`の集合へ統合する。part間で異なる値は両方残す。
+export function strategyTerms(parts: readonly PartEvaluation[], threshold: number): string[] {
+  const terms = new Set<string>();
+  for (const part of parts) {
+    for (const axis of STRATEGY_AXIS_NAMES) {
+      const choice = highChoice(part, jevStrategyQuestionId(axis, 0), threshold);
+      if (choice !== undefined && !STRATEGY_NON_TERMS.includes(choice)) {
+        terms.add(`${axis}:${choice}`);
+      }
+    }
+  }
+  return [...terms].sort();
+}
+
 // partごとの高信頼回答を設計の優先順位で統合し、analysis/relation/search_actionを決める。
 export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold: number): AggregatedEvaluation {
   const retention = aggregateRetention(parts, threshold);
@@ -135,18 +153,12 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
     parts.every(
       (part) => highChoice(part, `${JEV_SAME_CONDITIONS_QUESTION_ID}${JEV_PART_SEPARATOR}0`, threshold) === 'yes',
     );
-  const technicalLabels = new Set<string>();
-  for (const part of parts) {
-    for (const label of TECHNICAL_LABELS) {
-      if (highChoice(part, jevTechnicalLabelQuestionId(label, 0), threshold) === 'yes') {
-        technicalLabels.add(label);
-      }
-    }
-  }
   return {
     retention,
     primaryIntent,
-    technicalLabels: [...technicalLabels],
+    // 技術領域ラベルは質問しない。列互換のため空配列を保存する。
+    technicalLabels: [],
+    strategyTerms: strategyTerms(parts, threshold),
     decisionAction,
     continuity,
     statementStatus,
@@ -159,9 +171,8 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
       length: part.part.length,
       retention: aggregateRetention([part], threshold),
       primary_intent: adoptedOrUnknown([part], jevQuestionId('primary_intent', 0), threshold),
-      technical_labels: TECHNICAL_LABELS.filter(
-        (label) => highChoice(part, jevTechnicalLabelQuestionId(label, 0), threshold) === 'yes',
-      ),
+      technical_labels: [],
+      strategy_terms: strategyTerms([part], threshold),
       decision_action: adoptedOrUnknown([part], jevQuestionId('decision_action', 0), threshold),
       continuity: adoptedOrUnknown([part], jevQuestionId('continuity', 0), threshold),
       statement_status: adoptedOrUnknown([part], jevQuestionId('statement_status', 0), threshold),
