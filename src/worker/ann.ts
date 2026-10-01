@@ -15,7 +15,7 @@ const MEDIAN_FRACTION = 0.5;
 const P95_FRACTION = 0.95;
 
 // 索引名とDDLへ埋め込む世代IDはここでUUIDへ限定する。DDLはbind parameterを使えないため。
-export function annIndexName(generationId: string): string {
+function annIndexName(generationId: string): string {
   if (!validateUuid(generationId)) {
     throw new Error('generation idがUUIDではありません');
   }
@@ -97,9 +97,8 @@ export async function dropAnnIndex(pool: Pool, generationId: string): Promise<An
   return 'dropped';
 }
 
-// 絞り込みはsearch.tsのVECTOR_CANDIDATES_SQLと同じ（会社・案件・世代・検索可能な公開revision）。
-// 検索元sessionの発言を除く条件だけは持たない。embedding_cacheの質問ベクトルは元のsessionを
-// 記録しておらず再現できないため、厳密・近似の両方から同じように外す。
+// 絞り込みはsearch.tsのVECTOR_CANDIDATES_SQLと同じ（会社・案件・世代・検索可能な公開revision、
+// 検索元sessionの質問以降の発言をsourceに含む文書の除外）。本文を読み出さないため、列だけ別に持つ。
 const RECALL_SCOPE_SQL = `
     FROM document_embeddings e
     JOIN search_documents d ON d.id = e.document_id
@@ -110,14 +109,44 @@ const RECALL_SCOPE_SQL = `
         AND (r.status IN ('ready', 'superseded') OR p.correction_only)
    WHERE d.company_id = $1
      AND d.project_id = $2
+     AND NOT EXISTS (
+       SELECT 1
+         FROM search_document_sources sx
+         JOIN messages mx ON mx.id = sx.message_id
+        WHERE sx.document_id = e.document_id
+          AND sx.document_revision = e.revision
+          AND mx.session_id = $3
+          AND mx.sequence_no >= $4
+     )
+`;
+
+// 比較に使う質問。案件の過去の検索要求から、質問本文のhashでembedding_cacheの質問ベクトルを引く。
+// hashはDB内で計算し、質問本文をprocessへ読み出さない。manualは受付の質問、autoは入力発言の原文が質問になる。
+const RECALL_QUERIES_SQL = `
+  SELECT c.embedding::text AS embedding, sr.session_id, sr.input_sequence_no
+    FROM search_requests sr
+    JOIN message_revisions mr
+      ON mr.message_id = sr.input_message_id AND mr.revision = sr.input_message_revision
+    JOIN embedding_cache c
+      ON c.company_id = sr.company_id
+     AND c.generation_id = sr.embedding_generation_id
+     AND c.operation = 'query'
+     AND c.input_hash = sha256(convert_to(CASE WHEN sr.trigger = 'manual' THEN sr.question ELSE mr.text END, 'UTF8'))
+   WHERE sr.company_id = $1
+     AND sr.project_id = $2
+     AND sr.embedding_generation_id = $3
+     AND sr.search_action = 'new_search'
+     AND c.dimensions = $4
+   ORDER BY sr.created_at DESC, sr.id DESC
+   LIMIT $5
 `;
 
 const EXACT_TOP_SQL = `
   SELECT e.document_id, e.revision
   ${RECALL_SCOPE_SQL}
-     AND e.generation_id = $4
-   ORDER BY e.embedding <=> $3::vector ASC, e.document_id ASC, e.revision ASC
-   LIMIT $5
+     AND e.generation_id = $7
+   ORDER BY e.embedding <=> $5::vector ASC, e.document_id ASC, e.revision ASC
+   LIMIT $6
 `;
 
 // 部分索引の述語と式に一致させるため、世代IDはliteral、距離はhalfvecの式で書く。
@@ -127,11 +156,11 @@ function approximateTopSql(generationId: string): string {
   SELECT x.document_id, x.revision
     FROM (
       SELECT e.document_id, e.revision,
-             (e.embedding::halfvec(${VOYAGE_DIMENSIONS})) <=> $3::halfvec(${VOYAGE_DIMENSIONS}) AS distance
+             (e.embedding::halfvec(${VOYAGE_DIMENSIONS})) <=> $5::halfvec(${VOYAGE_DIMENSIONS}) AS distance
       ${RECALL_SCOPE_SQL}
          AND e.generation_id = '${generationId}'
        ORDER BY distance ASC
-       LIMIT $4
+       LIMIT $6
     ) x
    ORDER BY x.distance ASC, x.document_id ASC, x.revision ASC
 `;
@@ -189,8 +218,8 @@ function percentiles(durations: readonly number[]): { p50: number; p95: number }
   return { p50: at(MEDIAN_FRACTION), p95: at(P95_FRACTION) };
 }
 
-// active世代の既存の質問ベクトル（embedding_cache）で、厳密検索と近似検索の上位を比べる。
-// 外部providerは呼ばない。質問ベクトルは会社・世代単位のcacheであり、他案件の質問も含む。
+// 案件の過去の検索要求が使った既存の質問ベクトル（embedding_cache）で、厳密検索と近似検索の上位を比べる。
+// 外部providerは呼ばない。検索元のsessionと位置も検索要求から取り、本番と同じ除外条件で比べる。
 export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimit: number): Promise<AnnRecallResult> {
   const project = await pool.query<{ company_id: string; active_generation_id: string | null }>(
     'SELECT company_id, active_generation_id FROM projects WHERE id = $1',
@@ -208,14 +237,13 @@ export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimi
   if ((await annIndexState(pool, indexName)) !== 'valid') {
     return { ok: false, code: 'ann_index_not_found' };
   }
-  const queries = await pool.query<{ embedding: string }>(
-    `SELECT embedding::text AS embedding
-       FROM embedding_cache
-      WHERE company_id = $1 AND generation_id = $2 AND operation = 'query' AND dimensions = $3
-      ORDER BY created_at DESC, id DESC
-      LIMIT $4`,
-    [projectRow.company_id, generationId, VOYAGE_DIMENSIONS, sampleLimit],
-  );
+  const queries = await pool.query<{ embedding: string; session_id: string; input_sequence_no: number }>(RECALL_QUERIES_SQL, [
+    projectRow.company_id,
+    projectId,
+    generationId,
+    VOYAGE_DIMENSIONS,
+    sampleLimit,
+  ]);
   if (queries.rows.length === 0) {
     return { ok: false, code: 'ann_recall_no_samples' };
   }
@@ -231,15 +259,18 @@ export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimi
     'SET LOCAL enable_seqscan = off',
   ];
   const approximateSql = approximateTopSql(generationId);
-  const scope = [projectRow.company_id, projectId];
+  const paramsFor = (query: (typeof queries.rows)[number]): unknown[] => [
+    projectRow.company_id,
+    projectId,
+    query.session_id,
+    query.input_sequence_no,
+    query.embedding,
+    SEARCH_VECTOR_LIMIT,
+  ];
 
   // 近似側が実際に索引を使う計画でなければ、測った値は近似検索のrecallではない。
   const plan = await inSettingsTransaction(pool, approximateSettings, (client) =>
-    client.query<{ 'QUERY PLAN': unknown }>(`EXPLAIN (FORMAT JSON) ${approximateSql}`, [
-      ...scope,
-      queries.rows[0].embedding,
-      SEARCH_VECTOR_LIMIT,
-    ]),
+    client.query<{ 'QUERY PLAN': unknown }>(`EXPLAIN (FORMAT JSON) ${approximateSql}`, paramsFor(queries.rows[0])),
   );
   if (!JSON.stringify(plan.rows[0]?.['QUERY PLAN']).includes(indexName)) {
     return { ok: false, code: 'ann_index_not_used' };
@@ -250,21 +281,25 @@ export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimi
   const approximateDurations: number[] = [];
   let exactFirst = true;
   for (const query of queries.rows) {
-    const runExact = () => timedTopKeys(pool, exactSettings, EXACT_TOP_SQL, [...scope, query.embedding, generationId, SEARCH_VECTOR_LIMIT]);
-    const runApproximate = () => timedTopKeys(pool, approximateSettings, approximateSql, [...scope, query.embedding, SEARCH_VECTOR_LIMIT]);
+    const runExact = () => timedTopKeys(pool, exactSettings, EXACT_TOP_SQL, [...paramsFor(query), generationId]);
+    const runApproximate = () => timedTopKeys(pool, approximateSettings, approximateSql, paramsFor(query));
     // 先に実行した側がbufferを温めて後の側を有利にするため、順序を交互に入れ替える。
     const first = exactFirst ? await runExact() : await runApproximate();
     const second = exactFirst ? await runApproximate() : await runExact();
     const exact = exactFirst ? first : second;
     const approximate = exactFirst ? second : first;
     exactFirst = !exactFirst;
+    // 除外条件で厳密側の結果が空になる質問は比較できないため、sampleへ数えない。
     if (exact.keys.length === 0) {
-      return { ok: false, code: 'ann_recall_no_documents' };
+      continue;
     }
     const approximateKeys = new Set(approximate.keys);
     recalls.push(exact.keys.filter((key) => approximateKeys.has(key)).length / exact.keys.length);
     exactDurations.push(exact.durationMs);
     approximateDurations.push(approximate.durationMs);
+  }
+  if (recalls.length === 0) {
+    return { ok: false, code: 'ann_recall_no_documents' };
   }
 
   return {
