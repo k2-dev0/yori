@@ -75,7 +75,7 @@ export const RELATION_ACTIONS = ['accept', 'reject', 'revoke', 'change'] as cons
 export type RelationAction = (typeof RELATION_ACTIONS)[number];
 
 // 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
-export const JEV_QUESTIONS_VERSION = 'm3-2';
+export const JEV_QUESTIONS_VERSION = 'm3-3';
 
 // ---- M4 Voyage埋め込みの固定契約（計画3.3） ----
 export const VOYAGE_PROVIDER = 'voyage_direct';
@@ -118,9 +118,108 @@ export function jevQuestionId(field: JevPartField, partIndex?: number): string {
   return partIndex === undefined ? field : `${field}${JEV_PART_SEPARATOR}${partIndex}`;
 }
 
-export function jevTechnicalLabelQuestionId(label: TechnicalLabel, partIndex: number): string {
-  return `technical_label:${label}${JEV_PART_SEPARATOR}${partIndex}`;
+// 対象・用語に依存しない設計方針の軸。異なる対象の同型設計を候補へ入れる検索経路に使う。
+// 技術領域ラベル（TECHNICAL_LABELS）は検索に使っていないため、この軸の質問に置き換えた。
+// noneは該当なし、unknownは判断不能。どちらも検索語にしない。
+export const STRATEGY_AXES = {
+  state_hazard: {
+    instruction: '状態の危険',
+    criteria: {
+      duplicate_apply: '二重適用',
+      stale_write: '古い前提の書込み',
+      lost_update: '更新消失',
+      out_of_order: '順序逆転',
+      partial_failure: '部分失敗',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  consistency_strategy: {
+    instruction: '整合性手段',
+    criteria: {
+      idempotency: '冪等化',
+      optimistic_revalidation: '適用前再検証',
+      pessimistic_lock: '排他ロック',
+      fencing: 'fencing',
+      atomic_transaction: '原子的更新',
+      compensation: '補償',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  lifecycle_strategy: {
+    instruction: '更新・切替方式',
+    criteria: {
+      versioned_state: '版管理',
+      append_only: '追記のみ',
+      invalidation: '失効',
+      rebuild: '再構築',
+      dual_run_atomic_cutover: '旧版維持で切替',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  failure_strategy: {
+    instruction: '障害時方針',
+    criteria: {
+      retry: '再試行',
+      fallback: '代替',
+      explicit_degraded: '劣化を明示',
+      fail_closed: '不確かなら停止',
+      backpressure: '流量制御',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  performance_strategy: {
+    instruction: '性能・費用手段',
+    criteria: {
+      cache: 'cache',
+      deduplicate: '重複排除',
+      batch: '一括',
+      incremental: '差分',
+      precompute: '事前計算',
+      parallelize: '並列・先行',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  scope_invariant: {
+    instruction: '守る境界',
+    criteria: {
+      tenant: '会社分離',
+      project: '案件分離',
+      revision: '版一致',
+      generation: '世代一致',
+      authorization: '権限',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+  evidence_strategy: {
+    instruction: '根拠の示し方',
+    criteria: {
+      provenance: '出典保持',
+      revalidation: '利用時再検証',
+      audit: '監査',
+      executable_verification: '実行検証',
+      none: 'なし',
+      unknown: '不明',
+    },
+  },
+} as const satisfies Record<string, { instruction: string; criteria: Record<string, string> }>;
+export type StrategyAxis = keyof typeof STRATEGY_AXES;
+export const STRATEGY_AXIS_NAMES = Object.keys(STRATEGY_AXES) as StrategyAxis[];
+// 検索語にしない値。
+export const STRATEGY_NON_TERMS: readonly string[] = ['none', 'unknown'];
+
+export function jevStrategyQuestionId(axis: StrategyAxis, partIndex: number): string {
+  return `strategy:${axis}${JEV_PART_SEPARATOR}${partIndex}`;
 }
+
+// 設計方針の一致経路の上限と、候補にする最小一致軸数。1軸だけの一致は対象外にして雑音を抑える。
+export const SEARCH_STRATEGY_LIMIT = 10;
+export const SEARCH_STRATEGY_MIN_MATCHED_TERMS = 2;
 
 // 候補専用のrelation_explicit質問ID。候補message IDとpart indexで呼出し内に一意にし、意味はinstructionsで示す。
 export function jevRelationExplicitQuestionId(candidateId: string, partIndex: number): string {
@@ -222,11 +321,14 @@ export const SEARCH_VECTOR_LIMIT = 20;
 export const SEARCH_ENTITY_LIMIT = 20;
 export const SEARCH_CANDIDATE_LIMIT = 10;
 export const SEARCH_CANDIDATE_BUDGET_TOKENS = 8_000;
+// 候補判定を分割するJev 1リクエストあたりの候補数。上限10件を最大2リクエストへ分け、並列に送って待ち時間を短くする。
+export const SEARCH_CANDIDATE_REQUEST_SIZE = 5;
 // RRFは各経路の順位rに対して1/(60+r)を加算する。
 export const SEARCH_RRF_RANK_CONSTANT = 60;
 // 検索候補取得TXのstatement_timeout。空結果へ読み替えず、超過はエラーとして扱う。
 export const SEARCH_STATEMENT_TIMEOUT_MS = 5_000;
 export const SEARCH_MODE_EXACT_VECTOR_AND_ENTITY = 'exact_vector_and_entity';
+export const SEARCH_MODE_EXACT_VECTOR_ENTITY_AND_STRATEGY = 'exact_vector_entity_and_strategy';
 
 // 候補の有用性4段階。useful/directだけを採用する。
 export const CANDIDATE_RELEVANCES = ['unrelated', 'peripheral', 'useful', 'direct'] as const;
@@ -245,7 +347,6 @@ export const CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX = 'candidate_s
 export const CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX = 'candidate_similar_constraints';
 export const CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX = 'candidate_implementation_rationale';
 export const CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX = 'candidate_reusable_procedure';
-export const CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX = 'candidate_statement_status';
 export const CANDIDATE_YES_NO_CRITERIA = { yes: '当てはまる', no: '当てはまらない' };
 
 // 計画9.3の独立positive項目。手順有用性はstatement_statusと別fieldで保持する。
@@ -260,9 +361,3 @@ export type CandidateRelevanceKind = (typeof CANDIDATE_RELEVANCE_KINDS)[number];
 
 export const CANDIDATE_STATEMENT_STATUSES = ['proposal', 'reported_completed', 'reported_verified', 'unknown'] as const;
 export type CandidateStatementStatus = (typeof CANDIDATE_STATEMENT_STATUSES)[number];
-export const CANDIDATE_STATEMENT_STATUS_CRITERIA: Record<CandidateStatementStatus, string> = {
-  proposal: '単なる提案',
-  reported_completed: '完了報告',
-  reported_verified: '検証済み報告（ツール実証とは扱わない）',
-  unknown: '判断不能',
-};
