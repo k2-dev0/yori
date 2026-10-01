@@ -4017,7 +4017,16 @@ describe('検索の評価コマンド', () => {
     const before = await countEvalTables();
     const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: requireDatabaseUrl() };
     delete env.SEARCH_EVAL_DATABASE_IS_COPY;
-    assert.equal(await runCli(['search-eval', workspace.projectId, '/nonexistent/cases.json'], env), 1, '明示なしで評価を開始している');
+    // 入力不正による終了と区別するため、終了理由のcodeまで確かめる。
+    const written: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => written.push(String(chunk)) > 0) as typeof process.stderr.write;
+    try {
+      assert.equal(await runCli(['search-eval', workspace.projectId, '/nonexistent/cases.json'], env), 1, '明示なしで評価を開始している');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.ok(written.join('').includes('search_eval_requires_database_copy'), `安全装置以外の理由で終了している: ${written.join('')}`);
     assert.deepEqual(await countEvalTables(), before, '明示なしでDBへ書き込んでいる');
   });
 });
