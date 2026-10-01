@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
 import { v7 as uuidv7 } from 'uuid';
 import { z } from 'zod';
 import { createPool } from '../db/pool.js';
+import { createAnnIndex, dropAnnIndex, measureAnnRecall } from './ann.js';
 import { JEV_PROVIDER, VOYAGE_PROVIDER } from './contract.js';
 import { isVoyageEndpoint, isWorkerEndpoint, loadWorkerConfig } from './config.js';
 import { loadProjectMetrics } from './metrics.js';
@@ -31,6 +33,9 @@ const approvalFileSchema = z
       context.addIssue({ code: 'custom', path: ['endpoint'], message: 'endpointが許可形式ではありません' });
     }
   });
+
+const ANN_RECALL_DEFAULT_SAMPLES = 50;
+const ANN_RECALL_MAX_SAMPLES = 1_000;
 
 function fail(code: string): number {
   process.stderr.write(`worker: ${code}\n`);
@@ -235,6 +240,82 @@ async function runMetrics(env: NodeJS.ProcessEnv, projectId: string | undefined)
   }
 }
 
+// --name value形式のoptionを読む。未知のoption・値の欠落はnullにし、呼び出し側が固定codeで拒否する。
+function readOptions<Name extends string>(args: string[], names: readonly Name[]): { values: Partial<Record<Name, string>>; positionals: string[] } | null {
+  try {
+    const parsed = parseArgs({
+      args,
+      options: Object.fromEntries(names.map((name) => [name, { type: 'string' as const }])),
+      allowPositionals: true,
+    });
+    return { values: parsed.values as Partial<Record<Name, string>>, positionals: parsed.positionals };
+  } catch {
+    return null;
+  }
+}
+
+// 近似索引の作成・削除は管理者の明示実行だけで行う。DBだけを必要とし、provider credentialは要求しない。
+async function runAnnIndex(env: NodeJS.ProcessEnv, args: string[]): Promise<number> {
+  const options = readOptions(args, ['generation']);
+  const action = options?.positionals[0];
+  if (options === null || options.positionals.length !== 1 || (action !== 'create' && action !== 'drop')) {
+    return fail('invalid_arguments');
+  }
+  const generationId = options.values.generation;
+  if (generationId === undefined || !z.uuid().safeParse(generationId).success) {
+    return fail('invalid_generation_id');
+  }
+  const databaseUrl = requireDatabaseUrl(env);
+  if (databaseUrl === null) {
+    return fail('invalid_worker_config');
+  }
+  const pool = createPool(databaseUrl);
+  try {
+    const result = action === 'create' ? await createAnnIndex(pool, generationId) : await dropAnnIndex(pool, generationId);
+    if (result === 'generation_not_found' || result === 'ann_index_busy') {
+      return fail(result);
+    }
+    if (result === 'not_found') {
+      return fail('ann_index_not_found');
+    }
+    process.stdout.write(`worker: ${result}\n`);
+    return 0;
+  } finally {
+    await pool.end();
+  }
+}
+
+// 一致率の比較はDBだけを必要とし、stdoutへJSON以外を出さない。
+async function runAnnRecall(env: NodeJS.ProcessEnv, args: string[]): Promise<number> {
+  const options = readOptions(args, ['project', 'samples']);
+  if (options === null || options.positionals.length > 0) {
+    return fail('invalid_arguments');
+  }
+  const projectId = options.values.project;
+  if (projectId === undefined || !z.uuid().safeParse(projectId).success) {
+    return fail('invalid_project_id');
+  }
+  const samples = z.coerce.number().int().min(1).max(ANN_RECALL_MAX_SAMPLES).safeParse(options.values.samples ?? ANN_RECALL_DEFAULT_SAMPLES);
+  if (!samples.success) {
+    return fail('invalid_samples');
+  }
+  const databaseUrl = requireDatabaseUrl(env);
+  if (databaseUrl === null) {
+    return fail('invalid_worker_config');
+  }
+  const pool = createPool(databaseUrl);
+  try {
+    const result = await measureAnnRecall(pool, projectId, samples.data);
+    if (!result.ok) {
+      return fail(result.code);
+    }
+    process.stdout.write(`${JSON.stringify(result.report)}\n`);
+    return 0;
+  } finally {
+    await pool.end();
+  }
+}
+
 // CLIは資格情報・本文を引数やログへ出さない。終了コードは固定。
 export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const [command, ...rest] = argv;
@@ -258,6 +339,12 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
   }
   if (command === 'metrics') {
     return runMetrics(env, rest[0]);
+  }
+  if (command === 'ann-index') {
+    return runAnnIndex(env, rest);
+  }
+  if (command === 'ann-recall') {
+    return runAnnRecall(env, rest);
   }
   return fail('unknown_command');
 }
