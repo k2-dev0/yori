@@ -325,6 +325,9 @@ export interface JevRequest {
 export const SEARCH_VECTOR_LIMIT = 20;
 export const SEARCH_ENTITY_LIMIT = 20;
 export const SEARCH_CANDIDATE_LIMIT = 10;
+// 候補同士の埋め込みのcosine類似度がこの値以上なら、同じ内容の繰り返しとして1件へ畳む。
+// 本番の写しの1質問で、同じ質問への回答の繰り返し同士は0.84以上、別の内容とは0.80以下だった。その間に置いた暫定値。
+export const SEARCH_DUPLICATE_SIMILARITY = 0.82;
 // 長い検索質問は保存側と同じ大きさ（CHUNK_TARGET_TOKENS）へ区切り、先頭からこの件数までを区切りごとに検索する。
 // 候補上限10件に対して1区切りあたり平均2件を残せる件数にする。
 export const SEARCH_QUESTION_CHUNK_LIMIT = 5;
