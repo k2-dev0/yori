@@ -116,8 +116,11 @@ const foundSchema = z.object({
     .optional(),
 });
 
+// 通知へ載せる根拠本文は先頭の抜粋だけにする。続きは行頭のmessage_id・revisionでget_evidenceから取得できる。
+const EVIDENCE_EXCERPT_LENGTH = 400;
+
 function truncateContextText(text: string): string {
-  return [...text].slice(0, 2_000).join('');
+  return [...text].slice(0, EVIDENCE_EXCERPT_LENGTH).join('');
 }
 
 // 単一relationは従来どおり種類だけ、複数targetは種類と対象IDを全件残す。
