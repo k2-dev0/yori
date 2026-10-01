@@ -325,6 +325,9 @@ export interface JevRequest {
 export const SEARCH_VECTOR_LIMIT = 20;
 export const SEARCH_ENTITY_LIMIT = 20;
 export const SEARCH_CANDIDATE_LIMIT = 10;
+// 長い検索質問は保存側と同じ大きさ（CHUNK_TARGET_TOKENS）へ区切り、先頭からこの件数までを区切りごとに検索する。
+// 候補上限10件に対して1区切りあたり平均2件を残せる件数にする。
+export const SEARCH_QUESTION_CHUNK_LIMIT = 5;
 export const SEARCH_CANDIDATE_BUDGET_TOKENS = 8_000;
 // 候補判定を分割するJev 1リクエストあたりの候補数。上限10件を最大2リクエストへ分け、並列に送って待ち時間を短くする。
 export const SEARCH_CANDIDATE_REQUEST_SIZE = 5;
