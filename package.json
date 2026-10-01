@@ -14,7 +14,7 @@
     "deploy:production": "node deployment/deploy-production.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json && node deployment/build-collector.mjs",
+    "build": "tsc -p tsconfig.build.json && node deployment/build-artifacts.mjs",
     "migrate": "tsx src/db/migrate-cli.ts",
     "collector:collect": "tsx src/collector/cli.ts collect",
     "collector:notify": "tsx src/collector/cli.ts notify",
