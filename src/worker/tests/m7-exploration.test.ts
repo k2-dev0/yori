@@ -11,7 +11,12 @@ import {
   seedWorkspace,
   type WorkspaceFixture,
 } from '../../db/tests/fixtures.js';
+import { WORKER_POLICY_VERSION } from '../contract.js';
+import type { JobTarget } from '../context.js';
 import { ensureActiveGeneration } from '../embedding.js';
+import { claimJobs, enqueueJob } from '../../jobs/queue.js';
+import { processJob } from '../process.js';
+import { revalidateRelatedEvidence, type RelatedEvidenceDraft } from '../exploration.js';
 import { loadVoyageTokenizer } from '../tokenizer.js';
 import { advanceRevision, jevReply, readSearchRequest, seedMessage, seedRelation, seedSession } from './support.js';
 import {
@@ -150,6 +155,37 @@ async function insertIssueEntity(documentId: string, entityKey = '#777'): Promis
   );
 }
 
+// バックグラウンド判定済みの推定継続を作る。継続sessionに文書と埋め込みを置き、検索時は質問との近さで選ばれる。
+async function seedInferredContinuation(input: {
+  generationId: string;
+  primarySessionId: string;
+  sessionId: string;
+  text: string;
+  embedding: readonly number[];
+  continuous?: boolean;
+  sequenceNo?: number;
+}): Promise<{ messageId: string }> {
+  const message = await seedMessage(pool, { sessionId: input.sessionId, sequenceNo: input.sequenceNo ?? 1, text: input.text });
+  await seedReadyDocument(pool, {
+    companyId: workspace.companyId,
+    projectId: workspace.projectId,
+    sessionId: input.sessionId,
+    documentKey: `m7-inferred-${uuidv7()}`,
+    content: input.text,
+    generationId: input.generationId,
+    embedding: input.embedding,
+    sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: input.text.length }],
+  });
+  await pool.query(
+    `INSERT INTO session_continuity_judgments
+       (company_id, project_id, session_id, candidate_session_id, continuous, policy_version, questions_version)
+     VALUES ($1, $2, $3, $4, $5, $6, 'test')
+     ON CONFLICT DO NOTHING`,
+    [workspace.companyId, workspace.projectId, input.sessionId, input.primarySessionId, input.continuous ?? true, WORKER_POLICY_VERSION],
+  );
+  return { messageId: message.messageId };
+}
+
 // m4-documents/m5-searchと同じ合成base。token数を1刻みで作れる長さへ反復する。
 const TOKEN_FIXTURE_BASE = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu '.repeat(500);
 
@@ -275,10 +311,9 @@ describe('M7 明示session linkの探索', () => {
     await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [reverseSession, new Date(startedAt.getTime() - 60_000)]);
     await seedMessage(pool, { sessionId: reverseSession, sequenceNo: 1, text: 'EXPLICIT-R1' });
 
-    // 推定候補との優先順位を比較するため、同社員の時刻隣接sessionも1件置く。
+    // 推定候補との優先順位を比較するため、継続判定済みの同社員sessionも1件置く。
     const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-inferred-order' });
     await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [inferredSession, new Date(startedAt.getTime() + 2 * 60_000)]);
-    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: 'INFERRED-AFTER-EXPLICIT' });
 
     await seedReadyDocument(pool, {
       companyId: workspace.companyId,
@@ -289,6 +324,13 @@ describe('M7 明示session linkの探索', () => {
       generationId: generation.id,
       embedding: basisVector(0, 1),
       sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: inferredSession,
+      text: 'INFERRED-AFTER-EXPLICIT',
+      embedding: similarityVector(1),
     });
     await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: forwardSessions[0], evidenceMessageId: primary.messageId });
     for (let hop = 0; hop < forwardSessions.length - 1; hop += 1) {
@@ -330,7 +372,7 @@ describe('M7 明示session linkの探索', () => {
     assert.ok(!relatedWithText(match, 'EXPLICIT-F4'), '3 hopを超えたlink先を返している');
     const explicitMarker = relatedWithText(match, 'EXPLICIT-F1');
     const inferredMarker = relatedWithText(match, 'INFERRED-AFTER-EXPLICIT');
-    assert.ok(inferredMarker, '推定候補がJev肯定時に採用されていない');
+    assert.ok(inferredMarker, '継続判定済みで質問に近い推定候補が採用されていない');
     assert.ok(
       related.indexOf(explicitMarker as M7Evidence) < related.indexOf(inferredMarker),
       '明示linkが推定候補より後ろに並んでいる',
@@ -436,139 +478,150 @@ describe('M7 evidence revision固定の明示link', () => {
 });
 
 describe('M7 multi-hop明示linkの保存前再検証', () => {
+  // 周辺探索は外部HTTPを待たなくなったため、探索後・保存前の競合は保存TXの再検証関数で直接確かめる。
   it('起点linkが保存前にrevokeされたら終端Cと直接Bを落とす', async () => {
-    const gate = createExternalGate();
-    gate.armed = true;
-    const { config } = await startProviders({
-      jevResponder: async (request, rawBody) => {
-        // M5候補判定の後に走るM7推定探索のJev呼出しで止め、探索後・保存前の競合を作る。
-        if (gate.armed && rawBody.includes('m7_context_')) {
-          gate.armed = false;
-          gate.enter();
-          await gate.waitRelease();
-        }
-        return { body: jevReply(request, m7ChoiceSelector('positive')) };
-      },
-    });
-    const generation = await ensureActiveGeneration(
-      pool,
-      { companyId: workspace.companyId, projectId: workspace.projectId },
-      config,
-    );
     const startedAt = new Date('2026-09-21T00:00:00.000Z');
     const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-primary' });
     await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, startedAt]);
-    const primaryText = 'PATH-SAVE-PRIMARY-ANSWER';
-    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: primaryText });
-    const input = await seedExecuteSearch(pool, { workspace, sessionId: primarySession, sequenceNo: 3, text: 'QUERY-M7-PATH-SAVE' });
-    await seedReadyDocument(pool, {
-      companyId: workspace.companyId,
-      projectId: workspace.projectId,
-      sessionId: primarySession,
-      documentKey: 'm7-path-save-primary-doc',
-      content: primaryText,
-      generationId: generation.id,
-      embedding: basisVector(0, 1),
-      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
-    });
-
+    await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: 'PATH-SAVE-PRIMARY-ANSWER' });
+    const inputMessage = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 3, text: 'QUERY-M7-PATH-SAVE' });
     const sessionB = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-b' });
-    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [sessionB, new Date(startedAt.getTime() + 60_000)]);
     const bMessage = await seedMessage(pool, { sessionId: sessionB, sequenceNo: 1, text: 'PATH-SAVE-B' });
     const sessionC = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-c' });
-    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [sessionC, new Date(startedAt.getTime() + 2 * 60_000)]);
     const cMessage = await seedMessage(pool, { sessionId: sessionC, sequenceNo: 1, text: 'PATH-SAVE-C' });
     const linkAB = await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: sessionB, evidenceMessageId: bMessage.messageId });
-    await insertActiveSessionLink({ fromSessionId: sessionB, toSessionId: sessionC, evidenceMessageId: cMessage.messageId });
-    // 推定探索のJev呼出しを作るための隣接session。
-    const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-path-save-inferred' });
-    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [inferredSession, new Date(startedAt.getTime() + 3 * 60_000)]);
-    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: 'PATH-SAVE-INFERRED' });
+    const linkBC = await insertActiveSessionLink({ fromSessionId: sessionB, toSessionId: sessionC, evidenceMessageId: cMessage.messageId });
 
-    const processing = runExecuteSearch(pool, { jobId: input.jobId, config });
-    const entered = await gate.waitForEntry(5_000);
-    assert.ok(entered, 'M7推定探索のJev呼出しに到達しなかった');
-    await pool.query("UPDATE session_links SET status = 'revoked', updated_at = now() WHERE id = $1", [linkAB]);
-    gate.release();
-    await processing;
+    const target: JobTarget = {
+      messageId: inputMessage.messageId,
+      sessionId: primarySession,
+      projectId: workspace.projectId,
+      companyId: workspace.companyId,
+      employeeId: workspace.employeeId,
+      role: 'user',
+      sequenceNo: 3,
+      currentRevision: 1,
+      targetRevision: 1,
+      text: 'QUERY-M7-PATH-SAVE',
+      occurredAt: new Date().toISOString(),
+    };
+    const draft = (messageId: string, sessionId: string, text: string, linkIds: string[]): RelatedEvidenceDraft => ({
+      messageId,
+      revision: 1,
+      sessionId,
+      employeeId: workspace.employeeId,
+      role: 'user',
+      occurredAt: new Date(),
+      text,
+      sourceKind: 'explicit_session_link',
+      linkIds,
+    });
+    const drafts = [draft(bMessage.messageId, sessionB, 'PATH-SAVE-B', [linkAB]), draft(cMessage.messageId, sessionC, 'PATH-SAVE-C', [linkAB, linkBC])];
 
-    const request = await readSearchRequest(pool, input.requestId);
-    assert.equal(request.status, 'completed');
-    assert.equal(request.outcome, 'matched');
-    const match = primaryMatch(await readStoredResult(input.requestId));
-    const texts = evidenceTexts(relatedEvidence(match));
-    assert.ok(!texts.includes('PATH-SAVE-B'), `起点link revoke後も直接Bを保存している: ${JSON.stringify(texts)}`);
-    assert.ok(!texts.includes('PATH-SAVE-C'), `起点link revoke後も終端Cを保存している: ${JSON.stringify(texts)}`);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const before = await revalidateRelatedEvidence(client, target, drafts);
+      assert.deepEqual(before.map((item) => item.text), ['PATH-SAVE-B', 'PATH-SAVE-C'], 'revoke前の有効な経路を落としている');
+      await client.query('COMMIT');
+      await pool.query("UPDATE session_links SET status = 'revoked', updated_at = now() WHERE id = $1", [linkAB]);
+      await client.query('BEGIN');
+      const after = await revalidateRelatedEvidence(client, target, drafts);
+      await client.query('COMMIT');
+      const texts = after.map((item) => item.text);
+      assert.ok(!texts.includes('PATH-SAVE-B'), `起点link revoke後も直接Bを保存している: ${JSON.stringify(texts)}`);
+      assert.ok(!texts.includes('PATH-SAVE-C'), `起点link revoke後も終端Cを保存している: ${JSON.stringify(texts)}`);
+    } finally {
+      client.release();
+    }
   });
 });
 
-describe('M7 推定session候補', () => {
-  it('同社員の前後各3sessionと共通Issue entityだけを候補にし、他社員の時間隣接を除外する', async () => {
-    const { jev, config } = await startProviders();
-    const generation = await ensureActiveGeneration(
-      pool,
-      { companyId: workspace.companyId, projectId: workspace.projectId },
-      config,
-    );
+describe('M7 推定session継続のバックグラウンド判定', () => {
+  async function runJudgeJob(sessionId: string, messageId: string, config: Parameters<typeof processJob>[2]): Promise<void> {
+    const jobId = await enqueueJob(pool, {
+      kind: 'judge_continuity',
+      idempotencyKey: `judge-test-${uuidv7()}`,
+      sessionId,
+      messageId,
+      targetRevision: 1,
+    });
+    await pool.query('UPDATE jobs SET next_run_at = now() WHERE id = $1', [jobId]);
+    const [job] = await claimJobs(pool, { kinds: ['judge_continuity'], limit: 1 });
+    assert.ok(job !== undefined && job.id === jobId, 'judge_continuity jobをclaimできない');
+    await processJob(pool, job, config);
+    const status = await pool.query<{ status: string }>('SELECT status FROM jobs WHERE id = $1', [jobId]);
+    assert.equal(status.rows[0]?.status, 'completed', 'judge_continuity jobが完了していない');
+  }
+
+  it('同社員の直前3sessionと共通Issue entityのsessionを1回のJevで判定し、高信頼の継続だけを保存する', async () => {
+    const { jev, config } = await startProviders({
+      jevResponder: (request) => ({
+        body: jevReply(request, (question) => {
+          const context = question.instructions;
+          if (context.includes('INFER-B1') || context.includes('INFER-COMMON-ENTITY')) {
+            return 'continuous';
+          }
+          if (context.includes('INFER-B2')) {
+            return { choice: 'continuous', confidence: 0.5 };
+          }
+          return 'separate';
+        }),
+      }),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const base = new Date('2026-09-21T00:00:00.000Z');
-    const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-infer-primary' });
-    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, base]);
-    const primaryText = 'PRIMARY-INFER-MARKER Issue #777 の修正';
-    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 3, role: 'assistant', text: primaryText });
-    const primaryDocumentId = await seedReadyDocument(pool, {
-      id: uuidv7(),
+    const currentSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-judge-current' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [currentSession, base]);
+    const currentText = 'JUDGE-CURRENT Issue #777 の続き';
+    const current = await seedMessage(pool, { sessionId: currentSession, sequenceNo: 1, text: currentText });
+    const currentDocumentId = await seedReadyDocument(pool, {
       companyId: workspace.companyId,
       projectId: workspace.projectId,
-      sessionId: primarySession,
-      documentKey: 'm7-infer-primary-doc',
-      content: primaryText,
+      sessionId: currentSession,
+      documentKey: 'm7-judge-current-doc',
+      content: currentText,
       generationId: generation.id,
       embedding: basisVector(0, 1),
-      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+      sources: [{ messageId: current.messageId, messageRevision: 1, startOffset: 0, endOffset: currentText.length }],
     });
-    await insertIssueEntity(primaryDocumentId);
-    const input = await seedExecuteSearch(pool, { workspace, sessionId: primarySession, sequenceNo: 5, text: 'QUERY-M7-INFER' });
+    await insertIssueEntity(currentDocumentId);
 
-    const adjacent: Array<{ marker: string; offsetMinutes: number }> = [
-      { marker: 'INFER-B3', offsetMinutes: -180 },
-      { marker: 'INFER-B2', offsetMinutes: -120 },
+    const sessions = new Map<string, string>();
+    for (const candidate of [
       { marker: 'INFER-B1', offsetMinutes: -60 },
-      { marker: 'INFER-C1', offsetMinutes: 60 },
-      { marker: 'INFER-C2', offsetMinutes: 120 },
-      { marker: 'INFER-C3', offsetMinutes: 180 },
+      { marker: 'INFER-B2', offsetMinutes: -120 },
+      { marker: 'INFER-B3', offsetMinutes: -180 },
       { marker: 'INFER-B4', offsetMinutes: -240 },
-      { marker: 'INFER-C4', offsetMinutes: 240 },
-    ];
-    for (const candidate of adjacent) {
-      const sessionId = await seedSession(pool, workspace, { sourceSessionId: `m7-${candidate.marker}` });
+      { marker: 'INFER-LATER', offsetMinutes: 60 },
+    ]) {
+      const sessionId = await seedSession(pool, workspace, { sourceSessionId: `m7-judge-${candidate.marker}` });
       await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [sessionId, new Date(base.getTime() + candidate.offsetMinutes * 60_000)]);
       await seedMessage(pool, { sessionId, sequenceNo: 1, text: candidate.marker });
+      sessions.set(candidate.marker, sessionId);
     }
-
-    const otherEmployee = await insertEmployee(pool, workspace.companyId, 'employee-other');
+    const otherEmployee = await insertEmployee(pool, workspace.companyId, 'employee-judge-other');
     await addProjectMember(pool, workspace.projectId, otherEmployee);
-    const otherEmployeeSession = await insertSession(pool, {
+    const otherSession = await insertSession(pool, {
       projectId: workspace.projectId,
       employeeId: otherEmployee,
-      sourceSessionId: 'm7-other-employee',
+      sourceSessionId: 'm7-judge-other',
       startedAt: new Date(base.getTime() - 30 * 60_000),
     });
-    await seedMessage(pool, { sessionId: otherEmployeeSession, sequenceNo: 1, text: 'INFER-OTHER-EMPLOYEE' });
-
-    // 他社員でも代表根拠と共通のIssue entityを持つsessionは候補にする。
+    await seedMessage(pool, { sessionId: otherSession, sequenceNo: 1, text: 'INFER-OTHER-EMPLOYEE' });
     const entitySession = await insertSession(pool, {
       projectId: workspace.projectId,
       employeeId: otherEmployee,
-      sourceSessionId: 'm7-common-entity',
-      startedAt: new Date(base.getTime() + 5 * 60 * 60_000),
+      sourceSessionId: 'm7-judge-entity',
+      startedAt: new Date(base.getTime() - 5 * 60 * 60_000),
     });
     const entityText = 'INFER-COMMON-ENTITY Issue #777 の対応';
-    const entityMessage = await seedMessage(pool, { sessionId: entitySession, sequenceNo: 1, role: 'assistant', text: entityText });
+    const entityMessage = await seedMessage(pool, { sessionId: entitySession, sequenceNo: 1, text: entityText });
     const entityDocumentId = await seedReadyDocument(pool, {
       companyId: workspace.companyId,
       projectId: workspace.projectId,
       sessionId: entitySession,
-      documentKey: 'm7-common-entity-doc',
+      documentKey: 'm7-judge-entity-doc',
       content: entityText,
       generationId: generation.id,
       embedding: similarityVector(1),
@@ -576,47 +629,100 @@ describe('M7 推定session候補', () => {
     });
     await insertIssueEntity(entityDocumentId);
 
-    await runExecuteSearch(pool, { jobId: input.jobId, config });
-    const request = await readSearchRequest(pool, input.requestId);
-    assert.equal(request.status, 'completed');
-    assert.equal(request.outcome, 'matched');
-    const match = primaryMatch(await readStoredResult(input.requestId));
-    const related = relatedEvidence(match);
+    await runJudgeJob(currentSession, current.messageId, config);
+    assert.equal(jev.requests.length, 1, '候補sessionを1回のJev requestにまとめていない');
+    const body = jev.requests[0]?.rawBody ?? '';
+    for (const marker of ['INFER-B1', 'INFER-B2', 'INFER-B3', 'INFER-COMMON-ENTITY']) {
+      assert.ok(body.includes(marker), `判定候補${marker}がJevへ渡っていない`);
+    }
+    for (const marker of ['INFER-B4', 'INFER-LATER', 'INFER-OTHER-EMPLOYEE']) {
+      assert.ok(!body.includes(marker), `候補外の${marker}をJevへ渡している`);
+    }
+    const saved = await pool.query<{ candidate_session_id: string; continuous: boolean }>(
+      'SELECT candidate_session_id, continuous FROM session_continuity_judgments WHERE session_id = $1',
+      [currentSession],
+    );
+    const continuous = new Set(saved.rows.filter((row) => row.continuous).map((row) => row.candidate_session_id));
+    assert.equal(saved.rows.length, 4, '判定した組を全件保存していない');
+    assert.deepEqual(continuous, new Set([sessions.get('INFER-B1'), entitySession]), '高信頼の継続だけを保存していない');
 
-    for (const marker of ['INFER-B1', 'INFER-B2', 'INFER-B3', 'INFER-C1', 'INFER-C2', 'INFER-C3', 'INFER-COMMON-ENTITY']) {
-      const item = relatedWithText(match, marker);
-      assert.ok(item, `推定候補${marker}がない: ${JSON.stringify(evidenceTexts(related))}`);
-      assert.equal(item.source_kind, 'inferred_session_link', `${marker}のsource_kindがinferred_session_linkではない`);
-    }
-    for (const marker of ['INFER-B4', 'INFER-C4', 'INFER-OTHER-EMPLOYEE']) {
-      assert.ok(!relatedWithText(match, marker), `候補外の${marker}を返している: ${JSON.stringify(evidenceTexts(related))}`);
-    }
-
-    // 候補外のsessionはJevへ渡さず、候補は双方の判定材料として渡す。
-    const jevBody = allJevRawBody(jev);
-    for (const marker of ['INFER-B1', 'INFER-C1', 'INFER-COMMON-ENTITY']) {
-      assert.ok(jevBody.includes(marker), `推定候補${marker}がJev判定に渡っていない`);
-    }
-    for (const marker of ['INFER-B4', 'INFER-C4', 'INFER-OTHER-EMPLOYEE']) {
-      assert.ok(!jevBody.includes(marker), `候補外の${marker}をJevへ渡している`);
-    }
+    // 判定済みの組は再判定しない。
+    await runJudgeJob(currentSession, current.messageId, config);
+    assert.equal(jev.requests.length, 1, '判定済みの組を再度Jevへ送っている');
   });
 
-  it('Jevで現在質問・継続元の双方がpositiveでない推定候補は採用せず、明示linkは維持する', async () => {
-    const primaryDocumentId = uuidv7();
-    const { config } = await startProviders({ jevMode: 'primary-only', primaryDocumentId });
-    const generation = await ensureActiveGeneration(
-      pool,
-      { companyId: workspace.companyId, projectId: workspace.projectId },
-      config,
+  it('検索時はJevを呼ばず、継続判定済みsessionのうち質問に近い文書だけを推定候補として付ける', async () => {
+    const { jev, config } = await startProviders();
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const base = new Date('2026-09-21T00:00:00.000Z');
+    const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-attach-primary' });
+    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, base]);
+    const primaryText = 'PRIMARY-ATTACH-MARKER';
+    const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: primaryText });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: primarySession,
+      documentKey: 'm7-attach-primary-doc',
+      content: primaryText,
+      generationId: generation.id,
+      embedding: basisVector(0, 1),
+      sources: [{ messageId: primary.messageId, messageRevision: 1, startOffset: 0, endOffset: primaryText.length }],
+    });
+    const input = await seedExecuteSearch(pool, { workspace, sessionId: primarySession, sequenceNo: 4, text: 'QUERY-M7-ATTACH' });
+
+    const continuedSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-attach-continued' });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: continuedSession,
+      text: 'ATTACH-NEAR 方針を変更した',
+      embedding: similarityVector(1),
+    });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: continuedSession,
+      text: 'ATTACH-FAR 関係のない雑談',
+      embedding: basisVector(7, 1),
+      sequenceNo: 2,
+    });
+    const separateSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-attach-separate' });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: separateSession,
+      text: 'ATTACH-SEPARATE 別の作業',
+      embedding: similarityVector(1),
+      continuous: false,
+    });
+
+    await runExecuteSearch(pool, { jobId: input.jobId, config });
+    const request = await readSearchRequest(pool, input.requestId);
+    assert.equal(request.outcome, 'matched');
+    const match = primaryMatch(await readStoredResult(input.requestId));
+    const near = relatedWithText(match, 'ATTACH-NEAR');
+    assert.ok(near, `継続判定済みで質問に近い文書を付けていない: ${JSON.stringify(evidenceTexts(relatedEvidence(match)))}`);
+    assert.equal(near.source_kind, 'inferred_session_link');
+    assert.ok(!relatedWithText(match, 'ATTACH-FAR'), '質問から遠い継続sessionの文書を付けている');
+    assert.ok(!relatedWithText(match, 'ATTACH-SEPARATE'), '継続でないと判定したsessionを付けている');
+    // 推定候補の文書もvector候補として候補判定には入り得る。周辺探索としてのJev判定がないことを確認する。
+    assert.ok(
+      jev.requests.every((item) => item.rawBody.includes('"candidate_relevance:')),
+      '候補判定以外のJev呼出し（周辺探索の判定）が検索時に発生している',
     );
+    assert.ok(!allJevRawBody(jev).includes('m7_context_'), '検索時に推定候補の継続判定をJevへ送っている');
+  });
+
+  it('継続でないと判定した推定候補は採用せず、明示linkは維持する', async () => {
+    const { config } = await startProviders();
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const base = new Date('2026-09-21T00:00:00.000Z');
     const primarySession = await seedSession(pool, workspace, { sourceSessionId: 'm7-primary-only' });
     await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [primarySession, base]);
     const primaryText = 'PRIMARY-ONLY-MARKER';
     const primary = await seedMessage(pool, { sessionId: primarySession, sequenceNo: 1, role: 'assistant', text: primaryText });
     await seedReadyDocument(pool, {
-      id: primaryDocumentId,
       companyId: workspace.companyId,
       projectId: workspace.projectId,
       sessionId: primarySession,
@@ -634,16 +740,22 @@ describe('M7 推定session候補', () => {
     await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: explicitSession, evidenceMessageId: primary.messageId });
 
     const adjacentSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-inferred-dropped' });
-    await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [adjacentSession, new Date(base.getTime() + 120_000)]);
-    await seedMessage(pool, { sessionId: adjacentSession, sequenceNo: 1, text: 'INFERRED-DROPPED' });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: adjacentSession,
+      text: 'INFERRED-DROPPED',
+      embedding: similarityVector(1),
+      continuous: false,
+    });
 
     await runExecuteSearch(pool, { jobId: input.jobId, config });
     const request = await readSearchRequest(pool, input.requestId);
     assert.equal(request.status, 'completed');
     assert.equal(request.outcome, 'matched');
     const match = primaryMatch(await readStoredResult(input.requestId));
-    assert.ok(relatedWithText(match, 'EXPLICIT-KEPT'), 'Jev否定的な推定候補と同じ探索で明示linkまで落としている');
-    assert.ok(!relatedWithText(match, 'INFERRED-DROPPED'), 'Jevがpositiveでない推定候補を採用している');
+    assert.ok(relatedWithText(match, 'EXPLICIT-KEPT'), '推定候補の不採用と同じ探索で明示linkまで落としている');
+    assert.ok(!relatedWithText(match, 'INFERRED-DROPPED'), '継続でない推定候補を採用している');
   });
 });
 
@@ -877,7 +989,13 @@ describe('M7 最終コンテキストのtoken予算', () => {
     const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-budget-inferred' });
     await pool.query("UPDATE sessions SET started_at = $2 WHERE id = $1", [inferredSession, new Date('2026-09-21T01:00:00.000Z')]);
     const inferredText = `${exactTokenText(tokenizer, 3_000)} INFERRED-BIG`;
-    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: inferredText });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: inferredSession,
+      text: inferredText,
+      embedding: similarityVector(1),
+    });
 
     await runExecuteSearch(pool, { jobId: input.jobId, config });
     const request = await readSearchRequest(pool, input.requestId);
@@ -1119,10 +1237,16 @@ describe('M7 別session代表根拠の周辺・継続探索', () => {
     await seedMessage(pool, { sessionId: linkedSession, sequenceNo: 1, text: 'CROSS-EXPLICIT' });
     await insertActiveSessionLink({ fromSessionId: primarySession, toSessionId: linkedSession, evidenceMessageId: primary.messageId });
 
-    // 同社員の隣接session（推定候補）。
+    // 継続判定済みの同社員session（推定候補）。
     const inferredSession = await seedSession(pool, workspace, { sourceSessionId: 'm7-cross-inferred' });
     await pool.query('UPDATE sessions SET started_at = $2 WHERE id = $1', [inferredSession, new Date(base.getTime() + 60_000)]);
-    await seedMessage(pool, { sessionId: inferredSession, sequenceNo: 1, text: 'CROSS-INFERRED' });
+    await seedInferredContinuation({
+      generationId: generation.id,
+      primarySessionId: primarySession,
+      sessionId: inferredSession,
+      text: 'CROSS-INFERRED',
+      embedding: similarityVector(1),
+    });
 
     await runExecuteSearch(pool, { jobId: input.jobId, config });
     const request = await readSearchRequest(pool, input.requestId);
