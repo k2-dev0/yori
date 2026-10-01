@@ -91,6 +91,7 @@ npm run provider:revoke -- <approval-id>
 | `npm run worker:start` | route lane 1 + classify/build/execute_searchの外部処理lane 1（計2並列）でjobを処理する |
 | `npm run worker:retry -- <jobId>` | `failed`/`blocked_policy`のjobを、現在の承認を確認してpendingへ戻す。route/execute_searchは対象の検索受付も同一TXで戻す |
 | `npm run worker:reclassify -- <projectId>` | 現行revisionの分類で`information_source`が`unknown`のままのエージェントの回答について、完了済みの`classify_message` jobを再実行待ちへ戻す。件数を`worker: reclassify_requeued <n>`で出力し、分類自体は稼働中のworkerが行う。待機中・実行中・失敗のjob、利用者の発言、他案件には触れない。再分類はJevへ再送するため、他の分類項目（保存価値・発言状態・関係）も現在の判定で上書きされる |
+| `npm run worker:search-eval -- <projectId> <cases.json>` | 正解つきの質問を本番と同じ検索処理（区切り・Voyage・DB検索・Jev判定・順位付け）へ流し、正解の発言が代表根拠になったかをケースごとにJSONで出力する。対象DBへ一時的な会話・発言・検索の受付・jobを書き込み、ケースごとに削除するため、**本番DBの写しに対してだけ実行する**。`SEARCH_EVAL_DATABASE_IS_COPY=yes`がなければ何も書かず`search_eval_requires_database_copy`で終了する。VoyageとJevは実際に呼ぶ |
 | `npm run provider:approve -- <approval.json>` | 承認を登録し、同じendpointの旧承認を失効させる |
 | `npm run provider:revoke -- <approval-id>` | 承認を失効させる |
 
@@ -183,3 +184,17 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 ## テスト
 
 `npm test`は隔離Compose DBと合成loopback HTTP fixtureだけを使う。実Jev/Voyage・実会話は送信しない。workerのテストは`src/worker/tests/`にあり、runner/CLI/cacheも同じfixtureで検証する。
+
+## 検索の評価（worker:search-eval）
+
+調整値（質問の区切り、候補の上限、順位付け）を、デプロイせずに手元で比べるための道具。本番DBの写しを手元のDBへ復元し、そのDBを`DATABASE_URL`に指定して実行する。写しのDBに対してworkerを同時に動かさない。
+
+ケースのfileは次の配列。`expected_message_ids`は、その質問で根拠として出るべき発言の`messages.id`。
+
+```json
+[{ "name": "device-discount", "question": "端末値引きの実装ってどういう方針で誰がやりましたか？", "expected_message_ids": ["<message uuid>"] }]
+```
+
+出力はケースごとに`status`（`hit`＝正解が代表根拠、`miss`、`error`）、`in_candidates`（Jevの判定まで届いたか）、`candidate_position`（判定へ渡した順の位置、1始まり）、`relevance`（Jevの総合判定）、`error_code`を持ち、末尾に`total`と`hits`を持つ。`miss`かつ`in_candidates=false`は候補の探し方（区切り・埋め込み・上限）の問題、`miss`かつ`in_candidates=true`は順位付けまたはJevの判定の問題を示す。
+
+評価で作った会話は削除するが、外部呼び出しの記録（`usage_events`）、評価cache、埋め込みcache、検索所要時間のsampleは写しのDBに残る。調整値はコードの定数または環境変数を変えて再実行する。
