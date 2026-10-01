@@ -1427,6 +1427,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
         primaryDocumentRevision: primary.assessment.candidate.revision,
         primaryEvidence: primary.valid.evidence,
         question,
+        queryVector,
         jobKind: job.kind,
       });
     }
