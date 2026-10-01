@@ -2535,6 +2535,12 @@
                     "type": "string"
                   }
                 },
+                "retrieval_kinds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
                 "statement_status": {},
                 "claim_status": {
                   "type": "string",
@@ -2900,6 +2906,12 @@
                     },
                     "relevance": {},
                     "relevance_kind": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "retrieval_kinds": {
                       "type": "array",
                       "items": {
                         "type": "string"
