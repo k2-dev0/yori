@@ -10,6 +10,7 @@ import { isVoyageEndpoint, isWorkerEndpoint, loadWorkerConfig } from './config.j
 import { loadProjectMetrics } from './metrics.js';
 import { retryJob } from './process.js';
 import { reclassifyMessages } from './reclassify.js';
+import { evaluateSearchCases, type SearchEvalCase } from './search-eval.js';
 import { deleteGeneration, reindexProject } from './reindex.js';
 import { runWorker } from './runner.js';
 
@@ -189,6 +190,36 @@ async function runReclassify(env: NodeJS.ProcessEnv, projectId: string | undefin
   }
 }
 
+const searchEvalCasesSchema = z.array(
+  z.strictObject({ name: z.string().min(1), question: z.string().min(1), expected_message_ids: z.array(z.uuid()).min(1) }),
+);
+
+// 評価は対象DBへ一時的なデータを書き込む。本番の写しだと明示された時だけ、接続とfile読込へ進む。
+async function runSearchEval(env: NodeJS.ProcessEnv, projectId: string | undefined, casesPath: string | undefined): Promise<number> {
+  if (env.SEARCH_EVAL_DATABASE_IS_COPY !== 'yes') {
+    return fail('search_eval_requires_database_copy');
+  }
+  if (projectId === undefined || !z.uuid().safeParse(projectId).success || casesPath === undefined) {
+    return fail('invalid_arguments');
+  }
+  let cases: SearchEvalCase[];
+  let loaded;
+  try {
+    cases = searchEvalCasesSchema.parse(JSON.parse(readFileSync(casesPath, 'utf8')));
+    loaded = loadWorkerConfig(env);
+  } catch {
+    return fail('invalid_search_eval_input');
+  }
+  const pool = createPool(loaded.databaseUrl);
+  try {
+    const result = await evaluateSearchCases(pool, loaded.config, projectId, cases);
+    process.stdout.write(`${JSON.stringify(result.ok ? result.report : { error: result.code })}\n`);
+    return result.ok ? 0 : 1;
+  } finally {
+    await pool.end();
+  }
+}
+
 async function runReindex(env: NodeJS.ProcessEnv, projectId: string | undefined): Promise<number> {
   if (projectId === undefined || !z.uuid().safeParse(projectId).success) {
     return fail('invalid_project_id');
@@ -354,6 +385,9 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
   }
   if (command === 'revoke') {
     return runRevoke(env, rest[0]);
+  }
+  if (command === 'search-eval') {
+    return runSearchEval(env, rest[0], rest[1]);
   }
   if (command === 'reclassify') {
     return runReclassify(env, rest[0]);
