@@ -23,7 +23,7 @@ const linkSessionIdentitySchema = z.strictObject({
 
 // HTTP POST /v1/searchesと同じstrict入力。queryはHTTP本文と同じコードポイント上限で判定する。
 export const searchHistoryInputSchema = z.strictObject({
-  project_id: normalizedUuid,
+  project_id: normalizedUuid.optional(),
   input_id: normalizedUuid,
   input_revision: revisionSchema,
   query: conversationText,
@@ -34,7 +34,7 @@ export const searchHistoryInputSchema = z.strictObject({
 // request_id、input_id+input_revision、外部identityのどれか1つだけを指定する排他的branch。
 export const getSearchResultInputSchema = z
   .strictObject({
-    project_id: normalizedUuid,
+    project_id: normalizedUuid.optional(),
     request_id: normalizedUuid.optional(),
     wait_ms: waitMsValueSchema.optional(),
     input_id: normalizedUuid.optional(),
@@ -89,14 +89,14 @@ export const getSearchResultInputSchema = z
   );
 
 export const getEvidenceInputSchema = z.strictObject({
-  project_id: normalizedUuid,
+  project_id: normalizedUuid.optional(),
   message_id: normalizedUuid,
   revision: revisionSchema,
 });
 
 // HTTP POST /v1/session-linksと同じstrict入力。identityのbyte上限も共有する。
 export const linkSessionInputSchema = z.strictObject({
-  project_id: normalizedUuid,
+  project_id: normalizedUuid.optional(),
   idempotency_key: idempotencyKeySchema,
   from: linkSessionIdentitySchema,
   to: linkSessionIdentitySchema,
@@ -108,7 +108,7 @@ export const linkSessionInputSchema = z.strictObject({
 
 // record_caseはHTTP POST /v1/eventsのagent_reportと同じ本文上限・識別子上限を使う。
 export const recordCaseInputSchema = z.strictObject({
-  project_id: normalizedUuid,
+  project_id: normalizedUuid.optional(),
   idempotency_key: idempotencyKeySchema,
   source: z.enum(EVENT_SOURCES),
   source_scope: sourceIdentifier,
