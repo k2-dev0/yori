@@ -353,8 +353,8 @@ async function applyAnalysis(
     await client.query(
       `INSERT INTO message_analysis
          (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
-          continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15::text[])
+          continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms, information_source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15::text[], $16)
        ON CONFLICT (message_id, revision, policy_version) DO UPDATE
          SET retention_category = EXCLUDED.retention_category,
              primary_intent = EXCLUDED.primary_intent,
@@ -363,6 +363,7 @@ async function applyAnalysis(
              decision_action = EXCLUDED.decision_action,
              continuity = EXCLUDED.continuity,
              statement_status = EXCLUDED.statement_status,
+             information_source = EXCLUDED.information_source,
              is_searchable = EXCLUDED.is_searchable,
              response_models = EXCLUDED.response_models,
              state_hash = EXCLUDED.state_hash,
@@ -384,6 +385,7 @@ async function applyAnalysis(
         stateHash,
         JSON.stringify(aggregate.parts),
         aggregate.strategyTerms,
+        aggregate.informationSource,
       ],
     );
     for (const relation of aggregate.relations) {
