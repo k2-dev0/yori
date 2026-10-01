@@ -26,7 +26,7 @@ it('0013からの移行で既存sessionを全体構築待ちにし、原文とre
     const workspace = await seedWorkspace(legacy);
     const sessionId = await insertSession(legacy, { projectId: workspace.projectId, employeeId: workspace.employeeId });
     const { messageId } = await insertMessage(legacy, { sessionId, sourceMessageId: 'legacy', sequenceNo: 1, text: '保持する原文' });
-    assert.deepEqual(await runMigrations(legacy), ['0014_document_build_state.sql']);
+    assert.deepEqual(await runMigrations(legacy), ['0014_document_build_state.sql', '0015_strategy_fingerprint.sql']);
     const state = await legacy.query('SELECT dirty_sequence, tail, built_version FROM document_build_states WHERE session_id = $1', [sessionId]);
     assert.deepEqual(state.rows, [{ dirty_sequence: '0', tail: null, built_version: null }]);
     assert.equal((await legacy.query('SELECT text FROM message_revisions WHERE message_id = $1 AND revision = 1', [messageId])).rows[0].text, '保持する原文');
