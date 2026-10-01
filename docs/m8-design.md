@@ -92,8 +92,9 @@ npm run worker:ann-index -- drop --generation <generation-uuid>
 - 索引名は`document_embeddings_hnsw_<ハイフンを除いた世代UUID>`。
 - 作成は`CREATE INDEX CONCURRENTLY ... USING hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops) WHERE generation_id = '<id>'`。構築中も検索と書き込みを止めない。
 - `CONCURRENTLY`は失敗・中断でINVALIDな索引を残す。`create`の再実行はINVALIDな残骸を削除して作り直し、有効な索引があれば`already_exists`で成功する。同じ索引の同時作成はadvisory lockで拒否する（`ann_index_busy`）。
+- 作成に成功すると`worker: created duration_ms=<所要時間> index_bytes=<索引サイズ>`を出力する。構築中も検索を止めないため、本番での実行がそのまま実データでの実測になる。次の作成の見積もりに使う。
 - 存在しない世代は`generation_not_found`、存在しない索引の削除は`ann_index_not_found`で終了する。
-- `worker:generation-delete`は、世代の削除が確定した後にその世代の索引を`DROP INDEX CONCURRENTLY`で削除する。TX内の`DROP INDEX`は`document_embeddings`の排他lockを取り、待機中も後続の検索を待たせるため使わない。索引の削除だけが失敗した場合は`ann_index_drop_failed`で終了する。世代は削除済みで、残った索引はどの行も指さない。`ann-index drop`で消せる。
+- `worker:generation-delete`は、世代の削除が確定した後にその世代の索引を`DROP INDEX CONCURRENTLY`で削除する。TX内の`DROP INDEX`は`document_embeddings`の排他lockを取り、待機中も後続の検索を待たせるため使わない。索引の削除だけが失敗した場合は`ann_index_drop_failed`で終了する。世代は削除済みで、残った索引はどの行も指さない。同じ`worker:generation-delete`を再実行すれば残った索引を削除し、`ann_index_dropped`で成功する。
 - 構築の実測（2026-10-01、pgvector 0.8.6、`maintenance_work_mem=64MB`、乱数の1024次元ベクトル20,001件、`CONCURRENTLY`なし）：13.5秒、索引52 MB。本番composeと同じ64 MBに収まり、メモリ不足の通知は出なかった。`CONCURRENTLY`は表を2回走査するためこれより長い。文書数がこの数倍になる場合は、構築前に`maintenance_work_mem`を見直す。
 
 ### 一致率の比較（shadow比較）
@@ -106,20 +107,20 @@ npm run worker:ann-recall -- --project <project-uuid> [--samples 50]
 - 検索要求から検索元のsessionと位置も取るため、他案件の質問は混ざらず、本番と同じ除外条件で比べられる。
 - 各ベクトルについて上位20件を2通り取り、厳密検索の結果のうち近似検索にも含まれる割合をrecall@20とする。
   - 厳密検索：`VECTOR_CANDIDATES_SQL`と同じ絞り込み（会社・案件・世代・検索可能な公開revision、検索元sessionの質問以降の発言をsourceに含む文書の除外）で、vector型のcosine距離順。式が違うためhalfvecの索引は使われない。
-  - 近似検索：同じ絞り込みで、索引と同じhalfvecの式の距離順。`SET LOCAL hnsw.iterative_scan = relaxed_order`、`hnsw.ef_search = 100`、`enable_seqscan = off`を指定する。実行計画が索引を使わない場合は`ann_index_not_used`で終了し、近似でない値を報告しない。
-- 出力はJSON 1行で、サンプル数、recallの平均・最小、厳密・近似それぞれの所要時間p50/p95、使った設定値（`top_k`・`ef_search`・`iterative_scan`・`statement_timeout_ms`・`index_name`）。本文・質問・ベクトルは出力しない。
+  - 近似検索：同じ絞り込みで、索引と同じhalfvecの式の距離順。`SET LOCAL hnsw.iterative_scan = relaxed_order`、`hnsw.ef_search = 100`を指定する。索引を使うかどうかをplannerの統計任せにしないため、`enable_seqscan = off`と`enable_sort = off`も指定する。実行計画が索引を使わない場合は`ann_index_not_used`で終了し、近似でない値を報告しない。
+- 出力はJSON 1行で、要求した件数（`requested_samples`）、実際に比べた件数（`samples`）、厳密検索の結果が空で比べなかった件数（`skipped_samples`）、recallの平均・最小、厳密・近似それぞれの所要時間p50/p95、使った設定値（`top_k`・`ef_search`・`iterative_scan`・`statement_timeout_ms`・`index_name`）。本文・質問・ベクトルは出力しない。
 - 世代に有効な索引がなければ`ann_index_not_found`、cache済みの質問を持つ検索要求がなければ`ann_recall_no_samples`で終了する。厳密検索の結果が空になる質問はsampleへ数えず、全ての質問がそうなら`ann_recall_no_documents`で終了する。
 
 測定値を読むときの制約は次のとおり。
 
-- 使えるのは、検索要求と質問ベクトルのcacheが両方残っている質問だけである。検索要求が失効・削除された質問や、文書数が少なくplannerが索引を選ばない案件（`ann_index_not_used`）は測れない。
+- 使えるのは、検索要求と質問ベクトルのcacheが両方残っている質問だけである。検索要求が失効・削除された質問は測れない。
 - 文書は現在の公開状態で比べる。検索要求の時点の文書集合は再現しない。
 - recallの低下には、HNSWの取りこぼしとhalfvecへの精度低下の両方が含まれる。
 - 所要時間は厳密・近似の実行順を交互に入れ替えて測るが、同じ接続・同じbufferを共有するため目安である。
 
 ### 採用の目安
 
-recall@20の平均が0.95以上、かつ最小が0.8以上。満たさない場合は`ef_search`や索引の構築parameterを見直す。目安を満たしても本番の検索は自動では切り替わらない。
+recall@20の平均が0.95以上、かつ最小が0.8以上。`samples`が`requested_samples`を大きく下回る場合は、少数の質問の平均であり、目安を満たしても採用の根拠にしない。満たさない場合は`ef_search`や索引の構築parameterを見直す。目安を満たしても本番の検索は自動では切り替わらない。
 
 ## 本番配置
 
