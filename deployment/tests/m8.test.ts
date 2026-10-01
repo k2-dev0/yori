@@ -11,6 +11,7 @@ import { REPO_ROOT } from './docker.js';
 
 // production composeの設定を満たす合成env。passwordは合成の固定64桁hexで、実秘密・実domainは使わない。
 const PRODUCTION_ENV = {
+  YORI_RELEASE_SHA: '1111111111111111111111111111111111111111',
   YORI_POSTGRES_USER: 'yori',
   YORI_POSTGRES_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   YORI_POSTGRES_DB: 'yori',
@@ -63,6 +64,7 @@ function composeConfig(args: string[], overrides: NodeJS.ProcessEnv = {}): Promi
     'COMPOSE_PROJECT_NAME',
     'COMPOSE_PROFILES',
     'YORI_POSTGRES_USER',
+    'YORI_RELEASE_SHA',
     'YORI_POSTGRES_PASSWORD',
     'YORI_POSTGRES_DB',
     'YORI_DOMAIN',
