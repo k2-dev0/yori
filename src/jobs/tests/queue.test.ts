@@ -393,11 +393,10 @@ describe('セッション内の分類順序', () => {
     );
   });
 
-  it('先行jobがpending(未到来)・running・failed・blocked_policyの間は後続jobをclaimしない', async () => {
+  it('先行jobがpending(未到来)・running・blocked_policyの間は後続jobをclaimせず、恒久failedは飛ばして後続をclaimする', async () => {
     const blockedSuccessors: string[] = [];
     const claimableJobs: string[] = [];
     const blockingCases: Array<{ name: string; predecessor: InsertJobOptions }> = [
-      { name: 'failed', predecessor: { status: 'failed', errorCode: 'provider_error' } },
       { name: 'blocked_policy', predecessor: { status: 'blocked_policy', errorCode: 'policy_unconfirmed' } },
       {
         name: 'running',
@@ -425,8 +424,22 @@ describe('セッション内の分類順序', () => {
     await insertJob({ sessionId: completedSessionId, messageId: completedFirstMessage, targetRevision: 1, status: 'completed' });
     claimableJobs.push(await insertJob({ sessionId: completedSessionId, messageId: completedSecondMessage, targetRevision: 1 }));
 
+    // 先行jobが再試行しない失敗で確定している時は、その発言を飛ばして後続をclaimできる。会話全体を止めない。
+    const failedSessionId = await seedSession();
+    const failedFirstMessage = await seedMessage(failedSessionId, 1);
+    const failedSecondMessage = await seedMessage(failedSessionId, 2);
+    const failedJobId = await insertJob({
+      sessionId: failedSessionId,
+      messageId: failedFirstMessage,
+      targetRevision: 1,
+      status: 'failed',
+      errorCode: 'provider_contract_invalid',
+    });
+    claimableJobs.push(await insertJob({ sessionId: failedSessionId, messageId: failedSecondMessage, targetRevision: 1 }));
+
     const claimed = await claimJobs(pool, { kinds: ['classify_message'], limit: 50 });
     const claimedIds = claimed.map((job) => job.id);
+    assert.ok(!claimedIds.includes(failedJobId), '恒久failedのjob自体を再実行している');
     assert.deepEqual(claimedIds.slice().sort(), claimableJobs.slice().sort(), '先行jobの状態を無視した、または別sessionを止めた');
     for (const successorId of blockedSuccessors) {
       assert.ok(!claimedIds.includes(successorId), 'blockedされるべき後続jobをclaimした');
