@@ -832,6 +832,21 @@ describe('M5 schemaと識別子索引', () => {
     );
   });
 
+  it('build_documentsはsession継続の判定jobをsessionごとに1件だけ遅延登録する', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { approveJev: false });
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedSearchableMessage(pool, { sessionId, sequenceNo: 1, text: '継続判定の対象になる最初の発言' });
+    await runBuildJob(pool, first.buildJobId, config);
+    const second = await seedSearchableMessage(pool, { sessionId, sequenceNo: 2, text: '同じsessionの次の発言' });
+    await runBuildJob(pool, second.buildJobId, config);
+    const jobs = await pool.query<{ session_id: string; delayed: boolean }>(
+      `SELECT session_id, next_run_at > now() + interval '5 minutes' AS delayed FROM jobs WHERE kind = 'judge_continuity'`,
+    );
+    assert.equal(jobs.rows.length, 1, 'sessionごとに1件の判定jobになっていない');
+    assert.equal(jobs.rows[0]?.session_id, sessionId);
+    assert.equal(jobs.rows[0]?.delayed, true, '判定jobを遅延登録していない');
+  });
+
   it('build_documentsは明示識別子を文字大小そのままdocument_entitiesへ決定的に索引し、再実行で増殖しない', async () => {
     await requireM5Tables(pool);
     const { config } = await startProviders(pool, workspace.companyId, { approveJev: false });
