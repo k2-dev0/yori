@@ -1494,8 +1494,9 @@ describe('M5 順位統合とJev投入量', () => {
       voyageResponder: vectorQueryResponder(queryVector),
     });
     const tokenizer = await loadVoyageTokenizer();
-    const questionText = `${exactTokenText(tokenizer, 4_000)} QBUDGET`;
-    const candidateText = exactTokenText(tokenizer, 3_000);
+    // 区切られない長さの質問と、2件目が質問込みの予算を超える大きさの候補を使う。
+    const questionText = `${exactTokenText(tokenizer, 1_000)} QBUDGET`;
+    const candidateText = exactTokenText(tokenizer, 3_600);
     const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const sessionA = await seedSession(pool, workspace);
     const markers = ['QBUDGET-A', 'QBUDGET-B'];
@@ -1574,7 +1575,9 @@ describe('M5 順位統合とJev投入量', () => {
       assert.ok(tokenizer.encode(input).ids.length <= CHUNK_TARGET_TOKENS, '区切りが保存側の区切りの大きさを超えている');
     }
     assert.ok(!queryInputs.some((input) => input.includes(tailMarker)), '上限件数より後ろの区切りを検索に使っている');
-    assert.ok(queryInputs[0] !== undefined && questionText.startsWith(queryInputs[0]), '先頭から連続した区切りを使っていない');
+    // 区切りごとの埋め込みは並行に送るため、到着順には依存しない。
+    assert.ok(queryInputs.some((input) => questionText.startsWith(input)), '入力の先頭の区切りを検索に使っていない');
+    assert.ok(queryInputs.every((input) => questionText.includes(input)), '入力にない文を検索に使っている');
     const result = await readStoredResult(pool, seeded.requestId);
     assert.ok(
       (result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'question_truncated'),
