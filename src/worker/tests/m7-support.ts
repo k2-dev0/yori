@@ -44,9 +44,11 @@ export function basisVector(index: number, value = 1): number[] {
 }
 
 // 第1軸との類似度がrankに従って下がるvector。rankが小さいほど距離が近い。
+// 質問（第1軸）とのcosine類似度が約0.81になる別軸を持たせる。推定継続の採用条件（代表根拠の類似度×0.8以上）は満たし、
+// 内容の重複として畳む閾値（0.82）には届かないので、第1軸そのものの代表根拠とは別々の候補として扱われる。
 export function similarityVector(rank: number): number[] {
-  const vector = basisVector(0, 1);
-  vector[1] = rank * 0.01;
+  const vector = basisVector(0, 1 - rank * 0.005);
+  vector[200 + rank] = 0.72;
   return vector;
 }
 
