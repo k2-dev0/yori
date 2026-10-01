@@ -290,7 +290,7 @@ function fitPart(
   let priorSearchOmitted = priorSearch !== undefined;
   const build = (): FitResult => {
     const candidates = included.map((prior) => ({ messageId: prior.messageId, revision: prior.revision }));
-    const questions = buildQuestions(part, included.map((prior) => prior.messageId), priorSearchState !== null);
+    const questions = buildQuestions(part, included.map((prior) => prior.messageId), priorSearchState !== null, target.role === 'assistant');
     const state = makeState(target, part, included, priorSearchState, {
       priorMessages: priorMessages.length - included.length,
       splitCurrent,
@@ -352,7 +352,7 @@ function splitCurrentText(target: JobTarget, config: WorkerConfig): JevStatePart
 function maxFittingEnd(target: JobTarget, text: string, offset: number, config: WorkerConfig): number {
   const fits = (end: number): boolean => {
     const part: JevStatePart = { offset, length: end - offset, text: text.slice(offset, end) };
-    const questions = buildQuestions(part, [], false);
+    const questions = buildQuestions(part, [], false, target.role === 'assistant');
     const state = makeState(target, part, [], null, { priorMessages: 0, splitCurrent: true, priorSearch: false });
     return Buffer.byteLength(serializeRequest(buildRequest(config.model, state, questions)), 'utf8') <= config.inputBudgetBytes;
   };
