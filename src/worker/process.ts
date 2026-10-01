@@ -1,3 +1,5 @@
+import { splitQuestionIntoChunks } from './question.js';
+import { loadVoyageTokenizer } from './tokenizer.js';
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
@@ -672,7 +674,10 @@ async function prewarmQueryEmbedding(pool: Pool, target: JobTarget, config: Work
       return;
     }
     const generation = await loadPinnedGeneration(pool, { companyId: target.companyId, generationId }, config);
-    await new VoyageEmbeddingProvider(pool, config).embedQuery(target.text, generation);
+    // 検索本体と同じ区切り方で作る。全文1本の埋め込みは検索で使われない。
+    const provider = new VoyageEmbeddingProvider(pool, config);
+    const { chunks } = splitQuestionIntoChunks(await loadVoyageTokenizer(), target.text);
+    await Promise.all(chunks.map((chunk) => provider.embedQuery(chunk, generation)));
   } catch {
     // 先行実行は最適化に限る。
   }
