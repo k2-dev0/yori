@@ -34,10 +34,10 @@ interface CentralApiOptions {
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 // tool入力の型は./schema.tsのZod schemaから推論し、handler引数とcentral clientの要求を一致させる。
-export type SearchHistoryInput = z.infer<typeof searchHistoryInputSchema>;
-export type GetSearchResultInput = z.infer<typeof getSearchResultInputSchema>;
-export type GetEvidenceInput = z.infer<typeof getEvidenceInputSchema>;
-export type LinkSessionInput = z.infer<typeof linkSessionInputSchema>;
+export type SearchHistoryInput = z.infer<typeof searchHistoryInputSchema> & { project_id: string };
+export type GetSearchResultInput = z.infer<typeof getSearchResultInputSchema> & { project_id: string };
+export type GetEvidenceInput = z.infer<typeof getEvidenceInputSchema> & { project_id: string };
+export type LinkSessionInput = z.infer<typeof linkSessionInputSchema> & { project_id: string };
 
 export interface RecordCaseEvent {
   idempotency_key: string;
