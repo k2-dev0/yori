@@ -96,6 +96,8 @@ interface Candidate {
   retrievalKinds: RetrievalKind[];
   // source messageの分類済みstatement_statusから決めた候補の報告状態。Jevへは質問しない。
   statementStatus: CandidateStatementStatus;
+  // sourceに、過去会話の検索結果を伝えただけと分類された発言を含む。一次情報より後ろへ回す。
+  relayedHistory: boolean;
   sources: CandidateSource[];
 }
 
@@ -235,7 +237,7 @@ const STRATEGY_CANDIDATES_SQL = `
 // sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
-         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, a.statement_status
+         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, a.statement_status, a.information_source
     FROM search_document_sources s
     JOIN messages m ON m.id = s.message_id
     LEFT JOIN message_analysis a
@@ -279,6 +281,7 @@ function mergeRoutes(routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly
         entityMatched: false,
         retrievalKinds: [],
         statementStatus: 'unknown',
+        relayedHistory: false,
         sources: [],
       };
       candidate.rrfScore += 1 / (SEARCH_RRF_RANK_CONSTANT + index + 1);
@@ -441,7 +444,7 @@ async function loadCandidates(
     ]);
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
-      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null }>(
+      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; information_source: string | null }>(
         CANDIDATE_SOURCES_SQL,
         [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision), WORKER_POLICY_VERSION],
       );
@@ -449,6 +452,7 @@ async function loadCandidates(
         const candidate = candidates.get(`${row.document_id}:${row.document_revision}`);
         if (candidate !== undefined) {
           candidate.statementStatus = strongerStatus(candidate.statementStatus, row.statement_status);
+          candidate.relayedHistory ||= row.information_source === 'relayed_history';
         }
         candidate?.sources.push({
           message_id: row.message_id,
@@ -474,7 +478,11 @@ async function loadCandidates(
       ],
     );
     await client.query('COMMIT');
-    return [...candidates.values()].sort((left, right) => right.rrfScore - left.rrfScore || compareCandidates(left, right));
+    // 伝聞の候補を上限件数で切る前に後ろへ回し、一次情報を候補から押し出させない。除外はせず、他に候補がなければ残す。
+    return [...candidates.values()].sort(
+      (left, right) =>
+        Number(left.relayedHistory) - Number(right.relayedHistory) || right.rrfScore - left.rrfScore || compareCandidates(left, right),
+    );
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
@@ -699,7 +707,7 @@ function latestSourceTime(candidate: Candidate): number {
   return latest;
 }
 
-// relevanceを最優先し、同じrelevanceでは確定度・既知status内の新しさ・RRFの順にする。
+// relevanceを最優先し、同じrelevanceでは一次情報を伝聞より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
 // status不明同士は新しさで推測せず、従来のRRF・document ID順を維持する。
 function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAssessment[] {
   return assessments
@@ -708,6 +716,10 @@ function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAss
       const relevance = RELEVANCE_ORDER[right.relevance] - RELEVANCE_ORDER[left.relevance];
       if (relevance !== 0) {
         return relevance;
+      }
+      const relayed = Number(left.candidate.relayedHistory) - Number(right.candidate.relayedHistory);
+      if (relayed !== 0) {
+        return relayed;
       }
       const entityMatch = Number(right.candidate.entityMatched) - Number(left.candidate.entityMatched);
       if (entityMatch !== 0) {
