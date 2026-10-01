@@ -22,7 +22,7 @@ import {
 } from '../contract.js';
 import { ensureActiveGeneration } from '../embedding.js';
 import { loadProjectMetrics } from '../metrics.js';
-import { seedMessage, seedSession } from './support.js';
+import { seedMessage, seedSearchRequest, seedSession } from './support.js';
 import {
   basisVector,
   runExecuteSearch,
@@ -365,6 +365,7 @@ describe('worker:ann-recall', () => {
   const CACHED_QUERY_COUNT = 5;
   const REQUESTED_SAMPLES = 3;
   const CONTENT_MARKER = 'ANN-RECALL-SECRET';
+  const QUERY_MARKER = 'ANN-RECALL-QUESTION';
 
   async function seedRecallFixture(): Promise<string> {
     const generationId = await activeGenerationId();
@@ -381,19 +382,53 @@ describe('worker:ann-recall', () => {
         sources: [],
       });
     }
-    // 質問ベクトルは既存のcacheだけを使う。document用のcacheは質問として使わない。
-    for (let index = 1; index <= CACHED_QUERY_COUNT; index += 1) {
-      await pool.query(
-        `INSERT INTO embedding_cache (id, company_id, generation_id, operation, input_hash, embedding, model, dimensions)
-         VALUES ($1, $2, $3, 'query', $4, $5::vector, $6, $7)`,
-        [uuidv7(), workspace.companyId, generationId, sha256Bytes(`ann-recall-query-${index}`), toVectorLiteral(basisVector(0, index)), VOYAGE_MODEL, VOYAGE_DIMENSIONS],
-      );
-    }
     return generationId;
   }
 
+  async function insertQueryCache(generationId: string, text: string, vector: readonly number[]): Promise<void> {
+    await pool.query(
+      `INSERT INTO embedding_cache (id, company_id, generation_id, operation, input_hash, embedding, model, dimensions)
+       VALUES ($1, $2, $3, 'query', $4, $5::vector, $6, $7)`,
+      [uuidv7(), workspace.companyId, generationId, sha256Bytes(text), toVectorLiteral(vector), VOYAGE_MODEL, VOYAGE_DIMENSIONS],
+    );
+  }
+
+  // 案件の過去の検索要求と、その質問のcache済みベクトルを作る。manualは受付の質問、autoは入力発言が質問になる。
+  async function seedCachedSearch(
+    generationId: string,
+    input: { text: string; vector: readonly number[]; question?: string; sessionId?: string; sequenceNo?: number },
+  ): Promise<void> {
+    const sessionId = input.sessionId ?? (await seedSession(pool, workspace));
+    const sequenceNo = input.sequenceNo ?? 1;
+    const message = await seedMessage(pool, { sessionId, sequenceNo, role: 'user', text: input.text });
+    const requestId = await seedSearchRequest(pool, {
+      workspace,
+      sessionId,
+      inputId: message.messageId,
+      inputRevision: message.revision,
+      sequenceNo,
+      trigger: input.question === undefined ? 'auto' : 'manual',
+      question: input.question,
+      searchAction: 'new_search',
+      status: 'completed',
+    });
+    await pool.query('UPDATE search_requests SET embedding_generation_id = $2 WHERE id = $1', [requestId, generationId]);
+    await insertQueryCache(generationId, input.question ?? input.text, input.vector);
+  }
+
+  async function seedCachedSearches(generationId: string): Promise<void> {
+    for (let index = 1; index < CACHED_QUERY_COUNT; index += 1) {
+      await seedCachedSearch(generationId, { text: `${QUERY_MARKER}-${index}`, vector: basisVector(0, index) });
+    }
+    await seedCachedSearch(generationId, {
+      text: `${QUERY_MARKER}-INPUT`,
+      question: `${QUERY_MARKER}-MANUAL`,
+      vector: basisVector(0, CACHED_QUERY_COUNT),
+    });
+  }
+
   it('索引がない世代では固定のエラーコードで終了する', { timeout: 60_000 }, async () => {
-    await seedRecallFixture();
+    await seedCachedSearches(await seedRecallFixture());
     const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
     assert.equal(result.code, 1);
     assert.equal(result.stderr.trim(), 'worker: ann_index_not_found');
@@ -402,12 +437,14 @@ describe('worker:ann-recall', () => {
 
   it('同じデータで厳密と近似を実行し、本文を含まない指標をJSONで返す', { timeout: 60_000 }, async () => {
     const generationId = await seedRecallFixture();
+    await seedCachedSearches(generationId);
     assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
 
     const result = await runCliProcess(['ann-recall', '--project', workspace.projectId, '--samples', String(REQUESTED_SAMPLES)]);
     assert.equal(result.code, 0, `ann-recallが失敗した: ${result.stderr}`);
     assert.ok(!result.stdout.includes(CONTENT_MARKER), 'stdoutへ本文を含めた');
     assert.ok(!result.stderr.includes(CONTENT_MARKER), 'stderrへ本文を含めた');
+    assert.ok(!result.stdout.includes(QUERY_MARKER) && !result.stderr.includes(QUERY_MARKER), '質問を出力した');
     const report = JSON.parse(result.stdout) as {
       project_id: string;
       generation_id: string;
@@ -441,13 +478,51 @@ describe('worker:ann-recall', () => {
     assert.equal(report.settings.index_name, `document_embeddings_hnsw_${generationId.replaceAll('-', '')}`);
   });
 
-  it('質問ベクトルのcacheがなければVoyageを呼ばず固定のエラーコードで終了する', { timeout: 60_000 }, async () => {
+  it('manual検索は受付の質問、autoは入力発言のcacheを質問ベクトルに使う', { timeout: 60_000 }, async () => {
     const generationId = await seedRecallFixture();
-    await pool.query('DELETE FROM embedding_cache WHERE generation_id = $1', [generationId]);
+    await seedCachedSearches(generationId);
+    assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
+    const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
+    assert.equal(result.code, 0, `ann-recallが失敗した: ${result.stderr}`);
+    assert.equal((JSON.parse(result.stdout) as { samples: number }).samples, CACHED_QUERY_COUNT);
+  });
+
+  it('この案件の検索要求に結び付かないcacheは使わず、固定のエラーコードで終了する', { timeout: 60_000 }, async () => {
+    const generationId = await seedRecallFixture();
+    // 同じ会社・世代の質問cacheだが、この案件の検索要求の質問ではない。
+    await insertQueryCache(generationId, `${QUERY_MARKER}-OTHER-PROJECT`, basisVector(0, 1));
     assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
     const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
     assert.equal(result.code, 1);
     assert.equal(result.stderr.trim(), 'worker: ann_recall_no_samples');
+  });
+
+  it('検索元sessionの質問以降の発言を含む文書を、本番の検索と同じく比較対象から除く', { timeout: 60_000 }, async () => {
+    const generationId = await activeGenerationId();
+    const sessionId = await seedSession(pool, workspace);
+    const questionSequenceNo = 1;
+    // 全ての文書が、検索元sessionの質問より後の発言をsourceに持つ。
+    for (let rank = 1; rank <= DOCUMENT_COUNT; rank += 1) {
+      const text = `${CONTENT_MARKER}-AFTER-QUESTION-${rank}`;
+      const answer = await seedMessage(pool, { sessionId, sequenceNo: questionSequenceNo + rank, role: 'assistant', text });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId,
+        documentKey: `ann-recall-after-question-${rank}`,
+        content: text,
+        generationId,
+        embedding: similarityVector(rank),
+        sources: [{ messageId: answer.messageId, messageRevision: answer.revision, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    await seedCachedSearch(generationId, { text: `${QUERY_MARKER}-SELF`, vector: basisVector(0, 1), sessionId, sequenceNo: questionSequenceNo });
+    assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
+
+    // 全ての文書が除外されるため、比較できるsampleが残らない。
+    const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr.trim(), 'worker: ann_recall_no_documents');
   });
 
   it('不正な引数を拒否する', async () => {
