@@ -35,6 +35,9 @@ import {
   WORKER_POLICY_VERSION,
   type JevRequest,
   SEARCH_CANDIDATE_LIMIT,
+  SEARCH_QUESTION_CHUNK_LIMIT,
+  CHUNK_TARGET_TOKENS,
+  CHUNK_MAX_TOKENS,
 } from '../contract.js';
 import { ensureActiveGeneration } from '../embedding.js';
 import { processJob, retryJob } from '../process.js';
@@ -1533,25 +1536,25 @@ describe('M5 順位統合とJev投入量', () => {
     );
   });
 
-  it('現在質問だけで8,000 tokenを使い切る場合はinput_budget_exceededの恒久failedにし、no_matchにしない', async () => {
+  it('8,000 tokenを超える入力でも失敗にせず、先頭から上限件数の区切りだけで検索して警告を残す', async () => {
     const queryVector = basisVector(0, 1);
-    const { jev, config } = await startProviders(pool, workspace.companyId, {
+    const { voyage, config } = await startProviders(pool, workspace.companyId, {
       jevMode: 'direct',
       voyageResponder: vectorQueryResponder(queryVector),
     });
     const tokenizer = await loadVoyageTokenizer();
-    // 既存fixtureの語列長では8,000 tokenを1回で作れないため、予算を使い切る長さへ連結する。
-    const questionText = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 100)}`;
+    const tailMarker = 'TAIL-ONLY-MARKER';
+    const questionText = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 100)} ${tailMarker}`;
     assert.ok(tokenizer.encode(questionText).ids.length >= 8_000, '8,000 token以上の質問fixtureを作れない');
     const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const sessionA = await seedSession(pool, workspace);
-    const text = 'INPUT-BUDGET-CANDIDATE 候補本文';
+    const text = 'LONG-INPUT-CANDIDATE 候補本文';
     const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
     await seedReadyDocument(pool, {
       companyId: workspace.companyId,
       projectId: workspace.projectId,
       sessionId: sessionA,
-      documentKey: 'input-budget-candidate',
+      documentKey: 'long-input-candidate',
       content: text,
       generationId: generation.id,
       embedding: queryVector,
@@ -1561,15 +1564,121 @@ describe('M5 順位統合とJev投入量', () => {
     const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
     await runExecuteSearch(pool, { jobId: seeded.jobId, config });
 
-    const job = await readJob(pool, seeded.jobId);
-    assert.equal(job.status, 'failed');
-    assert.equal(job.error_code, 'input_budget_exceeded');
+    assert.equal((await readJob(pool, seeded.jobId)).status, 'completed', '長い入力の検索jobを完了していない');
     const request = await readSearchRequest(pool, seeded.requestId);
-    assert.equal(request.status, 'failed');
-    assert.equal(request.error_code, 'input_budget_exceeded');
-    assert.notEqual(request.outcome, 'no_match');
-    assert.equal(request.result, null);
-    assert.equal(jev.requests.length, 0, '質問だけで予算超過なのにJevへ送信した');
+    assert.equal(request.status, 'completed', '長い入力の検索を失敗にしている');
+    assert.equal(request.outcome, 'matched');
+    const queryInputs = voyage.requests.filter((item) => item.body.input_type === 'query').flatMap((item) => item.body.input ?? []);
+    assert.equal(queryInputs.length, SEARCH_QUESTION_CHUNK_LIMIT, '区切りの上限件数で検索していない');
+    for (const input of queryInputs) {
+      assert.ok(tokenizer.encode(input).ids.length <= CHUNK_TARGET_TOKENS, '区切りが保存側の区切りの大きさを超えている');
+    }
+    assert.ok(!queryInputs.some((input) => input.includes(tailMarker)), '上限件数より後ろの区切りを検索に使っている');
+    assert.ok(queryInputs[0] !== undefined && questionText.startsWith(queryInputs[0]), '先頭から連続した区切りを使っていない');
+    const result = await readStoredResult(pool, seeded.requestId);
+    assert.ok(
+      (result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'question_truncated'),
+      '入力の一部だけで検索したことを警告に残していない',
+    );
+  });
+
+  it('入力の途中の区切りにだけ一致する過去発言を候補にし、その区切りを質問にして判定する', async () => {
+    const middleMarker = 'MIDDLE-TOPIC-MARKER';
+    const select: JevChoiceSelector = (question, request) => {
+      const field = question.id.split(':')[0] ?? question.id;
+      const candidate = request.state.candidates?.find((item) => question.instructions.includes(`candidate_id=${item.candidate_id}`));
+      const current = request.state.current.parts[0]?.text ?? '';
+      if (field === 'candidate_relevance') {
+        // 候補を引いた区切りが質問として渡った時だけ関連ありにする。先頭の区切りや全文では判定できない条件にする。
+        return candidate?.text.includes('MID-DOC') === true && current.includes(middleMarker) ? 'direct' : 'unrelated';
+      }
+      return Object.keys(question.criteria).includes('yes') ? 'yes' : undefined;
+    };
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: (request) => ({
+        body: voyageBody(request.input ?? [], (text, index) => {
+          if (request.input_type !== 'query') {
+            return defaultVector(index);
+          }
+          return text.includes(middleMarker) ? basisVector(1, 1) : basisVector(0, 1);
+        }),
+      }),
+    });
+    const tokenizer = await loadVoyageTokenizer();
+    const questionText = `${exactTokenText(tokenizer, 1_700)} ${middleMarker} ${exactTokenText(tokenizer, 500)}`;
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const messageIds = new Map<string, string>();
+    for (const [index, fixture] of [
+      { marker: 'HEAD-DOC', embedding: basisVector(0, 1) },
+      { marker: 'MID-DOC', embedding: basisVector(1, 1) },
+    ].entries()) {
+      const text = `${fixture.marker} 候補本文`;
+      const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: index + 1, role: 'assistant', text });
+      messageIds.set(fixture.marker, message.messageId);
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `question-chunk-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: fixture.embedding,
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.ok(evidenceIds.includes(messageIds.get('MID-DOC') as string), '途中の区切りにだけ一致する候補を根拠にしていない');
+    const judged = jev.requests.find((item) => (item.body.state.candidates ?? []).some((candidate) => candidate.text.includes('MID-DOC')));
+    const judgedQuestion = judged?.body.state.current.parts[0]?.text ?? '';
+    assert.ok(judgedQuestion.includes(middleMarker), '候補を引いた区切りを判定の質問にしていない');
+    assert.ok(judgedQuestion.length < questionText.length, '判定の質問へ入力の全文を渡している');
+    assert.ok(tokenizer.encode(judgedQuestion).ids.length <= CHUNK_TARGET_TOKENS, '判定の質問が区切りの大きさを超えている');
+  });
+
+  it('区切る長さ以下の入力は1回で検索し、判定の質問は原文のままで警告も付けない', async () => {
+    const queryVector = basisVector(0, 1);
+    const { jev, voyage, config } = await startProviders(pool, workspace.companyId, {
+      jevMode: 'direct',
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const tokenizer = await loadVoyageTokenizer();
+    const questionText = exactTokenText(tokenizer, CHUNK_MAX_TOKENS);
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const text = 'SHORT-INPUT-CANDIDATE 候補本文';
+    const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sessionA,
+      documentKey: 'short-input-candidate',
+      content: text,
+      generationId: generation.id,
+      embedding: queryVector,
+      sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+    });
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: questionText });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const queryInputs = voyage.requests.filter((item) => item.body.input_type === 'query').flatMap((item) => item.body.input ?? []);
+    assert.deepEqual(queryInputs, [questionText], '区切る長さ以下の入力を区切って検索している');
+    assert.ok(jev.requests.length > 0, '候補を判定していない');
+    for (const item of jev.requests) {
+      assert.equal(item.body.state.current.parts[0]?.text, questionText, '判定の質問が原文でない');
+    }
+    const result = await readStoredResult(pool, seeded.requestId);
+    assert.ok(
+      !(result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'question_truncated'),
+      '区切っていない入力へ警告を付けている',
+    );
   });
 
   it('候補が存在しても全件が質問込みtoken予算に収まらない場合はinput_budget_exceededにする', async () => {
@@ -1579,13 +1688,14 @@ describe('M5 順位統合とJev投入量', () => {
       voyageResponder: vectorQueryResponder(queryVector),
     });
     const tokenizer = await loadVoyageTokenizer();
-    const questionText = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 3_500)}`;
-    const questionTokens = tokenizer.encode(questionText).ids.length;
-    assert.ok(questionTokens < 8_000 && questionTokens > 7_000, `質問単独で予算を使い切らないfixtureにできない: ${questionTokens}`);
+    // 質問は区切られて短くなるため、候補本文の側を予算より大きくして全件除外を作る。
+    const questionText = '全候補が予算に収まらない質問';
+    const oversizedContent = `${exactTokenText(tokenizer, 4_000)} ${exactTokenText(tokenizer, 4_000)}`;
+    assert.ok(tokenizer.encode(oversizedContent).ids.length > 7_900, '予算を超える候補fixtureを作れない');
     const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
     const sessionA = await seedSession(pool, workspace);
     for (const [index, marker] of ['ALLOC-ONE', 'ALLOC-TWO'].entries()) {
-      const text = `${marker} ${exactTokenText(tokenizer, 800)}`;
+      const text = `${marker} ${oversizedContent}`;
       const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: index + 1, role: 'assistant', text: `全候補除外-${index + 1}` });
       await seedReadyDocument(pool, {
         companyId: workspace.companyId,
