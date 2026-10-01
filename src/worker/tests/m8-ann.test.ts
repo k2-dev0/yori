@@ -333,6 +333,17 @@ describe('worker:ann-index', () => {
     assert.notEqual(await runCli(['ann-index', 'drop', '--generation', generationId], env), 0, '存在しない索引の削除が成功した');
   });
 
+  it('作成時に所要時間と索引サイズを出力する', { timeout: 60_000 }, async () => {
+    const generationId = await activeGenerationId();
+    const created = await runCliProcess(['ann-index', 'create', '--generation', generationId]);
+    assert.equal(created.code, 0, `索引を作成できない: ${created.stderr}`);
+    const measured = /^worker: created duration_ms=(\d+) index_bytes=(\d+)\n$/.exec(created.stdout);
+    assert.ok(measured, `所要時間と索引サイズがない: ${created.stdout}`);
+    assert.ok(Number(measured[2]) > 0, '索引サイズが0');
+    const repeated = await runCliProcess(['ann-index', 'create', '--generation', generationId]);
+    assert.equal(repeated.stdout, 'worker: already_exists\n', '作成していないのに実測値を出力した');
+  });
+
   it('存在しない世代・不正な引数を拒否し、索引を作らない', { timeout: 30_000 }, async () => {
     const env = workerEnv();
     const missingGenerationId = uuidv7();
@@ -353,6 +364,16 @@ describe('worker:ann-index', () => {
     assert.equal(await runCli(['generation:delete', generationId], env), 0, '世代を削除できない');
     assert.equal(await readAnnIndex(generationId), undefined, '削除した世代の索引が残っている');
     assert.ok(await readAnnIndex(keptGenerationId), '別世代の索引まで消した');
+
+    // 世代は削除済みで索引だけ残った状態（索引の削除だけ失敗した後）は、同じ削除の再実行で直る。
+    const orphanGenerationId = uuidv7();
+    await pool.query(
+      `CREATE INDEX document_embeddings_hnsw_${orphanGenerationId.replaceAll('-', '')} ON document_embeddings
+         USING hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops) WHERE generation_id = '${orphanGenerationId}'`,
+    );
+    assert.equal(await runCli(['generation:delete', orphanGenerationId], env), 0, '残った索引を再実行で消せない');
+    assert.equal(await readAnnIndex(orphanGenerationId), undefined, '世代のない索引が残っている');
+    assert.notEqual(await runCli(['generation:delete', orphanGenerationId], env), 0, '世代も索引もないのに成功した');
 
     // 参照があり削除を拒否された世代の索引は残す。
     assert.notEqual(await runCli(['generation:delete', keptGenerationId], env), 0);
@@ -448,7 +469,9 @@ describe('worker:ann-recall', () => {
     const report = JSON.parse(result.stdout) as {
       project_id: string;
       generation_id: string;
+      requested_samples: number;
       samples: number;
+      skipped_samples: number;
       recall: { mean: number; min: number };
       exact_duration_ms: { p50: number; p95: number };
       approximate_duration_ms: { p50: number; p95: number };
@@ -460,12 +483,16 @@ describe('worker:ann-recall', () => {
       'generation_id',
       'project_id',
       'recall',
+      'requested_samples',
       'samples',
       'settings',
+      'skipped_samples',
     ]);
     assert.equal(report.project_id, workspace.projectId);
     assert.equal(report.generation_id, generationId);
+    assert.equal(report.requested_samples, REQUESTED_SAMPLES);
     assert.equal(report.samples, REQUESTED_SAMPLES);
+    assert.equal(report.skipped_samples, 0);
     // 距離が全て異なる少数の文書では、近似検索は厳密検索の上位を取りこぼさない。
     assert.equal(report.recall.mean, 1);
     assert.equal(report.recall.min, 1);
@@ -484,7 +511,34 @@ describe('worker:ann-recall', () => {
     assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
     const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
     assert.equal(result.code, 0, `ann-recallが失敗した: ${result.stderr}`);
-    assert.equal((JSON.parse(result.stdout) as { samples: number }).samples, CACHED_QUERY_COUNT);
+    // 既定の50件を要求しても使える質問は5件しかない。不足が出力から分かる。
+    const report = JSON.parse(result.stdout) as { requested_samples: number; samples: number; skipped_samples: number };
+    assert.equal(report.samples, CACHED_QUERY_COUNT);
+    assert.ok(report.requested_samples > report.samples, '要求件数に対する不足が出力から分からない');
+    assert.equal(report.skipped_samples, 0);
+  });
+
+  it('厳密検索の結果が空の質問は比べず、除いた件数を出力する', { timeout: 60_000 }, async () => {
+    const generationId = await seedRecallFixture();
+    await seedCachedSearches(generationId);
+    // この質問のsessionは、質問より後の発言を全ての文書のsourceに持つ。全ての文書が除外され、比べられない。
+    const selfSession = await seedSession(pool, workspace);
+    const answer = await seedMessage(pool, { sessionId: selfSession, sequenceNo: 2, role: 'assistant', text: `${CONTENT_MARKER}-SELF-ANSWER` });
+    await pool.query(
+      `INSERT INTO search_document_sources
+         (id, document_id, document_revision, message_id, message_revision, start_offset, end_offset, display_order, source_kind)
+       SELECT gen_random_uuid(), d.id, d.desired_revision, $2, $3, 0, 1, 0, 'original'
+         FROM search_documents d WHERE d.project_id = $1`,
+      [workspace.projectId, answer.messageId, answer.revision],
+    );
+    await seedCachedSearch(generationId, { text: `${QUERY_MARKER}-SELF`, vector: basisVector(0, 1), sessionId: selfSession, sequenceNo: 1 });
+    assert.equal(await runCli(['ann-index', 'create', '--generation', generationId], workerEnv()), 0);
+
+    const result = await runCliProcess(['ann-recall', '--project', workspace.projectId]);
+    assert.equal(result.code, 0, `ann-recallが失敗した: ${result.stderr}`);
+    const report = JSON.parse(result.stdout) as { samples: number; skipped_samples: number };
+    assert.equal(report.samples, CACHED_QUERY_COUNT);
+    assert.equal(report.skipped_samples, 1);
   });
 
   it('この案件の検索要求に結び付かないcacheは使わず、固定のエラーコードで終了する', { timeout: 60_000 }, async () => {
