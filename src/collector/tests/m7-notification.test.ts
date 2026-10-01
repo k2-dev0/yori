@@ -20,6 +20,9 @@ import {
   type CollectorFixture,
 } from './support.js';
 
+// 通知へ載せる根拠本文の抜粋の長さ（Unicodeコードポイント）。production側の定数と同じ値を契約として固定する。
+const EVIDENCE_EXCERPT_LENGTH = 400;
+
 // M7補助通知（docs/m7-design.md 補助通知）のRedテスト。
 // 正本は通知用command名を固定していないため、最小の新command名 `notify` を要求する。
 // collect処理の実行後に、その呼出しで確定した最新user message identityでGET /v1/searches/by-inputを
@@ -611,6 +614,36 @@ describe('M7 collector補助通知', () => {
             `根拠行にmessage_idとrevisionがない: ${context}`,
           );
           assert.ok(!result.stdout.includes('token-a'), 'tokenを出力している');
+        });
+      },
+    );
+  });
+
+  it('matched通知の根拠本文は先頭の抜粋だけにし、続きはmessage_idとrevisionで原文取得へ委ねる', async () => {
+    const evidenceMessageId = uuidv7();
+    const excerpt = 'あ'.repeat(EVIDENCE_EXCERPT_LENGTH);
+    const responseBody = searchView();
+    const match = (responseBody.matches as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    match.evidence = [
+      {
+        message_id: evidenceMessageId,
+        revision: 1,
+        employee_id: uuidv7(),
+        role: 'assistant',
+        occurred_at: '2026-09-21T01:00:00.000Z',
+        text: `${excerpt}M7-BEYOND-EXCERPT 抜粋より後ろの本文`,
+      },
+    ];
+
+    await withCentral(
+      () => ({ status: 200, body: responseBody }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          const context = hookContext(result.stdout);
+          assert.ok(context.includes(`- [message_id=${evidenceMessageId} revision=1] ${excerpt}`), `根拠の抜粋がない: ${context}`);
+          assert.ok(!context.includes('M7-BEYOND-EXCERPT'), '抜粋の長さを超えた本文を通知へ載せている');
         });
       },
     );
