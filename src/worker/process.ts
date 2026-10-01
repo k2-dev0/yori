@@ -49,6 +49,7 @@ import {
 } from './documents.js';
 import { ensureActiveGeneration, loadPinnedGeneration, VoyageEmbeddingProvider } from './embedding.js';
 import { processExecuteSearch, searchRequestIdFromPayload } from './search.js';
+import { enqueueContinuityJudgment, processJudgeContinuity } from './continuity.js';
 import { GenerationMismatchError, LeaseLostError, PolicyBlockedError, StaleApplyError, TargetMissingError } from './errors.js';
 import { VoyageCallError } from './voyage.js';
 import { hasActiveProviderApproval } from './approvals.js';
@@ -595,6 +596,8 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     }
     return;
   }
+  // session継続のバックグラウンド判定をsessionごとに1件だけ遅延登録する。検索時のJev判定を不要にする。
+  await enqueueContinuityJudgment(pool, target);
   // 文書planの制限的変更（publication削除・is_searchable・revision状態）は、世代spec検証より先に
   // 外部HTTP前のTXで反映する。世代不一致・retired/failedでも除外対象を残さない。
   const { chunks, snapshot, checkpoint } = await loadDocumentBuildPlan(pool, target.sessionId);
@@ -842,6 +845,10 @@ export async function processJob(pool: Pool, job: ClaimedJob, config: WorkerConf
     }
     if (job.kind === 'execute_search') {
       await processExecuteSearch(pool, job, config);
+      return;
+    }
+    if (job.kind === 'judge_continuity') {
+      await processJudgeContinuity(pool, job, config);
       return;
     }
     throw new TargetMissingError('未対応のjob種別です');
