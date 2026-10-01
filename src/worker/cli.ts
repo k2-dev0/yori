@@ -208,10 +208,11 @@ async function runGenerationDelete(env: NodeJS.ProcessEnv, generationId: string 
   const pool = createPool(databaseUrl);
   try {
     const result = await deleteGeneration(pool, generationId);
-    if (result !== 'deleted') {
+    // 世代は削除済みで索引だけ残っていた場合の再実行。残った索引を消せたら成功として扱う。
+    if (result !== 'deleted' && result !== 'ann_index_dropped') {
       return fail(result);
     }
-    process.stdout.write('worker: deleted\n');
+    process.stdout.write(`worker: ${result}\n`);
     return 0;
   } finally {
     await pool.end();
@@ -271,14 +272,21 @@ async function runAnnIndex(env: NodeJS.ProcessEnv, args: string[]): Promise<numb
   }
   const pool = createPool(databaseUrl);
   try {
-    const result = action === 'create' ? await createAnnIndex(pool, generationId) : await dropAnnIndex(pool, generationId);
-    if (result === 'generation_not_found' || result === 'ann_index_busy') {
-      return fail(result);
+    if (action === 'drop') {
+      const dropped = await dropAnnIndex(pool, generationId);
+      if (dropped === 'not_found') {
+        return fail('ann_index_not_found');
+      }
+      process.stdout.write(`worker: ${dropped}\n`);
+      return 0;
     }
-    if (result === 'not_found') {
-      return fail('ann_index_not_found');
+    const created = await createAnnIndex(pool, generationId);
+    if (created.status === 'generation_not_found' || created.status === 'ann_index_busy') {
+      return fail(created.status);
     }
-    process.stdout.write(`worker: ${result}\n`);
+    // 次の索引作成の見積もりに使えるよう、作成時は所要時間と索引サイズも出す。
+    const measured = created.status === 'created' ? ` duration_ms=${created.durationMs} index_bytes=${created.indexBytes}` : '';
+    process.stdout.write(`worker: ${created.status}${measured}\n`);
     return 0;
   } finally {
     await pool.end();
