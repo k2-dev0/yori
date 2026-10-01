@@ -60,6 +60,65 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 
 本文、質問、検索条件、API key、provider credentialは返さない。
 
+## 近似索引（HNSW）導入の準備
+
+2026-10-01追記。候補検索のvector経路は案件内の全文書を総当たりする厳密検索で、文書数に比例して遅くなる。将来、世代ごとの部分HNSW索引へ切り替えるための判断材料だけを用意する。本番の検索経路（`VECTOR_CANDIDATES_SQL`）は変更せず、近似索引への自動切替もしない。再索引への索引作成の組み込みは次の段階で行う。
+
+### 切替基準
+
+`0017_vector_duration.sql`で`search_duration_samples.vector_duration_ms`（NULL可）を追加し、`loadCandidates`がvector経路のqueryだけの所要時間を記録する。既存の`duration_ms`はvector・entity・strategyの合計のまま変えない。列追加前のsampleはNULLで、判定に使わない。
+
+`worker:metrics`の出力へ`ann_recommendation`を追加する。形式は`{ recommended, reasons, thresholds, observed }`。次のどちらかを満たすと`recommended=true`になる。
+
+| 条件 | reason | しきい値 |
+|---|---|---|
+| 直近のsampleが50件以上あり、`vector_duration_ms`のp95が100ミリ秒を超える | `vector_p95_exceeded` | `min_samples=50`、`vector_p95_ms=100` |
+| active世代で検索対象として公開されている文書が20,000件を超える | `document_count_exceeded` | `documents=20000` |
+
+- 「直近」は、案件のactive世代でvector経路の時間を記録済みのsampleを新しい順に200件まで（`sample_window=200`）。
+- sampleが50件未満なら`reasons`へ`insufficient_samples`を入れ、時間の条件は評価しない。文書数の条件は独立しており、sample不足でも文書数が超えていれば推奨する。
+- しきい値は`src/worker/metrics.ts`の名前付き定数で、暫定値である。最終調整は実測後に行う。
+- 本文・質問・検索条件・credentialは返さない。
+
+### 索引の作成・削除
+
+管理者が明示実行するコマンドだけが索引を作る。workerや再索引は自動では作らない。M8の「runtime DDLを行わない」は通常の実行経路についての方針で、この管理コマンドだけを例外とする。
+
+```
+npm run worker:ann-index -- create --generation <generation-uuid>
+npm run worker:ann-index -- drop --generation <generation-uuid>
+```
+
+- 索引名は`document_embeddings_hnsw_<ハイフンを除いた世代UUID>`。
+- 作成は`CREATE INDEX CONCURRENTLY ... USING hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops) WHERE generation_id = '<id>'`。構築中も検索と書き込みを止めない。
+- `CONCURRENTLY`は失敗・中断でINVALIDな索引を残す。`create`の再実行はINVALIDな残骸を削除して作り直し、有効な索引があれば`already_exists`で成功する。同じ索引の同時作成はadvisory lockで拒否する（`ann_index_busy`）。
+- 存在しない世代は`generation_not_found`、存在しない索引の削除は`ann_index_not_found`で終了する。
+- `worker:generation-delete`は、世代の削除と同じTXでその世代の索引を削除する。索引の削除は`document_embeddings`の排他lockを必要とするため、待機は5秒で打ち切り、取得できなければ世代も削除せず`ann_index_locked`で終了する。
+
+### 一致率の比較（shadow比較）
+
+```
+npm run worker:ann-recall -- --project <project-uuid> [--samples 50]
+```
+
+- 質問ベクトルはVoyageを呼ばず、`embedding_cache`の`operation='query'`にあるactive世代の既存ベクトルを新しい順に使う。費用は増えない。
+- 各ベクトルについて上位20件を2通り取り、厳密検索の結果のうち近似検索にも含まれる割合をrecall@20とする。
+  - 厳密検索：`VECTOR_CANDIDATES_SQL`と同じ絞り込み（会社・案件・世代・検索可能な公開revision）で、vector型のcosine距離順。式が違うためhalfvecの索引は使われない。
+  - 近似検索：同じ絞り込みで、索引と同じhalfvecの式の距離順。`SET LOCAL hnsw.iterative_scan = relaxed_order`、`hnsw.ef_search = 100`、`enable_seqscan = off`を指定する。実行計画が索引を使わない場合は`ann_index_not_used`で終了し、近似でない値を報告しない。
+- 出力はJSON 1行で、サンプル数、recallの平均・最小、厳密・近似それぞれの所要時間p50/p95、使った設定値（`top_k`・`ef_search`・`iterative_scan`・`statement_timeout_ms`・`index_name`）。本文・質問・ベクトルは出力しない。
+- 世代に有効な索引がなければ`ann_index_not_found`、質問ベクトルがなければ`ann_recall_no_samples`、比較対象の文書がなければ`ann_recall_no_documents`で終了する。
+
+測定値を読むときの制約は次のとおり。
+
+- 本番の検索が持つ「検索元sessionの、質問以降の発言を含む文書を除く」条件は再現しない。`embedding_cache`は質問ベクトルの元sessionを記録していないためで、厳密・近似の両方から同じように外している。
+- `embedding_cache`は会社・世代単位で、案件単位ではない。同じ会社の他案件の質問ベクトルも使う。
+- recallの低下には、HNSWの取りこぼしとhalfvecへの精度低下の両方が含まれる。
+- 所要時間は厳密・近似の実行順を交互に入れ替えて測るが、同じ接続・同じbufferを共有するため目安である。
+
+### 採用の目安
+
+recall@20の平均が0.95以上、かつ最小が0.8以上。満たさない場合は`ef_search`や索引の構築parameterを見直す。目安を満たしても本番の検索は自動では切り替わらない。
+
 ## 本番配置
 
 `deployment/compose.yaml`の`production` profileだけがCaddyを起動する。Caddyは固定digestの公式imageを使い、80/tcp、443/tcp、443/udpだけを外部公開して`api:3210`へ転送する。APIのhost portはloopback、PostgreSQLは非公開のままにする。PostgreSQL、Caddy data/configはnamed volumeへ永続化し、全serviceのjson-file logを容量制限する。
@@ -70,5 +129,6 @@ M8は、旧埋め込み世代を検索に使い続けたまま新世代を構築
 
 - `src/db/tests/m8-schema.test.ts`: migration、run、検索世代固定、検索時間sample。
 - `src/worker/tests/m8-reindex.test.ts`: 正常切替、追加・改訂・除外追従、provider障害、承認待ち、恒久失敗、再開・完了後no-op、会社・案件隔離、検索世代固定、明示削除とretry競合、metrics、初回世代設定・source改訂・pointer変更・マイクロ秒cursorとの競合。
+- `src/worker/tests/m8-ann.test.ts`: vector経路の時間の記録、`ann_recommendation`の分岐、索引の作成・削除と世代削除時の連動、recall比較のJSON出力と固定エラーコード、本文を出力しないこと。pgvector 0.8系が必要なため`npm test`（compose）で実行する。
 - `deployment/tests/m8.test.ts`: production profile、Caddy、公開port、永続volume、log rotation、運用手順。
 - 合成fixtureとloopback providerだけを使用し、実Jev/Voyage・実会話・実クラウドへ送信しない。
