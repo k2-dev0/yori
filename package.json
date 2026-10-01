@@ -27,6 +27,8 @@
     "worker:reindex": "tsx src/worker/cli.ts reindex",
     "worker:generation-delete": "tsx src/worker/cli.ts generation:delete",
     "worker:metrics": "tsx src/worker/cli.ts metrics",
+    "worker:ann-index": "tsx src/worker/cli.ts ann-index",
+    "worker:ann-recall": "tsx src/worker/cli.ts ann-recall",
     "mcp:start": "tsx src/mcp/server.ts",
     "api:contract": "tsx src/api/generate-openapi.ts",
     "api:contract:check": "tsx src/api/generate-openapi.ts --check"
