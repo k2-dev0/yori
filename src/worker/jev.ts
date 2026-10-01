@@ -8,6 +8,7 @@ import {
   SAME_CONDITION_VALUES,
   SEARCH_ACTIONS,
   STATEMENT_STATUSES,
+  INFORMATION_SOURCES,
   STRATEGY_AXES,
   STRATEGY_AXIS_NAMES,
   jevQuestionId,
@@ -92,6 +93,12 @@ const STATEMENT_STATUS_CRITERIA = criteriaFrom(STATEMENT_STATUSES, {
   unknown: '判断不能',
 });
 
+const INFORMATION_SOURCE_CRITERIA = criteriaFrom(INFORMATION_SOURCES, {
+  first_hand: '発言者自身の判断・作業・観測',
+  relayed_history: '過去会話の検索結果として得た内容の引用・要約・伝聞',
+  unknown: '判断不能',
+});
+
 const SEARCH_ACTION_CRITERIA = criteriaFrom(SEARCH_ACTIONS, {
   new_search: '新しい条件の検索が必要',
   reuse: '同じ条件の直近検索を再利用できる',
@@ -106,7 +113,12 @@ const SAME_CONDITION_CRITERIA = criteriaFrom(SAME_CONDITION_VALUES, {
 
 
 // partごとの質問を、fieldの意味と判定基準がinstructionから分かるように組み立てる。
-export function buildQuestions(part: JevStatePart, candidateIds: readonly string[], includeSameConditions: boolean): Record<string, JevChoiceQuestion> {
+export function buildQuestions(
+  part: JevStatePart,
+  candidateIds: readonly string[],
+  includeSameConditions: boolean,
+  includeInformationSource: boolean,
+): Record<string, JevChoiceQuestion> {
   const partLabel = `現在発言の原文範囲(offset ${part.offset}, ${part.length}文字)`;
   const questions: Record<string, JevChoiceQuestion> = {};
   questions[jevQuestionId('retention', 0)] = {
@@ -134,6 +146,14 @@ export function buildQuestions(part: JevStatePart, candidateIds: readonly string
     instructions: `${partLabel}の発言状態statement_statusを選ぶ。`,
     criteria: STATEMENT_STATUS_CRITERIA,
   };
+  // 質問定義は入力予算を使うため、伝聞を書き得るエージェントの回答にだけ聞く。
+  if (includeInformationSource) {
+    questions[jevQuestionId('information_source', 0)] = {
+      type: 'choice',
+      instructions: `${partLabel}の内容の出どころinformation_sourceを選ぶ。話題ではなく、内容をどこから得たかで判断する。`,
+      criteria: INFORMATION_SOURCE_CRITERIA,
+    };
+  }
   questions[jevQuestionId('search_action', 0)] = {
     type: 'choice',
     instructions: `${partLabel}で過去履歴の検索を開始・再利用・省略のどれにすべきかsearch_actionを選ぶ。`,
