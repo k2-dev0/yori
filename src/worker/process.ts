@@ -701,7 +701,7 @@ async function routeWithEvaluation(pool: Pool, job: ClaimedJob, target: JobTarge
   await applyRouteDecision(pool, job, target, decision, condition);
 }
 
-function errorCodeOf(error: unknown): { code: string; retryable: boolean; retryAfterMs?: number } {
+function errorCodeOf(error: unknown): { code: string; retryable: boolean; retryAfterMs?: number; detail?: string } {
   if (error instanceof InputBudgetError) {
     return { code: 'input_budget_exceeded', retryable: false };
   }
@@ -712,23 +712,26 @@ function errorCodeOf(error: unknown): { code: string; retryable: boolean; retryA
     return { code: 'embedding_generation_mismatch', retryable: false };
   }
   if (error instanceof JevCallError || error instanceof VoyageCallError) {
-    return { code: error.code, retryable: error.retryable, retryAfterMs: error.retryAfterMs };
+    // 両providerが同じcodeを返すため、切り分け用にprovider名と検証条件の識別子を残す。
+    const provider = error instanceof JevCallError ? 'jev' : 'voyage';
+    const detail = error.detail === undefined ? provider : `${provider}:${error.detail}`;
+    return { code: error.code, retryable: error.retryable, retryAfterMs: error.retryAfterMs, detail };
   }
   return { code: 'internal_error', retryable: false };
 }
 
 // 障害時もsearch受付はfailedとcodeを持ち、no_matchにしない。所有喪失時は状態を変えない。
 // route_searchは既存のauto入力更新を維持し、execute_searchはpayloadが指す1件だけを更新する。
-async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: string): Promise<void> {
+async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: string, detail: string | null): Promise<void> {
   if (job.kind === 'route_search') {
     if (job.messageId === null || job.targetRevision === null) {
       return;
     }
     await client.query(
       `UPDATE search_requests
-          SET status = 'failed', error_code = $4, outcome = NULL, updated_at = now()
+          SET status = 'failed', error_code = $4, error_detail = $5, outcome = NULL, updated_at = now()
         WHERE input_message_id = $1 AND input_message_revision = $2 AND policy_version = $3 AND trigger = 'auto'`,
-      [job.messageId, job.targetRevision, WORKER_POLICY_VERSION, code],
+      [job.messageId, job.targetRevision, WORKER_POLICY_VERSION, code, detail],
     );
     return;
   }
@@ -742,7 +745,7 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
     // DB正本で一致する場合だけfailedにする。payload側のscopeを信用しない。
     await client.query(
       `UPDATE search_requests sr
-          SET status = 'failed', error_code = $2, outcome = NULL, updated_at = now()
+          SET status = 'failed', error_code = $2, error_detail = $6, outcome = NULL, updated_at = now()
         WHERE sr.id = $1
           AND sr.status IN ('running', 'pending', 'failed')
           AND EXISTS (
@@ -760,7 +763,7 @@ async function markSearchFailed(client: PoolClient, job: ClaimedJob, code: strin
                AND sr.company_id = p.company_id
                AND sr.session_id = $5
           )`,
-      [requestId, code, job.messageId, job.targetRevision, job.sessionId],
+      [requestId, code, job.messageId, job.targetRevision, job.sessionId, detail],
     );
   }
 }
@@ -802,7 +805,7 @@ async function handleProcessError(pool: Pool, job: ClaimedJob, error: unknown): 
         await client.query('ROLLBACK');
         return;
       }
-      await markSearchFailed(client, job, 'provider_policy_unverified');
+      await markSearchFailed(client, job, 'provider_policy_unverified', null);
       await client.query('COMMIT');
       return;
     }
@@ -818,7 +821,7 @@ async function handleProcessError(pool: Pool, job: ClaimedJob, error: unknown): 
       await client.query('ROLLBACK');
       return;
     }
-    await markSearchFailed(client, job, failure.code);
+    await markSearchFailed(client, job, failure.code, failure.detail ?? null);
     await client.query('COMMIT');
   } catch (persistError) {
     await client.query('ROLLBACK').catch(() => undefined);
