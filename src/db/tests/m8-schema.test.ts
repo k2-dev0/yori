@@ -118,5 +118,13 @@ describe('M8 schema: 再索引run・世代固定・検索duration', () => {
     }
     const defs = (await checkConstraintDefs('search_duration_samples')).join('\n');
     assert.match(defs, /duration_ms\s*>=\s*0/, `search_duration_samples.duration_msの非負CHECKがない: ${defs}`);
+    // vector経路だけの時間はNULLを許す追加列。列追加前のsampleと同じ形のINSERTを壊さない。
+    assert.ok(columns.has('vector_duration_ms'), 'search_duration_samples.vector_duration_msがない');
+    assert.match(defs, /vector_duration_ms\s*>=\s*0/, `vector_duration_msの非負CHECKがない: ${defs}`);
+    const nullable = await pool.query<{ is_nullable: string }>(
+      `SELECT is_nullable FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'search_duration_samples' AND column_name = 'vector_duration_ms'`,
+    );
+    assert.equal(nullable.rows[0]?.is_nullable, 'YES', 'vector_duration_msがNULLを許さない');
   });
 });
