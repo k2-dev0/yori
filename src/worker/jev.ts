@@ -28,6 +28,8 @@ export class JevCallError extends Error {
     readonly code: string,
     readonly retryable: boolean,
     readonly retryAfterMs?: number,
+    // 応答検証のどの条件で落ちたかを示す固定識別子。原文や応答値は入れない。
+    readonly detail?: string,
   ) {
     super(code);
   }
@@ -234,13 +236,13 @@ export interface ValidatedJevResponse {
 export function validateJevResponse(raw: unknown, questions: Record<string, JevChoiceQuestion>): ValidatedJevResponse {
   const parsed = rawResponseSchema.safeParse(raw);
   if (!parsed.success) {
-    throw new JevCallError('provider_contract_invalid', false);
+    throw new JevCallError('provider_contract_invalid', false, undefined, 'response_shape');
   }
   const response = parsed.data;
   const questionIds = Object.keys(questions);
   const answerIds = Object.keys(response.answers);
   if (questionIds.length !== answerIds.length || questionIds.some((id) => response.answers[id] === undefined)) {
-    throw new JevCallError('provider_contract_invalid', false);
+    throw new JevCallError('provider_contract_invalid', false, undefined, 'answer_ids');
   }
   const answers: Record<string, JevAnswer> = {};
   for (const id of questionIds) {
@@ -248,22 +250,22 @@ export function validateJevResponse(raw: unknown, questions: Record<string, JevC
     const answer = response.answers[id];
     const criteriaKeys = Object.keys(question.criteria);
     if (!criteriaKeys.includes(answer.choice)) {
-      throw new JevCallError('provider_contract_invalid', false);
+      throw new JevCallError('provider_contract_invalid', false, undefined, 'answer_choice');
     }
     const probabilityKeys = Object.keys(answer.probabilities);
     if (probabilityKeys.length !== criteriaKeys.length || criteriaKeys.some((key) => answer.probabilities[key] === undefined)) {
-      throw new JevCallError('provider_contract_invalid', false);
+      throw new JevCallError('provider_contract_invalid', false, undefined, 'probability_keys');
     }
     let sum = 0;
     for (const key of criteriaKeys) {
       const probability = answer.probabilities[key];
       if (!Number.isFinite(probability) || probability < 0 || probability > 1) {
-        throw new JevCallError('provider_contract_invalid', false);
+        throw new JevCallError('provider_contract_invalid', false, undefined, 'probability_range');
       }
       sum += probability;
     }
     if (Math.abs(sum - 1) > 0.01 || !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
-      throw new JevCallError('provider_contract_invalid', false);
+      throw new JevCallError('provider_contract_invalid', false, undefined, 'probability_sum_or_confidence');
     }
     answers[id] = {
       type: 'choice',
@@ -330,7 +332,7 @@ export async function callJev(config: WorkerConfig, bodyText: string): Promise<J
   try {
     json = await response.json();
   } catch {
-    throw new JevCallError('provider_contract_invalid', false);
+    throw new JevCallError('provider_contract_invalid', false, undefined, 'response_not_json');
   }
   return { json, durationMs };
 }
