@@ -31,6 +31,7 @@ export interface StoredPartResult {
   decision_action: string;
   continuity: string;
   statement_status: string;
+  information_source: string;
   search_action: string;
   response_model: string;
 }
@@ -52,6 +53,7 @@ export interface AggregatedEvaluation {
   decisionAction: string;
   continuity: string;
   statementStatus: string;
+  informationSource: string;
   searchAction: string;
   isSearchable: boolean;
   sameConditions: boolean;
@@ -162,6 +164,7 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
     decisionAction,
     continuity,
     statementStatus,
+    informationSource: adoptedOrUnknown(parts, jevQuestionId('information_source', 0), threshold),
     searchAction: searchAction === 'reuse' || searchAction === 'skip' ? searchAction : 'new_search',
     isSearchable: retention !== 'progress_only',
     sameConditions,
@@ -176,6 +179,7 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
       decision_action: adoptedOrUnknown([part], jevQuestionId('decision_action', 0), threshold),
       continuity: adoptedOrUnknown([part], jevQuestionId('continuity', 0), threshold),
       statement_status: adoptedOrUnknown([part], jevQuestionId('statement_status', 0), threshold),
+      information_source: adoptedOrUnknown([part], jevQuestionId('information_source', 0), threshold),
       search_action: highChoice(part, jevQuestionId('search_action', 0), threshold) ?? 'unknown',
       response_model: part.responseModel,
     })),
