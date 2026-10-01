@@ -392,6 +392,7 @@ async function loadCandidates(
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
     await client.query(`SET LOCAL statement_timeout = ${SEARCH_STATEMENT_TIMEOUT_MS}`);
+    const vectorStartedAt = Date.now();
     const vectorRows = await client.query<CandidateRow>(VECTOR_CANDIDATES_SQL, [
       input.target.companyId,
       input.target.projectId,
@@ -401,6 +402,8 @@ async function loadCandidates(
       input.target.sequenceNo,
       SEARCH_VECTOR_LIMIT,
     ]);
+    // 近似索引への切替判定用に、vector経路のqueryだけの所要時間を合計とは別に観測する。
+    const vectorDurationMs = Math.max(0, Date.now() - vectorStartedAt);
     const entityRows =
       identifiers.length === 0
         ? []
@@ -459,9 +462,16 @@ async function loadCandidates(
     }
     // DB候補検索のdurationだけをproject/generation scopeで観測する。本文・質問は保存しない。
     await client.query(
-      `INSERT INTO search_duration_samples (id, company_id, project_id, generation_id, duration_ms)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [uuidv7(), input.target.companyId, input.target.projectId, input.generation.id, Math.max(0, Date.now() - startedAt)],
+      `INSERT INTO search_duration_samples (id, company_id, project_id, generation_id, duration_ms, vector_duration_ms)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        uuidv7(),
+        input.target.companyId,
+        input.target.projectId,
+        input.generation.id,
+        Math.max(0, Date.now() - startedAt),
+        vectorDurationMs,
+      ],
     );
     await client.query('COMMIT');
     return [...candidates.values()].sort((left, right) => right.rrfScore - left.rrfScore || compareCandidates(left, right));
