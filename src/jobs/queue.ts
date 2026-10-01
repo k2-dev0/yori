@@ -109,6 +109,7 @@ interface JobRow {
 }
 
 // due pendingをpriority DESC・作成順で安定に選ぶ。分類は同sessionの先行jobが未完了の間は後続を除外する。
+// 恒久failedの先行jobは待っても解消しないため未完了に数えず、その発言を飛ばして後続を進める。
 // 分類の順序はmessage.sequence_no→target_revisionで決め、未受信のsequence_noは待たない。
 const CLAIM_JOBS_SQL = `
   SELECT j.id, j.kind, j.priority, j.session_id, j.message_id, j.target_revision, j.payload, j.attempts
@@ -127,7 +128,7 @@ const CLAIM_JOBS_SQL = `
             AND (
               o.status = 'running'
               OR (
-                o.status IN ('pending', 'failed', 'blocked_policy')
+                o.status IN ('pending', 'blocked_policy')
                 AND EXISTS (
                   SELECT 1
                     FROM messages om
@@ -162,7 +163,7 @@ const RECHECK_CLASSIFY_JOB_SQL = `
           AND (
             o.status = 'running'
             OR (
-              o.status IN ('pending', 'failed', 'blocked_policy')
+              o.status IN ('pending', 'blocked_policy')
               AND EXISTS (
                 SELECT 1
                   FROM messages om
