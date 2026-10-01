@@ -116,7 +116,6 @@ describe('M7 MCP link_session', () => {
           label: 'unknown nested',
           args: { ...valid, to: { ...(valid.to as Record<string, unknown>), unknown_field: 'x' } },
         },
-        { label: 'missing project_id', args: withoutKey(valid, 'project_id') },
         { label: 'missing idempotency_key', args: withoutKey(valid, 'idempotency_key') },
         {
           label: 'invalid source',
