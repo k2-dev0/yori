@@ -246,6 +246,11 @@ export function extractJevUsage(raw: unknown): JevUsage {
   };
 }
 
+// Jevは各選択肢の確率を小数2桁へ丸めて返す。
+const PROBABILITY_ROUNDING_STEP = 0.01;
+// 0.99と1の差が0.01をわずかに超えるような、浮動小数点の誤差で境界の値を弾かないための余裕。
+const FLOAT_COMPARISON_MARGIN = 1e-9;
+
 export interface ValidatedJevResponse {
   model: string;
   answers: Record<string, JevAnswer>;
@@ -284,8 +289,13 @@ export function validateJevResponse(raw: unknown, questions: Record<string, JevC
       }
       sum += probability;
     }
-    if (Math.abs(sum - 1) > 0.01 || !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
-      throw new JevCallError('provider_contract_invalid', false, undefined, 'probability_sum_or_confidence');
+    // 丸めた値の合計は、選択肢1つにつき最大で丸め幅の半分ずつ1からずれる。それを超えるずれだけを契約不正にする。
+    const sumTolerance = (criteriaKeys.length * PROBABILITY_ROUNDING_STEP) / 2 + FLOAT_COMPARISON_MARGIN;
+    if (Math.abs(sum - 1) > sumTolerance) {
+      throw new JevCallError('provider_contract_invalid', false, undefined, 'probability_sum');
+    }
+    if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
+      throw new JevCallError('provider_contract_invalid', false, undefined, 'confidence_range');
     }
     answers[id] = {
       type: 'choice',
