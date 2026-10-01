@@ -16,10 +16,54 @@ export interface ProjectMetrics {
   generations: GenerationMetrics[];
   reindex: { pending_documents: number };
   search_duration_ms: { samples: number; p50: number; p95: number };
+  ann_recommendation: AnnRecommendation;
   jobs: Record<'pending' | 'running' | 'completed' | 'failed' | 'blocked_policy', number>;
 }
 
+// 近似索引（HNSW）へ切り替えるべきかの判断材料。判定だけを返し、切替自体は行わない。
+export interface AnnRecommendation {
+  recommended: boolean;
+  reasons: string[];
+  thresholds: { min_samples: number; sample_window: number; vector_p95_ms: number; documents: number };
+  // vector_p95_msはsampleが1件もないときnull。
+  observed: { samples: number; vector_p95_ms: number | null; documents: number };
+}
+
 const JOB_STATUSES = ['pending', 'running', 'completed', 'failed', 'blocked_policy'] as const;
+
+// 切替基準の暫定値。最終調整は実測後に行う。
+const ANN_MIN_SAMPLES = 50;
+// 「直近」の範囲。active世代でvector経路の時間を記録済みのsampleを新しい順にこの件数まで見る。
+const ANN_SAMPLE_WINDOW = 200;
+const ANN_VECTOR_P95_THRESHOLD_MS = 100;
+const ANN_DOCUMENT_THRESHOLD = 20_000;
+
+// p95超過と文書数超過は独立した条件で、どちらかを満たせば推奨する。
+// sample不足は時間の条件を評価できないことを示すだけで、文書数超過による推奨は打ち消さない。
+function buildAnnRecommendation(observed: AnnRecommendation['observed']): AnnRecommendation {
+  const reasons: string[] = [];
+  const enoughSamples = observed.samples >= ANN_MIN_SAMPLES;
+  if (!enoughSamples) {
+    reasons.push('insufficient_samples');
+  }
+  if (enoughSamples && observed.vector_p95_ms !== null && observed.vector_p95_ms > ANN_VECTOR_P95_THRESHOLD_MS) {
+    reasons.push('vector_p95_exceeded');
+  }
+  if (observed.documents > ANN_DOCUMENT_THRESHOLD) {
+    reasons.push('document_count_exceeded');
+  }
+  return {
+    recommended: reasons.includes('vector_p95_exceeded') || reasons.includes('document_count_exceeded'),
+    reasons,
+    thresholds: {
+      min_samples: ANN_MIN_SAMPLES,
+      sample_window: ANN_SAMPLE_WINDOW,
+      vector_p95_ms: ANN_VECTOR_P95_THRESHOLD_MS,
+      documents: ANN_DOCUMENT_THRESHOLD,
+    },
+    observed,
+  };
+}
 
 export async function loadProjectMetrics(pool: Pool, projectId: string): Promise<ProjectMetrics | null> {
   const project = await pool.query<{ id: string; active_generation_id: string | null }>(
@@ -109,6 +153,22 @@ export async function loadProjectMetrics(pool: Pool, projectId: string): Promise
   );
   const durationRow = duration.rows[0];
 
+  // active世代の直近sampleだけでvector経路のp95を集約する。列追加前のNULL sampleは数えない。
+  const activeGenerationId = projectRow.active_generation_id;
+  const vectorDuration = await pool.query<{ samples: number; p95: number | null }>(
+    `SELECT count(*)::int AS samples,
+            percentile_disc(0.95) WITHIN GROUP (ORDER BY recent.vector_duration_ms)::int AS p95
+       FROM (
+         SELECT vector_duration_ms
+           FROM search_duration_samples
+          WHERE project_id = $1 AND generation_id = $2 AND vector_duration_ms IS NOT NULL
+          ORDER BY created_at DESC, id DESC
+          LIMIT $3
+       ) recent`,
+    [projectId, activeGenerationId, ANN_SAMPLE_WINDOW],
+  );
+  const vectorDurationRow = vectorDuration.rows[0];
+
   const jobRows = await pool.query<{ status: string; count: number }>(
     `SELECT j.status, count(*)::int AS count
        FROM jobs j
@@ -134,6 +194,11 @@ export async function loadProjectMetrics(pool: Pool, projectId: string): Promise
       p50: durationRow?.p50 ?? 0,
       p95: durationRow?.p95 ?? 0,
     },
+    ann_recommendation: buildAnnRecommendation({
+      samples: vectorDurationRow?.samples ?? 0,
+      vector_p95_ms: vectorDurationRow?.p95 ?? null,
+      documents: activeGenerationId === null ? 0 : (documents.get(activeGenerationId) ?? 0),
+    }),
     jobs,
   };
 }
