@@ -4,8 +4,8 @@ import type { WorkerConfig } from './config.js';
 import { processJob } from './process.js';
 
 // 検索laneはroute_search→execute_searchを1並列で扱い、利用者の待つ検索を分類・文書構築の後ろに並べない。
-// 外部処理laneはclassify_message・build_documentsを1並列で扱う。各laneの並列数は増やさない。
-const EXTERNAL_KINDS: readonly JobKind[] = ['classify_message', 'build_documents'];
+// 外部処理laneはclassify_message・build_documents・judge_continuityを1並列で扱う。各laneの並列数は増やさない。
+const EXTERNAL_KINDS: readonly JobKind[] = ['classify_message', 'build_documents', 'judge_continuity'];
 const SEARCH_KINDS: readonly JobKind[] = ['route_search', 'execute_search'];
 const RECOVER_INTERVAL_MS = 30_000;
 
