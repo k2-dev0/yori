@@ -364,13 +364,14 @@ export interface StoredSearchRequest {
   outcome: string | null;
   search_action: string | null;
   error_code: string | null;
+  error_detail: string | null;
   reused_from_request_id: string | null;
   result: unknown;
 }
 
 export async function readSearchRequest(pool: Pool, requestId: string): Promise<StoredSearchRequest> {
   const result = await pool.query<StoredSearchRequest>(
-    `SELECT id, status, outcome, search_action, error_code, reused_from_request_id, result
+    `SELECT id, status, outcome, search_action, error_code, error_detail, reused_from_request_id, result
        FROM search_requests WHERE id = $1`,
     [requestId],
   );
