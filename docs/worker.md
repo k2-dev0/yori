@@ -159,6 +159,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 ## 失敗と再開
 
 - 429/529/5xx/timeout/通信障害: jobはpendingへ戻し、Retry-Afterと指数バックオフ+jitterで再試行する。検索受付はfailedとcodeを持ち、自動再試行のclaim時にpendingへ戻す。
+- 検索受付をfailedにする時は、切り分け用に`search_requests.error_detail`へ失敗したprovider名（`jev`/`voyage`）と、応答検証のどの条件で落ちたかの固定識別子を`voyage:embedding_zero`の形で保存する。provider以外の失敗はNULL。原文・応答値・外部error bodyは保存しない。値は`status='failed'`の時だけ有効で、APIとMCPの応答には出さない。運用者は通知の`request_id`で`SELECT error_code, error_detail FROM search_requests WHERE id = '<request_id>'`を引く。
 - 401/422/応答契約不正: `failed`で保持する。自動では再送しない。
 - 承認未確認: `blocked_policy`。`worker:retry`は現在の承認が有効な時だけpendingへ戻す（build_documentsはVoyage、classify/routeはJev、execute_searchは両方）。
 - Voyageの408/429/5xx/timeout（headers受信後のbody read timeout含む）と、HTTP statusを得られないDNS・接続・TLS・本文受信切断等のtransport failure: jobをpendingへ戻し、Retry-After（秒/HTTP-date）とバックオフで再試行する。400/401/403/422/応答契約不正はfailedで保持し、対象revisionもfailedにする。
