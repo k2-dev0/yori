@@ -22,6 +22,7 @@ import { BUILD_DOCUMENTS_PRIORITY, EXECUTE_SEARCH_PRIORITY, claimJobs, enqueueJo
 import { loadWorkerConfig, type WorkerConfig } from '../config.js';
 import {
   JEV_API_PATH,
+  SEARCH_VECTOR_LIMIT,
   VOYAGE_API_PATH,
   VOYAGE_DIMENSIONS,
   VOYAGE_DOCUMENT_INPUT_TYPE,
@@ -282,10 +283,8 @@ function m5ChoiceSelector(mode: M5JevMode): JevChoiceSelector {
   };
 }
 
-function rankingChoiceSelector(
-  statusFor: (text: string) => 'proposal' | 'reported_completed' | 'reported_verified' | 'unknown',
-  relevanceFor: (text: string) => 'useful' | 'direct' = () => 'direct',
-): JevChoiceSelector {
+// 候補のstatement_statusはJevへ質問せず、source messageの分類済みstatement_statusから決まる。
+function rankingChoiceSelector(relevanceFor: (text: string) => 'useful' | 'direct' = () => 'direct'): JevChoiceSelector {
   return (question, request) => {
     const field = question.id.split(':')[0] ?? question.id;
     const candidate = request.state.candidates?.find((item) => question.instructions.includes(`candidate_id=${item.candidate_id}`));
@@ -293,11 +292,33 @@ function rankingChoiceSelector(
     if (field === 'candidate_relevance') {
       return relevanceFor(text);
     }
-    if (field === 'candidate_statement_status') {
-      return statusFor(text);
-    }
     return Object.keys(question.criteria).includes('yes') ? 'yes' : undefined;
   };
+}
+
+// 候補source messageの分類結果を保存する。statement_statusと設計方針fingerprintを検索側が参照する。
+async function seedSourceAnalysis(
+  pool: Pool,
+  input: { messageId: string; revision?: number; statementStatus?: string; strategyTerms?: readonly string[] },
+): Promise<void> {
+  const revision = input.revision ?? 1;
+  await pool.query(
+    `INSERT INTO message_analysis
+       (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
+        continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms)
+     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', $5, true, '["test-model"]'::jsonb, $6, '[]'::jsonb, $7::text[])
+     ON CONFLICT (message_id, revision, policy_version) DO UPDATE
+       SET statement_status = EXCLUDED.statement_status, strategy_terms = EXCLUDED.strategy_terms`,
+    [
+      uuidv7(),
+      input.messageId,
+      revision,
+      WORKER_POLICY_VERSION,
+      input.statementStatus ?? 'unknown',
+      sha256Bytes(`${input.messageId}:${revision}`),
+      [...(input.strategyTerms ?? [])],
+    ],
+  );
 }
 
 // ---- 外部待ちgate。候補取得後の状態変更をJev応答タイミングで起こす。 ----
@@ -1619,7 +1640,7 @@ describe('M5 順位統合とJev投入量', () => {
 });
 
 describe('M5 独立候補判定', () => {
-  it('overall relevanceと6つの独立Choiceを候補ごとに評価し、positiveをreason code・statement_statusを別fieldで残す', async () => {
+  it('overall relevanceと5つの独立Choiceを候補ごとに評価し、positiveをreason code・分類済みstatement_statusを別fieldで残す', async () => {
     const queryVector = basisVector(0, 1);
     const selectByQuestion: JevChoiceSelector = (question) => {
       const field = question.id.split(':')[0] ?? question.id;
@@ -1636,13 +1657,11 @@ describe('M5 独立候補判定', () => {
           return 'no';
         case 'candidate_reusable_procedure':
           return 'yes';
-        case 'candidate_statement_status':
-          return 'reported_verified';
         default:
           return undefined;
       }
     };
-    const { config } = await startProviders(pool, workspace.companyId, {
+    const { config, jev } = await startProviders(pool, workspace.companyId, {
       jevResponder: (request) => ({ body: jevReply(request, selectByQuestion) }),
       voyageResponder: vectorQueryResponder(queryVector),
     });
@@ -1650,6 +1669,7 @@ describe('M5 独立候補判定', () => {
     const sessionA = await seedSession(pool, workspace);
     const text = 'INDEPENDENT-CANDIDATE 独立判定の候補';
     const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: 1, role: 'assistant', text });
+    await seedSourceAnalysis(pool, { messageId: message.messageId, statementStatus: 'reported_verified' });
     await seedReadyDocument(pool, {
       companyId: workspace.companyId,
       projectId: workspace.projectId,
@@ -1686,7 +1706,9 @@ describe('M5 独立候補判定', () => {
     assert.equal(evaluation.adopted, true);
     const answers = evaluation.answers ?? {};
     assert.equal(answers.overall?.choice, 'useful');
-    assert.equal(answers.statement_status?.choice, 'reported_verified');
+    assert.equal(answers.statement_status, undefined, 'statement_statusをJevへ質問している');
+    const candidateRequest = jev.requests.map((item) => item.rawBody).find((body) => body.includes('"candidate_relevance:'));
+    assert.ok(candidateRequest !== undefined && !candidateRequest.includes('candidate_statement_status'), '候補判定でstatement_statusを質問している');
     for (const kind of [
       'overall',
       'target_match',
@@ -1694,7 +1716,6 @@ describe('M5 独立候補判定', () => {
       'similar_constraints',
       'implementation_rationale',
       'reusable_procedure',
-      'statement_status',
     ]) {
       const answer = answers[kind];
       assert.ok(answer, `${kind}のraw answerがない`);
@@ -1713,10 +1734,7 @@ describe('M5 独立候補判定', () => {
 
   it('同じrelevanceでは検証済み報告を古い提案より優先し、低relevanceの新情報は昇格させない', async () => {
     const queryVector = basisVector(0, 1);
-    const select = rankingChoiceSelector(
-      (text) => (text.includes('OLD-PROPOSAL') ? 'proposal' : 'reported_verified'),
-      (text) => (text.includes('LOWER-USEFUL') ? 'useful' : 'direct'),
-    );
+    const select = rankingChoiceSelector((text) => (text.includes('LOWER-USEFUL') ? 'useful' : 'direct'));
     const { config } = await startProviders(pool, workspace.companyId, {
       jevResponder: (request) => ({ body: jevReply(request, select) }),
       voyageResponder: vectorQueryResponder(queryVector),
@@ -1739,6 +1757,10 @@ describe('M5 独立候補判定', () => {
         occurredAt: fixture.occurredAt,
       });
       messageIds.set(fixture.marker, message.messageId);
+      await seedSourceAnalysis(pool, {
+        messageId: message.messageId,
+        statementStatus: fixture.marker === 'OLD-PROPOSAL' ? 'proposal' : 'reported_verified',
+      });
       await seedReadyDocument(pool, {
         companyId: workspace.companyId,
         projectId: workspace.projectId,
@@ -1768,7 +1790,7 @@ describe('M5 独立候補判定', () => {
 
   it('同じrelevance・statement status・RRFでは新しい発言を安定ID順より優先する', async () => {
     const queryVector = basisVector(0, 1);
-    const select = rankingChoiceSelector(() => 'reported_completed');
+    const select = rankingChoiceSelector();
     const { config } = await startProviders(pool, workspace.companyId, {
       jevResponder: (request) => ({ body: jevReply(request, select) }),
       voyageResponder: vectorQueryResponder(queryVector),
@@ -1786,6 +1808,7 @@ describe('M5 独立候補判定', () => {
       text: oldText,
       occurredAt: new Date('2026-09-01T00:00:00.000Z'),
     });
+    await seedSourceAnalysis(pool, { messageId: oldMessage.messageId, statementStatus: 'reported_completed' });
     await seedReadyDocument(pool, {
       id: oldDocumentId,
       companyId: workspace.companyId,
@@ -1810,6 +1833,7 @@ describe('M5 独立候補判定', () => {
       text: newText,
       occurredAt: new Date('2026-09-02T00:00:00.000Z'),
     });
+    await seedSourceAnalysis(pool, { messageId: newMessage.messageId, statementStatus: 'reported_completed' });
     await seedReadyDocument(pool, {
       id: newDocumentId,
       companyId: workspace.companyId,
@@ -1842,7 +1866,7 @@ describe('M5 独立候補判定', () => {
 
   it('statement statusがunknown同士なら新しさで並べ替えず従来のRRF順位を維持する', async () => {
     const queryVector = basisVector(0, 1);
-    const select = rankingChoiceSelector(() => 'unknown');
+    const select = rankingChoiceSelector();
     const { config } = await startProviders(pool, workspace.companyId, {
       jevResponder: (request) => ({ body: jevReply(request, select) }),
       voyageResponder: vectorQueryResponder(queryVector),
@@ -3523,3 +3547,108 @@ function exactTokenText(tokenizer: { encode: (text: string) => { ids: number[] }
   assert.equal(tokenizer.encode(text).ids.length, target, `token数${target}のfixture文字列を作れない`);
   return text;
 }
+
+describe('M5 設計方針fingerprint経路', () => {
+  const STALE_WRITE_TERMS = ['consistency_strategy:optimistic_revalidation', 'scope_invariant:revision', 'state_hazard:stale_write'];
+
+  // vector上位20件を近い別文書で埋め、類推候補だけはvector経路の外に置く。
+  async function seedStrategyFixture(config: WorkerConfig) {
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    for (let index = 0; index < SEARCH_VECTOR_LIMIT + 2; index += 1) {
+      const text = `NEAR-${index} 近いが方針の違う発言`;
+      const message = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: index + 1, role: 'assistant', text });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `near-${index}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const analogText = 'ANALOG ジョブlease回収後の古いworkerによる二重反映を、適用直前の世代確認で防いだ';
+    const analog = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: 100, role: 'assistant', text: analogText });
+    await seedSourceAnalysis(pool, { messageId: analog.messageId, strategyTerms: STALE_WRITE_TERMS });
+    const analogDocumentId = await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'analog',
+      content: analogText,
+      generationId: generation.id,
+      embedding: basisVector(5, 1),
+      sources: [{ messageId: analog.messageId, messageRevision: 1, startOffset: 0, endOffset: analogText.length }],
+    });
+    // 1軸だけ一致する文書は最小一致数に届かず、候補へ入れない。
+    const weakText = 'WEAK 状態の危険だけが同じ発言';
+    const weak = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: 101, role: 'assistant', text: weakText });
+    await seedSourceAnalysis(pool, { messageId: weak.messageId, strategyTerms: ['state_hazard:stale_write', 'performance_strategy:cache'] });
+    const weakDocumentId = await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: sourceSession,
+      documentKey: 'weak',
+      content: weakText,
+      generationId: generation.id,
+      embedding: basisVector(6, 1),
+      sources: [{ messageId: weak.messageId, messageRevision: 1, startOffset: 0, endOffset: weakText.length }],
+    });
+    return { analogDocumentId, weakDocumentId };
+  }
+
+  it('用語が違う同型設計の文書をvector上位外からでも候補へ入れ、経路をresultへ残す', async () => {
+    const queryVector = basisVector(0, 1);
+    const { config, jev } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, rankingChoiceSelector()) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const { analogDocumentId, weakDocumentId } = await seedStrategyFixture(config);
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: 'Webhook再送による二重処理を防ぎたい' });
+    await pool.query('UPDATE search_requests SET strategy_terms = $2::text[] WHERE id = $1', [
+      seeded.requestId,
+      ['consistency_strategy:optimistic_revalidation', 'state_hazard:stale_write'],
+    ]);
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{ document_id?: string; retrieval_kinds?: string[] }>;
+    const analog = evaluations.find((evaluation) => evaluation.document_id === analogDocumentId);
+    assert.ok(analog, `類推候補がJev判定へ入っていない: ${JSON.stringify(evaluations.map((item) => item.document_id))}`);
+    assert.deepEqual(analog.retrieval_kinds, ['strategy'], '類推候補の検索経路が記録されていない');
+    assert.ok(!evaluations.some((evaluation) => evaluation.document_id === weakDocumentId), '1軸だけ一致する文書を候補にしている');
+    assert.ok(evaluations.length <= 10, '候補上限10件を超えている');
+    assert.equal(result.index_status?.search_mode, 'exact_vector_entity_and_strategy');
+    assert.ok(!(result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'strategy_fingerprint_unavailable'));
+    // 候補10件は5件ずつ2つのJev requestへ分けて送る。
+    const candidateRequests = jev.requests.filter((request) => request.rawBody.includes('"candidate_relevance:'));
+    assert.equal(candidateRequests.length, 2, '候補判定を2requestへ分割していない');
+    for (const request of candidateRequests) {
+      assert.ok((request.body.state.candidates?.length ?? 0) <= 5, '1requestの候補が5件を超えている');
+    }
+  });
+
+  it('fingerprint未評価の自動検索は経路を省き、部分検索であることをwarningで示す', async () => {
+    const queryVector = basisVector(0, 1);
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, rankingChoiceSelector()) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const { analogDocumentId } = await seedStrategyFixture(config);
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: 'Webhook再送による二重処理を防ぎたい' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{ document_id?: string }>;
+    assert.ok(!evaluations.some((evaluation) => evaluation.document_id === analogDocumentId), '未評価なのにfingerprint経路を使っている');
+    assert.equal(result.index_status?.search_mode, 'exact_vector_and_entity');
+    assert.ok(
+      (result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'strategy_fingerprint_unavailable'),
+      `部分検索のwarningがない: ${JSON.stringify(result.warnings)}`,
+    );
+  });
+});
