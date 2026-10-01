@@ -75,6 +75,38 @@ describe('検索振り分け', () => {
     }
   });
 
+  it('new_searchの受付へ入力の高信頼な設計方針fingerprintだけを保存する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: 'Webhook再送による二重処理を防ぎたい' });
+    const server = await startFakeJev((request) => ({
+      body: jevReply(
+        request,
+        jevChoices({
+          retention: 'substantive',
+          search_action: 'new_search',
+          'strategy:state_hazard': 'duplicate_apply',
+          'strategy:consistency_strategy': 'idempotency',
+          'strategy:performance_strategy': { choice: 'cache', confidence: 0.5 },
+          'strategy:failure_strategy': 'unknown',
+        }),
+      ),
+    }));
+    try {
+      await seedApproval(pool, { companyId: workspace.companyId, endpoint: buildWorkerConfig(server.baseUrl).apiUrl });
+      await processRoute(seeded.messageId, server);
+      const stored = await pool.query<{ strategy_terms: string[] | null }>('SELECT strategy_terms FROM search_requests WHERE id = $1', [
+        seeded.searchRequestId,
+      ]);
+      assert.deepEqual(
+        stored.rows[0]?.strategy_terms,
+        ['consistency_strategy:idempotency', 'state_hazard:duplicate_apply'],
+        '低信頼・unknownを除いたfingerprintが保存されていない',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
   it('条件不変の承認はreuseとして先行requestを参照し、結果をコピーしない', async () => {
     const sessionId = await seedSession(pool, workspace);
     const evidence = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '以前のキャッシュ修正報告' });
