@@ -150,6 +150,8 @@ const searchMatchResponseSchema = z.strictObject({
   // 候補評価の生値はworker保存JSONの内部表現であり、公開契約ではoptionalのまま保持する。
   relevance: z.unknown().optional(),
   relevance_kind: z.array(z.string()),
+  // 候補を見つけた検索経路（vector / entity / strategy）。strategyだけなら対象・用語が違う同型設計の類推候補。
+  retrieval_kinds: z.array(z.string()).optional(),
   statement_status: z.unknown().optional(),
   claim_status: z.enum(['agent_reported', 'not_reported']),
   evidence: z.array(evidenceItemResponseSchema).min(1),
