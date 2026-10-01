@@ -3929,6 +3929,95 @@ describe('M5 設計方針fingerprint経路', () => {
   });
 });
 
+describe('内容が重複する候補の集約', () => {
+  // 現在の質問に近く、互いにもほぼ同じ向きのvector。同じ質問への回答の繰り返しを表す。
+  function repeatedVector(rank: number): number[] {
+    const vector = basisVector(0, 1);
+    vector[1] = rank * 0.01;
+    return vector;
+  }
+
+  // 質問とは中程度に近く、他の候補とは別の軸を持つvector。別の内容の候補を表す。
+  function distinctVector(axis: number): number[] {
+    const vector = basisVector(0, 0.6);
+    vector[100 + axis] = 0.8;
+    return vector;
+  }
+
+  async function seedCandidate(
+    config: WorkerConfig,
+    sessionId: string,
+    input: { marker: string; sequenceNo: number; embedding: number[]; occurredAt?: Date },
+  ): Promise<void> {
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const text = `${input.marker} 候補本文`;
+    const message = await seedMessage(pool, { sessionId, sequenceNo: input.sequenceNo, role: 'assistant', text, occurredAt: input.occurredAt });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId,
+      documentKey: `collapse-${input.marker}`,
+      content: text,
+      generationId: generation.id,
+      embedding: input.embedding,
+      sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+    });
+  }
+
+  async function runSearch(config: WorkerConfig): Promise<M5SearchResult> {
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: '重複する候補の集約を確認する質問' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+    return readStoredResult(pool, seeded.requestId);
+  }
+
+  function collapsedCount(result: M5SearchResult): number | undefined {
+    const warning = (result.warnings ?? []).find((item) => (item as { code?: string }).code === 'similar_candidates_collapsed');
+    return (warning as { excluded_count?: number } | undefined)?.excluded_count;
+  }
+
+  it('埋め込みが近い候補を1件へ畳み、その中では新しい発言を残して、畳んだ件数を警告に残す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
+    const sessionId = await seedSession(pool, workspace);
+    // 古い発言ほど質問に近い順位にし、順位ではなく新しさで残す候補が決まることを確かめる。
+    await seedCandidate(config, sessionId, { marker: 'REPEAT-OLD', sequenceNo: 1, embedding: repeatedVector(1), occurredAt: new Date('2026-09-28T00:00:00.000Z') });
+    await seedCandidate(config, sessionId, { marker: 'REPEAT-MID', sequenceNo: 2, embedding: repeatedVector(2), occurredAt: new Date('2026-09-29T00:00:00.000Z') });
+    await seedCandidate(config, sessionId, { marker: 'REPEAT-NEW', sequenceNo: 3, embedding: repeatedVector(3), occurredAt: new Date('2026-09-30T00:00:00.000Z') });
+    await seedCandidate(config, sessionId, { marker: 'OTHER-TOPIC', sequenceNo: 4, embedding: distinctVector(1) });
+
+    const result = await runSearch(config);
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes('REPEAT-NEW'), '重複する候補のうち新しい発言を残していない');
+    assert.ok(!jevBody.includes('REPEAT-OLD') && !jevBody.includes('REPEAT-MID'), '重複する候補を畳まずに判定へ渡している');
+    assert.ok(jevBody.includes('OTHER-TOPIC'), '別の内容の候補を判定へ渡していない');
+    assert.equal(collapsedCount(result), 2, '畳んだ件数を警告に残していない');
+  });
+
+  it('重複する候補が上限件数を占めても、畳んで空いた枠へ別の内容の候補を入れる', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
+    const sessionId = await seedSession(pool, workspace);
+    for (let index = 0; index < SEARCH_CANDIDATE_LIMIT; index += 1) {
+      await seedCandidate(config, sessionId, { marker: `REPEAT-${index + 1}`, sequenceNo: index + 1, embedding: repeatedVector(index + 1) });
+    }
+    await seedCandidate(config, sessionId, { marker: 'OTHER-TOPIC', sequenceNo: SEARCH_CANDIDATE_LIMIT + 1, embedding: distinctVector(1) });
+
+    await runSearch(config);
+    assert.ok(allJevRawBody(jev).includes('OTHER-TOPIC'), '重複する候補が枠を占め、別の内容の候補が判定へ渡っていない');
+  });
+
+  it('埋め込みが近くない候補は畳まず、どちらも判定へ渡す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
+    const sessionId = await seedSession(pool, workspace);
+    await seedCandidate(config, sessionId, { marker: 'TOPIC-ONE', sequenceNo: 1, embedding: distinctVector(1) });
+    await seedCandidate(config, sessionId, { marker: 'TOPIC-TWO', sequenceNo: 2, embedding: distinctVector(2) });
+
+    const result = await runSearch(config);
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes('TOPIC-ONE') && jevBody.includes('TOPIC-TWO'), '別の内容の候補を畳んでいる');
+    assert.equal(collapsedCount(result), undefined, '畳んでいないのに警告を付けている');
+  });
+});
+
 describe('検索の評価コマンド', () => {
   // 一時的な会話・発言・検索の受付・jobを作るtableの件数。評価の前後で変わらないことを確かめる。
   async function countEvalTables(): Promise<Record<string, string>> {
