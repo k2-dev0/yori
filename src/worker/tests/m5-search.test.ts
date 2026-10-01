@@ -34,6 +34,7 @@ import {
   VOYAGE_TOKENIZER_VERSION,
   WORKER_POLICY_VERSION,
   type JevRequest,
+  SEARCH_CANDIDATE_LIMIT,
 } from '../contract.js';
 import { ensureActiveGeneration } from '../embedding.js';
 import { processJob, retryJob } from '../process.js';
@@ -299,16 +300,17 @@ function rankingChoiceSelector(relevanceFor: (text: string) => 'useful' | 'direc
 // 候補source messageの分類結果を保存する。statement_statusと設計方針fingerprintを検索側が参照する。
 async function seedSourceAnalysis(
   pool: Pool,
-  input: { messageId: string; revision?: number; statementStatus?: string; strategyTerms?: readonly string[] },
+  input: { messageId: string; revision?: number; statementStatus?: string; strategyTerms?: readonly string[]; informationSource?: string },
 ): Promise<void> {
   const revision = input.revision ?? 1;
   await pool.query(
     `INSERT INTO message_analysis
        (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
-        continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms)
-     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', $5, true, '["test-model"]'::jsonb, $6, '[]'::jsonb, $7::text[])
+        continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms, information_source)
+     VALUES ($1, $2, $3, $4, 'substantive', 'implementation', '[]'::jsonb, 'none', 'same_topic', $5, true, '["test-model"]'::jsonb, $6, '[]'::jsonb, $7::text[], $8)
      ON CONFLICT (message_id, revision, policy_version) DO UPDATE
-       SET statement_status = EXCLUDED.statement_status, strategy_terms = EXCLUDED.strategy_terms`,
+       SET statement_status = EXCLUDED.statement_status, strategy_terms = EXCLUDED.strategy_terms,
+           information_source = EXCLUDED.information_source`,
     [
       uuidv7(),
       input.messageId,
@@ -317,6 +319,7 @@ async function seedSourceAnalysis(
       input.statementStatus ?? 'unknown',
       sha256Bytes(`${input.messageId}:${revision}`),
       [...(input.strategyTerms ?? [])],
+      input.informationSource ?? 'unknown',
     ],
   );
 }
@@ -1801,6 +1804,99 @@ describe('M5 独立候補判定', () => {
     assert.ok(evidenceIds.includes(messageIds.get('NEW-VERIFIED') as string), '同じrelevanceの検証済み報告を優先していない');
     assert.ok(!evidenceIds.includes(messageIds.get('OLD-PROPOSAL') as string), '古い提案を検証済み報告より優先している');
     assert.ok(!evidenceIds.includes(messageIds.get('LOWER-USEFUL') as string), '低relevance候補を新しさだけで昇格させている');
+  });
+
+  it('過去会話の検索結果を伝えただけの発言は、同じrelevanceの一次情報より下に置く', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector();
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    // 伝聞の方がベクトル類似度・発言状態・新しさのすべてで有利な条件にする。
+    const fixtures = [
+      { marker: 'RELAYED-META', informationSource: 'relayed_history', statementStatus: 'reported_verified', embedding: similarityVector(1) },
+      { marker: 'FIRST-HAND', informationSource: 'first_hand', statementStatus: 'proposal', embedding: similarityVector(2) },
+    ];
+    const messageIds = new Map<string, string>();
+    for (const [index, fixture] of fixtures.entries()) {
+      const text = `${fixture.marker} 端末値引の実装方針`;
+      const message = await seedMessage(pool, {
+        sessionId: sourceSession,
+        sequenceNo: index + 1,
+        role: 'assistant',
+        text,
+        occurredAt: new Date(fixture.marker === 'RELAYED-META' ? '2026-09-30T00:00:00.000Z' : '2026-08-10T00:00:00.000Z'),
+      });
+      messageIds.set(fixture.marker, message.messageId);
+      await seedSourceAnalysis(pool, {
+        messageId: message.messageId,
+        statementStatus: fixture.statementStatus,
+        informationSource: fixture.informationSource,
+      });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `information-source-rank-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: fixture.embedding,
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: '端末値引の実装方針を確認する' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.ok(evidenceIds.includes(messageIds.get('FIRST-HAND') as string), '一次情報を代表根拠にしていない');
+    assert.ok(!evidenceIds.includes(messageIds.get('RELAYED-META') as string), '伝聞を一次情報より優先している');
+  });
+
+  it('伝聞の候補が上限件数を埋めても、一次情報を候補から落とさない', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector();
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    // 上限件数ちょうどの伝聞を一次情報より類似度の高い位置へ置き、一次情報を上限の外へ押し出す。
+    const markers = [...Array.from({ length: SEARCH_CANDIDATE_LIMIT }, (_, index) => `RELAYED-${index + 1}`), 'FIRST-HAND-ORIGIN'];
+    let originId = '';
+    for (const [index, marker] of markers.entries()) {
+      const text = `${marker} 端末値引の実装方針`;
+      const message = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: index + 1, role: 'assistant', text });
+      const isOrigin = marker === 'FIRST-HAND-ORIGIN';
+      originId = isOrigin ? message.messageId : originId;
+      await seedSourceAnalysis(pool, { messageId: message.messageId, informationSource: isOrigin ? 'first_hand' : 'relayed_history' });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `information-source-limit-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: '端末値引の実装方針を確認する' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    assert.ok(
+      jev.requests.some((request) => request.rawBody.includes('FIRST-HAND-ORIGIN')),
+      '一次情報が上限で落ち、関連度の判定へ渡っていない',
+    );
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.ok(evidenceIds.includes(originId), '一次情報を代表根拠にしていない');
   });
 
   it('同じrelevance・statement status・RRFでは新しい発言を安定ID順より優先する', async () => {
