@@ -63,7 +63,8 @@ function jsonSchemaObject(
   properties: Record<string, unknown>,
   required: string[],
 ): Record<string, unknown> {
-  return { type: 'object', properties, required, additionalProperties: false };
+  // 必須項目がないschemaはSDKがrequired自体を出力しない。
+  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}), additionalProperties: false };
 }
 
 // tools/list直下のinputSchemaは$schemaを持ち、ネストしたidentity schemaは持たない形で公開される。
@@ -109,7 +110,7 @@ const EXPECTED_TOOLS = [
         idempotency_key: IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA,
         force_refresh: { type: 'boolean' },
       },
-      ['project_id', 'input_id', 'input_revision', 'query', 'idempotency_key', 'force_refresh'],
+      ['input_id', 'input_revision', 'query', 'idempotency_key', 'force_refresh'],
     ),
   },
   {
@@ -129,7 +130,7 @@ const EXPECTED_TOOLS = [
         source_message_id: SOURCE_IDENTIFIER_INPUT_JSON_SCHEMA,
         revision: REVISION_INPUT_JSON_SCHEMA,
       },
-      ['project_id'],
+      [],
     ),
   },
   {
@@ -141,7 +142,7 @@ const EXPECTED_TOOLS = [
         message_id: UUID_INPUT_JSON_SCHEMA,
         revision: REVISION_INPUT_JSON_SCHEMA,
       },
-      ['project_id', 'message_id', 'revision'],
+      ['message_id', 'revision'],
     ),
   },
   {
@@ -155,7 +156,7 @@ const EXPECTED_TOOLS = [
         to: LINK_SESSION_IDENTITY_INPUT_JSON_SCHEMA,
         evidence: LINK_EVIDENCE_INPUT_JSON_SCHEMA,
       },
-      ['project_id', 'idempotency_key', 'from', 'to', 'evidence'],
+      ['idempotency_key', 'from', 'to', 'evidence'],
     ),
   },
   {
@@ -182,7 +183,6 @@ const EXPECTED_TOOLS = [
         related_files_or_prs: CONVERSATION_TEXT_LIST_INPUT_JSON_SCHEMA,
       },
       [
-        'project_id',
         'idempotency_key',
         'source',
         'source_scope',
