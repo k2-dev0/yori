@@ -10,18 +10,19 @@ import {
   CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX,
   CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX,
   CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX,
-  CANDIDATE_STATEMENT_STATUS_CRITERIA,
-  CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX,
-  CANDIDATE_STATEMENT_STATUSES,
   CANDIDATE_TARGET_MATCH_QUESTION_PREFIX,
   CANDIDATE_YES_NO_CRITERIA,
   JEV_PROVIDER,
   SEARCH_CANDIDATE_BUDGET_TOKENS,
   SEARCH_CANDIDATE_LIMIT,
   SEARCH_ENTITY_LIMIT,
+  SEARCH_CANDIDATE_REQUEST_SIZE,
   SEARCH_MODE_EXACT_VECTOR_AND_ENTITY,
+  SEARCH_MODE_EXACT_VECTOR_ENTITY_AND_STRATEGY,
   SEARCH_RRF_RANK_CONSTANT,
   SEARCH_STATEMENT_TIMEOUT_MS,
+  SEARCH_STRATEGY_LIMIT,
+  SEARCH_STRATEGY_MIN_MATCHED_TERMS,
   SEARCH_VECTOR_LIMIT,
   WORKER_POLICY_VERSION,
   type CandidateRelevance,
@@ -55,7 +56,8 @@ import {
 } from './exploration.js';
 
 // M5のexecute_search処理。開始時に固定した世代で質問を埋め込み、案件内の厳密vector検索と
-// 明示識別子の完全一致検索をRRFで統合し、候補をJevで判定して原文evidence付きの結果を保存する。
+// 明示識別子の完全一致検索、設計方針fingerprintの一致検索をRRFで統合し、
+// 候補をJevで判定して原文evidence付きの結果を保存する。
 // 外部HTTP待ちの間は行ロックを持たず、保存TXでlease・request・候補の有効性を再検証する。
 
 interface SearchRequestRow {
@@ -69,6 +71,8 @@ interface SearchRequestRow {
   input_sequence_no: number;
   question: string | null;
   embedding_generation_id: string | null;
+  // route_searchで得た入力の設計方針fingerprint。NULLは未評価（manual検索・旧受付）。
+  strategy_terms: string[] | null;
 }
 
 interface CandidateSource {
@@ -80,17 +84,23 @@ interface CandidateSource {
   occurred_at: Date;
 }
 
+// 候補を見つけた検索経路。結果へ残し、対象が違う類推候補かどうかを利用側が区別できるようにする。
+type RetrievalKind = 'vector' | 'entity' | 'strategy';
+
 interface Candidate {
   documentId: string;
   revision: number;
   content: string;
   rrfScore: number;
   entityMatched: boolean;
+  retrievalKinds: RetrievalKind[];
+  // source messageの分類済みstatement_statusから決めた候補の報告状態。Jevへは質問しない。
+  statementStatus: CandidateStatementStatus;
   sources: CandidateSource[];
 }
 
-// Jevへ送った候補ごとの独立Choice質問。overallとstatement_statusはrelevance_kindと別fieldで保持する。
-type CandidateQuestionKind = 'overall' | 'statement_status' | CandidateRelevanceKind;
+// Jevへ送った候補ごとの独立Choice質問。overallはrelevance_kindと別fieldで保持する。
+type CandidateQuestionKind = 'overall' | CandidateRelevanceKind;
 
 interface RawChoiceAnswer {
   choice: string;
@@ -184,11 +194,52 @@ const ENTITY_CANDIDATES_SQL = `
    LIMIT $8
 `;
 
+// 設計方針fingerprintの一致経路。fingerprintを持つsource messageから文書revisionへ集約し、
+// 一致した`軸:値`の数が多い順に返す。scope・公開・現在input以降の除外はvector経路と同じ条件にする。
+const STRATEGY_CANDIDATES_SQL = `
+  WITH matched AS (
+    SELECT sx.document_id, sx.document_revision AS revision, count(DISTINCT t.term) AS matched_terms
+      FROM message_analysis a
+      JOIN search_document_sources sx ON sx.message_id = a.message_id AND sx.message_revision = a.revision
+      CROSS JOIN LATERAL unnest(a.strategy_terms) AS t(term)
+     WHERE a.policy_version = $8
+       AND cardinality(a.strategy_terms) > 0
+       AND a.strategy_terms && $4::text[]
+       AND t.term = ANY($4::text[])
+     GROUP BY sx.document_id, sx.document_revision
+    HAVING count(DISTINCT t.term) >= $9
+  )
+  SELECT x.document_id, x.revision, r.content
+    FROM matched x
+    JOIN search_documents d ON d.id = x.document_id
+    JOIN document_search_entries p
+      ON p.document_id = x.document_id AND p.generation_id = $3 AND p.revision = x.revision
+    JOIN search_document_revisions r
+      ON r.document_id = x.document_id AND r.revision = x.revision
+        AND (r.status IN ('ready', 'superseded') OR p.correction_only)
+   WHERE d.company_id = $1
+     AND d.project_id = $2
+     AND NOT EXISTS (
+       SELECT 1
+         FROM search_document_sources sx
+         JOIN messages mx ON mx.id = sx.message_id
+        WHERE sx.document_id = x.document_id
+          AND sx.document_revision = x.revision
+          AND mx.session_id = $5
+          AND mx.sequence_no >= $6
+     )
+   ORDER BY x.matched_terms DESC, x.document_id ASC, x.revision ASC
+   LIMIT $7
+`;
+
+// sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
-         s.start_offset, s.end_offset, s.source_kind, m.occurred_at
+         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, a.statement_status
     FROM search_document_sources s
     JOIN messages m ON m.id = s.message_id
+    LEFT JOIN message_analysis a
+      ON a.message_id = s.message_id AND a.revision = s.message_revision AND a.policy_version = $3
    WHERE (s.document_id, s.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
    ORDER BY s.document_id, s.document_revision, s.display_order
 `;
@@ -215,10 +266,10 @@ interface CandidateRow {
 }
 
 // route順位の1/(60+r)を加算し、同じdocument revisionを1件へまとめる。
-function mergeRoutes(vectorRows: readonly CandidateRow[], entityRows: readonly CandidateRow[]): Map<string, Candidate> {
+function mergeRoutes(routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly CandidateRow[] }>): Map<string, Candidate> {
   const candidates = new Map<string, Candidate>();
-  const addRoute = (rows: readonly CandidateRow[], entityMatched: boolean): void => {
-    for (const [index, row] of rows.entries()) {
+  for (const route of routes) {
+    for (const [index, row] of route.rows.entries()) {
       const key = `${row.document_id}:${row.revision}`;
       const candidate = candidates.get(key) ?? {
         documentId: row.document_id,
@@ -226,16 +277,31 @@ function mergeRoutes(vectorRows: readonly CandidateRow[], entityRows: readonly C
         content: row.content,
         rrfScore: 0,
         entityMatched: false,
+        retrievalKinds: [],
+        statementStatus: 'unknown',
         sources: [],
       };
       candidate.rrfScore += 1 / (SEARCH_RRF_RANK_CONSTANT + index + 1);
-      candidate.entityMatched ||= entityMatched;
+      candidate.entityMatched ||= route.kind === 'entity';
+      if (!candidate.retrievalKinds.includes(route.kind)) {
+        candidate.retrievalKinds.push(route.kind);
+      }
       candidates.set(key, candidate);
     }
-  };
-  addRoute(vectorRows, false);
-  addRoute(entityRows, true);
+  }
   return candidates;
+}
+
+const STATEMENT_STATUS_FROM_ANALYSIS: Readonly<Record<string, CandidateStatementStatus>> = {
+  proposal: 'proposal',
+  reported_completed: 'reported_completed',
+  reported_verified: 'reported_verified',
+};
+
+// source messageの分類済みstatement_statusのうち最も確定度が高いものを候補の報告状態にする。
+function strongerStatus(current: CandidateStatementStatus, analysisStatus: string | null): CandidateStatementStatus {
+  const mapped = analysisStatus === null ? 'unknown' : STATEMENT_STATUS_FROM_ANALYSIS[analysisStatus] ?? 'unknown';
+  return STATEMENT_STATUS_ORDER[mapped] > STATEMENT_STATUS_ORDER[current] ? mapped : current;
 }
 
 // 同じ原文range集合の候補を1件へまとめ、安定順のまま上位10件・現在質問+候補本文の8,000 token予算へ収める。
@@ -304,9 +370,20 @@ async function selectCandidates(
   return { selected, warnings };
 }
 
+function strategyRouteApplicable(terms: readonly string[] | null): terms is readonly string[] {
+  return terms !== null && terms.length >= SEARCH_STRATEGY_MIN_MATCHED_TERMS;
+}
+
 async function loadCandidates(
   pool: Pool,
-  input: { target: JobTarget; generation: EmbeddingGeneration; queryVector: readonly number[]; question: string },
+  input: {
+    target: JobTarget;
+    generation: EmbeddingGeneration;
+    queryVector: readonly number[];
+    question: string;
+    // 一致経路に使う入力fingerprint。nullまたは最小一致数未満なら経路を実行しない。
+    strategyTerms: readonly string[] | null;
+  },
 ): Promise<Candidate[]> {
   // 検索の識別子経路は検索質問から抽出する。autoはinput原文、manualは受付へ保存した質問を使う。
   const identifiers = extractEntityReferences(input.question);
@@ -339,15 +416,37 @@ async function loadCandidates(
               SEARCH_ENTITY_LIMIT,
             ])
           ).rows;
-    const candidates = mergeRoutes(vectorRows.rows, entityRows);
+    const strategyRows = !strategyRouteApplicable(input.strategyTerms)
+      ? []
+      : (
+          await client.query<CandidateRow>(STRATEGY_CANDIDATES_SQL, [
+            input.target.companyId,
+            input.target.projectId,
+            input.generation.id,
+            input.strategyTerms,
+            input.target.sessionId,
+            input.target.sequenceNo,
+            SEARCH_STRATEGY_LIMIT,
+            WORKER_POLICY_VERSION,
+            SEARCH_STRATEGY_MIN_MATCHED_TERMS,
+          ])
+        ).rows;
+    const candidates = mergeRoutes([
+      { kind: 'vector', rows: vectorRows.rows },
+      { kind: 'entity', rows: entityRows },
+      { kind: 'strategy', rows: strategyRows },
+    ]);
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
-      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number }>(CANDIDATE_SOURCES_SQL, [
-        entries.map((candidate) => candidate.documentId),
-        entries.map((candidate) => candidate.revision),
-      ]);
+      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null }>(
+        CANDIDATE_SOURCES_SQL,
+        [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision), WORKER_POLICY_VERSION],
+      );
       for (const row of sources.rows) {
         const candidate = candidates.get(`${row.document_id}:${row.document_revision}`);
+        if (candidate !== undefined) {
+          candidate.statementStatus = strongerStatus(candidate.statementStatus, row.statement_status);
+        }
         candidate?.sources.push({
           message_id: row.message_id,
           message_revision: row.message_revision,
@@ -374,7 +473,8 @@ async function loadCandidates(
   }
 }
 
-// overall relevanceと、計画9.3の6つの独立Choice質問を候補ごとに組み立てる。
+// overall relevanceと、計画9.3の独立Choice質問を候補ごとに組み立てる。
+// statement_statusはsource messageの分類結果から決めるため、候補判定では質問しない。
 function buildCandidateQuestions(candidates: readonly Candidate[]): {
   questions: Record<string, JevChoiceQuestion>;
   index: Map<string, { candidate: Candidate; kind: CandidateQuestionKind }>;
@@ -436,22 +536,38 @@ function buildCandidateQuestions(candidates: readonly Candidate[]): {
       `candidate_id=${key}の解決方法または調査手順を再利用できるか選ぶ。`,
       CANDIDATE_YES_NO_CRITERIA,
     );
-    addQuestion(
-      candidate,
-      'statement_status',
-      CANDIDATE_STATEMENT_STATUS_QUESTION_PREFIX,
-      `candidate_id=${key}の発言が提案・完了報告・検証済み報告のどれかstatement_statusを選ぶ。実行証跡の有無は推定しない。`,
-      CANDIDATE_STATEMENT_STATUS_CRITERIA,
-    );
   }
   return { questions, index };
 }
 
+interface CandidateEvaluationInput {
+  target: JobTarget;
+  config: WorkerConfig;
+  candidates: readonly Candidate[];
+  jobKind: string;
+  question: string;
+}
+
+// 候補をSEARCH_CANDIDATE_REQUEST_SIZE件ずつのJev requestへ分け、並列に送って候補ごとの判定へ写す。
+// 全requestの完了（usage記録）を待ってから、最初の失敗を既存のエラー分類のまま返す。
+async function evaluateCandidates(pool: Pool, input: CandidateEvaluationInput): Promise<CandidateAssessment[]> {
+  const batches: Candidate[][] = [];
+  for (let index = 0; index < input.candidates.length; index += SEARCH_CANDIDATE_REQUEST_SIZE) {
+    batches.push(input.candidates.slice(index, index + SEARCH_CANDIDATE_REQUEST_SIZE));
+  }
+  const settled = await Promise.allSettled(batches.map((candidates) => evaluateCandidateBatch(pool, { ...input, candidates })));
+  const assessments: CandidateAssessment[] = [];
+  for (const outcome of settled) {
+    if (outcome.status === 'rejected') {
+      throw outcome.reason;
+    }
+    assessments.push(...outcome.value);
+  }
+  return assessments;
+}
+
 // Jevへ候補本文と質問を送り、回答を候補ごとのrelevance・relevance_kindへ写す。
-async function evaluateCandidates(
-  pool: Pool,
-  input: { target: JobTarget; config: WorkerConfig; candidates: readonly Candidate[]; jobKind: string; question: string },
-): Promise<CandidateAssessment[]> {
+async function evaluateCandidateBatch(pool: Pool, input: CandidateEvaluationInput): Promise<CandidateAssessment[]> {
   const { questions, index } = buildCandidateQuestions(input.candidates);
   // Jevの現在質問はmanual受付の質問、autoはinput原文。入力identityは検索対象messageのまま固定する。
   const state: JevState = {
@@ -537,7 +653,7 @@ async function evaluateCandidates(
       candidate,
       relevance: 'unrelated',
       relevanceKinds: [],
-      statementStatus: 'unknown',
+      statementStatus: candidate.statementStatus,
       answers: {},
     });
   }
@@ -555,12 +671,6 @@ async function evaluateCandidates(
     if (question.kind === 'overall') {
       if ((CANDIDATE_RELEVANCES as readonly string[]).includes(answer.choice)) {
         assessment.relevance = answer.choice as CandidateRelevance;
-      }
-      continue;
-    }
-    if (question.kind === 'statement_status') {
-      if ((CANDIDATE_STATEMENT_STATUSES as readonly string[]).includes(answer.choice)) {
-        assessment.statementStatus = answer.choice as CandidateStatementStatus;
       }
       continue;
     }
@@ -753,6 +863,8 @@ function buildMatch(
     case_or_document_id: assessment.candidate.documentId,
     relevance: assessment.relevance,
     relevance_kind: assessment.relevanceKinds,
+    // 候補を見つけた検索経路。strategyだけの候補は対象・用語が違う同型設計の類推候補を表す。
+    retrieval_kinds: assessment.candidate.retrievalKinds,
     statement_status: assessment.statementStatus,
     // claim_statusは報告の種類。reported_verifiedをツール実証済みへ格上げしない。
     claim_status: agentReported ? 'agent_reported' : 'not_reported',
@@ -771,6 +883,7 @@ function buildCandidateEvaluations(evaluations: readonly CandidateAssessment[], 
     revision: assessment.candidate.revision,
     relevance: assessment.relevance,
     relevance_kind: assessment.relevanceKinds,
+    retrieval_kinds: assessment.candidate.retrievalKinds,
     statement_status: assessment.statementStatus,
     adopted: adoptedKey !== null && candidateKey(assessment.candidate) === adoptedKey,
     answers: assessment.answers,
@@ -782,6 +895,7 @@ async function loadIndexStatus(
   companyId: string,
   projectId: string,
   generation: EmbeddingGeneration | null,
+  searchMode: string,
 ): Promise<unknown> {
   const counts = await client.query<{ pending: string; failed: string }>(
     `SELECT count(*) FILTER (WHERE r.status IN ('pending', 'embedding'))::text AS pending,
@@ -795,7 +909,7 @@ async function loadIndexStatus(
     pending_documents: Number(counts.rows[0]?.pending ?? '0'),
     failed_documents: Number(counts.rows[0]?.failed ?? '0'),
     embedding_generation_id: generation === null ? null : generation.id,
-    search_mode: SEARCH_MODE_EXACT_VECTOR_AND_ENTITY,
+    search_mode: searchMode,
   };
 }
 
@@ -958,6 +1072,7 @@ async function saveSearchResult(
     warnings: readonly SearchWarning[];
     evaluations: readonly CandidateAssessment[];
     exploration: ExplorationResult | null;
+    searchMode?: string;
   },
 ): Promise<void> {
   const client = await pool.connect();
@@ -1084,7 +1199,13 @@ async function saveSearchResult(
         break;
       }
     }
-    const indexStatus = await loadIndexStatus(client, input.target.companyId, input.target.projectId, input.generation);
+    const indexStatus = await loadIndexStatus(
+      client,
+      input.target.companyId,
+      input.target.projectId,
+      input.generation,
+      input.searchMode ?? SEARCH_MODE_EXACT_VECTOR_AND_ENTITY,
+    );
     const result = {
       request_id: input.request.id,
       input_id: input.target.messageId,
@@ -1150,7 +1271,7 @@ export function searchRequestIdFromPayload(payload: unknown): string | null {
 async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
     `SELECT id, trigger, search_action, status, result, input_message_id, input_message_revision, input_sequence_no, question,
-              embedding_generation_id
+              embedding_generation_id, strategy_terms
        FROM search_requests
       WHERE id = $1
         AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
@@ -1270,14 +1391,23 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   }
   const provider = new VoyageEmbeddingProvider(pool, config);
   const queryVector = await provider.embedQuery(question, generation);
-  const candidates = await loadCandidates(pool, { target, generation, queryVector, question });
-  const { selected, warnings } = await selectCandidates(candidates, questionTokens);
+  // manual検索の質問は入力発言と異なるため、入力のfingerprintを流用しない。
+  const strategyTerms = request.trigger === 'auto' ? request.strategy_terms : null;
+  const candidates = await loadCandidates(pool, { target, generation, queryVector, question, strategyTerms });
+  const selection = await selectCandidates(candidates, questionTokens);
+  const { selected } = selection;
+  const warnings = [...selection.warnings];
+  const searchMode = strategyRouteApplicable(strategyTerms) ? SEARCH_MODE_EXACT_VECTOR_ENTITY_AND_STRATEGY : SEARCH_MODE_EXACT_VECTOR_AND_ENTITY;
+  if (request.trigger === 'auto' && strategyTerms === null) {
+    // 設計方針経路を使えない部分検索であることを結果へ明示する。通常検索の結果として黙って返さない。
+    warnings.push({ code: 'strategy_fingerprint_unavailable' });
+  }
   if (selected.length === 0) {
     if (candidates.length > 0) {
       // 候補は存在するが全件が質問込みtoken予算に収まらない。no_matchに偽装せず恒久failedにする。
       throw new InputBudgetError();
     }
-    await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [], exploration: null });
+    await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [], exploration: null, searchMode });
     return;
   }
   const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, question });
@@ -1309,5 +1439,6 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     warnings,
     evaluations: assessments,
     exploration,
+    searchMode,
   });
 }
