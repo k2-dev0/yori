@@ -65,10 +65,6 @@ export const STATEMENT_STATUSES = [
 ] as const;
 export type StatementStatus = (typeof STATEMENT_STATUSES)[number];
 
-// 発言内容の出どころ。過去会話の検索結果の引用・要約はrelayed_historyとし、一次情報と区別する。話題が検索の仕組みかどうかでは分けない。
-export const INFORMATION_SOURCES = ['first_hand', 'relayed_history', 'unknown'] as const;
-export type InformationSource = (typeof INFORMATION_SOURCES)[number];
-
 export const SAME_CONDITION_VALUES = ['yes', 'no', 'unknown'] as const;
 export type SameCondition = (typeof SAME_CONDITION_VALUES)[number];
 export const JEV_SAME_CONDITIONS_QUESTION_ID = 'same_conditions';
@@ -79,7 +75,7 @@ export const RELATION_ACTIONS = ['accept', 'reject', 'revoke', 'change'] as cons
 export type RelationAction = (typeof RELATION_ACTIONS)[number];
 
 // 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
-export const JEV_QUESTIONS_VERSION = 'm3-4';
+export const JEV_QUESTIONS_VERSION = 'm3-5';
 
 // ---- M4 Voyage埋め込みの固定契約（計画3.3） ----
 export const VOYAGE_PROVIDER = 'voyage_direct';
@@ -112,7 +108,6 @@ export const JEV_PART_FIELDS = [
   'decision_action',
   'continuity',
   'statement_status',
-  'information_source',
   'search_action',
   'relation_target',
 ] as const;
