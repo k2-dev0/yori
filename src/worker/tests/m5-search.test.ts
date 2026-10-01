@@ -227,9 +227,10 @@ function basisVector(index: number, value = 1): number[] {
 }
 
 // 第1軸との類似度がrankに従って下がるvector。rankが小さいほど距離が近い。
+// rankごとに別の軸も持たせ、候補同士は互いに近くならないようにする（内容の重複として畳まれない別々の候補を表す）。
 function similarityVector(rank: number): number[] {
-  const vector = basisVector(0, 1);
-  vector[1] = rank * 0.01;
+  const vector = basisVector(0, 1 - rank * 0.01);
+  vector[200 + rank] = 0.8;
   return vector;
 }
 
@@ -1746,7 +1747,8 @@ describe('M5 順位統合とJev投入量', () => {
         documentKey: `dup-range-${suffix}`,
         content: text,
         generationId: generation.id,
-        embedding: queryVector,
+        // 埋め込みの近さでは畳まれない別々のvectorにし、原文範囲の重複除外そのものを検証する。
+        embedding: similarityVector(suffix === 'a' ? 1 : 2),
         sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
       });
     }
