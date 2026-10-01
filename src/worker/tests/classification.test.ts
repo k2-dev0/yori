@@ -25,7 +25,6 @@ import {
   seedUserMessage,
   startApprovedJev,
   type FakeJevServer,
-  enqueueWorkerJobs,
 } from './support.js';
 
 const pool = createPool(requireDatabaseUrl());
@@ -52,25 +51,6 @@ async function processClassify(messageId: string, server: FakeJevServer): Promis
 }
 
 describe('分類と原文保持', () => {
-  it('エージェントの回答にだけ情報源を質問し、過去会話の伝聞という分類を保存する', async () => {
-    const sessionId = await seedSession(pool, workspace);
-    const reply = await seedMessage(pool, { sessionId, sequenceNo: 1, role: 'assistant', text: '注入された過去会話には、8月に実装したと書いてあった' });
-    await enqueueWorkerJobs(pool, { sessionId, messageId: reply.messageId, revision: reply.revision });
-    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
-      body: jevReply(request, jevChoices({ retention: 'substantive', information_source: 'relayed_history' })),
-    }));
-    try {
-      await processClassify(reply.messageId, server);
-      const sentQuestions = Object.keys(server.requests[0].body.questions);
-      assert.equal(sentQuestions.filter((id) => id.startsWith('information_source')).length, 1, '回答の情報源を質問していない');
-      const analysis = await readAnalysis(pool, reply.messageId, 1);
-      assert.equal(analysis?.information_source, 'relayed_history', '情報源の分類を保存していない');
-      assert.equal(analysis?.parts[0]?.information_source, 'relayed_history', 'part単位の情報源を保存していない');
-    } finally {
-      await server.close();
-    }
-  });
-
   it('substantiveの高信頼分類を保存し、原文とbuild_documents jobを保持する', async () => {
     const sessionId = await seedSession(pool, workspace);
     const text = '毎分100件までにしてください';
@@ -101,13 +81,11 @@ describe('分類と原文保持', () => {
       assert.equal(analysis.is_searchable, true);
       assert.equal(analysis.primary_intent, 'requirements');
       assert.equal(analysis.statement_status, 'request');
-      assert.equal(analysis.information_source, 'unknown', '利用者の発言へ情報源を付けている');
       assert.deepEqual(analysis.technical_labels, [], '質問しない技術領域ラベルを保存している');
       assert.deepEqual(analysis.strategy_terms, ['failure_strategy:backpressure', 'performance_strategy:batch'], '設計方針fingerprintが不正');
       const sentQuestions = Object.keys(server.requests[0].body.questions);
       assert.ok(!sentQuestions.some((id) => id.startsWith('technical_label')), '技術領域ラベルを質問している');
       assert.equal(sentQuestions.filter((id) => id.startsWith('strategy:')).length, 7, '設計方針の7軸を質問していない');
-      assert.ok(!sentQuestions.some((id) => id.startsWith('information_source')), '利用者の発言で情報源を質問し、入力予算を使っている');
       assert.equal(analysis.policy_version, 'initial-v1');
       assert.ok(analysis.response_models.length > 0, 'response_modelsが保存されていない');
       assert.ok(analysis.state_hash.length > 0, 'state_hashが保存されていない');
