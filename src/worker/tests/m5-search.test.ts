@@ -2137,6 +2137,7 @@ describe('M5 provider障害の分類', () => {
     voyageRequestTimeoutMs?: number;
     expectedJobStatus: string;
     expectedCode: string;
+    expectedDetail: string;
     expectedVoyageCalls: number;
     expectedJevCalls: number;
   }
@@ -2147,6 +2148,7 @@ describe('M5 provider障害の分類', () => {
       voyageResponder: () => ({ status: 429, headers: { 'retry-after': '1' }, body: {} }),
       expectedJobStatus: 'pending',
       expectedCode: 'provider_rate_limited',
+      expectedDetail: 'voyage',
       expectedVoyageCalls: 1,
       expectedJevCalls: 0,
     },
@@ -2155,6 +2157,7 @@ describe('M5 provider障害の分類', () => {
       voyageResponder: () => ({ status: 500, body: {} }),
       expectedJobStatus: 'pending',
       expectedCode: 'provider_unavailable',
+      expectedDetail: 'voyage',
       expectedVoyageCalls: 1,
       expectedJevCalls: 0,
     },
@@ -2164,6 +2167,7 @@ describe('M5 provider障害の分類', () => {
       voyageRequestTimeoutMs: 200,
       expectedJobStatus: 'pending',
       expectedCode: 'provider_timeout',
+      expectedDetail: 'voyage',
       expectedVoyageCalls: 1,
       expectedJevCalls: 0,
     },
@@ -2172,6 +2176,7 @@ describe('M5 provider障害の分類', () => {
       voyageResponder: (request) => ({ body: voyageBody(request.input ?? [], () => new Array<number>(VOYAGE_DIMENSIONS).fill(0)) }),
       expectedJobStatus: 'failed',
       expectedCode: 'provider_contract_invalid',
+      expectedDetail: 'voyage:embedding_zero',
       expectedVoyageCalls: 1,
       expectedJevCalls: 0,
     },
@@ -2180,6 +2185,7 @@ describe('M5 provider障害の分類', () => {
       jevResponder: () => ({ status: 503, body: {} }),
       expectedJobStatus: 'pending',
       expectedCode: 'provider_unavailable',
+      expectedDetail: 'jev',
       expectedVoyageCalls: 1,
       expectedJevCalls: 1,
     },
@@ -2188,6 +2194,7 @@ describe('M5 provider障害の分類', () => {
       jevResponder: () => ({ body: {} }),
       expectedJobStatus: 'failed',
       expectedCode: 'provider_contract_invalid',
+      expectedDetail: 'jev:response_shape',
       expectedVoyageCalls: 1,
       expectedJevCalls: 1,
     },
@@ -2226,6 +2233,7 @@ describe('M5 provider障害の分類', () => {
       const request = await readSearchRequest(pool, seeded.requestId);
       assert.equal(request.status, 'failed', 'provider障害をfailedへ反映していない');
       assert.equal(request.error_code, errorCase.expectedCode);
+      assert.equal(request.error_detail, errorCase.expectedDetail, '失敗したproviderと検証条件を記録していない');
       assert.notEqual(request.outcome, 'no_match');
       assert.equal(request.result, null);
       assert.equal(voyage.requests.length, errorCase.expectedVoyageCalls);
