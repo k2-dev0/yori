@@ -116,8 +116,9 @@ export async function evaluateSearchCases(
   cases: readonly SearchEvalCase[],
 ): Promise<SearchEvalResult> {
   const owner = await pool.query<{ company_id: string; employee_id: string }>(
-    `SELECT p.company_id, m.employee_id FROM projects p JOIN project_members m ON m.project_id = p.id
-      WHERE p.id = $1 ORDER BY m.employee_id LIMIT 1`,
+    // 所属の登録がない案件にも会話は保存されるため、持ち主は案件の既存の会話から選ぶ。検索の範囲は社員で絞らない。
+    `SELECT p.company_id, s.employee_id FROM projects p JOIN sessions s ON s.project_id = p.id
+      WHERE p.id = $1 ORDER BY s.employee_id LIMIT 1`,
     [projectId],
   );
   const scope = owner.rows[0];
