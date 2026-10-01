@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// 配布用single-file collector artifactとmanifest（version/checksum）を生成する。
+// 配布用single-file artifact（collectorとMCP）と各manifest（version/Git SHA/checksum）を生成する。
 // esbuildはdevDependencyとして直接固定し、transitive依存へ暗黙依存しない。
-// Node >= 24のnode:ビルトインだけをexternalにし、zod・uuid等は1ファイルへbundleする。
+// Node >= 24のnode:ビルトインだけをexternalにし、zod・MCP SDK等は1ファイルへbundleする。
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -10,35 +10,46 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const OUT_DIR = path.join(REPO_ROOT, 'dist', 'collector');
-const ARTIFACT_NAME = 'yori-collector.mjs';
-const ARTIFACT_PATH = path.join(OUT_DIR, ARTIFACT_NAME);
-const MANIFEST_PATH = path.join(OUT_DIR, 'collector-manifest.json');
+const DIST_DIR = path.join(REPO_ROOT, 'dist');
+// 配布物の一覧。versionとGit SHAは下で1回だけ解決し、全対象のmanifestへ同じ値を書く。
+const ARTIFACTS = [
+  { name: 'collector', entry: 'src/collector/cli.ts', file: 'yori-collector.mjs', manifest: 'collector-manifest.json' },
+  { name: 'mcp', entry: 'src/mcp/server.ts', file: 'yori-mcp.mjs', manifest: 'mcp-manifest.json' },
+];
 
-await build({
-  entryPoints: [path.join(REPO_ROOT, 'src', 'collector', 'cli.ts')],
-  outfile: ARTIFACT_PATH,
-  bundle: true,
-  platform: 'node',
-  format: 'esm',
-  target: 'node24',
-  // 配布物へsource path・法務コメントを残さず、repositoryやnode_modulesへの依存を持たせない。
-  minify: true,
-  legalComments: 'none',
-  logLevel: 'silent',
-});
-
-const bytes = readFileSync(ARTIFACT_PATH);
+// yori-cliは両manifestのversionを自身のversionと照合するため、出どころをこの1 fileに限定する。
 const { version } = JSON.parse(readFileSync(path.join(REPO_ROOT, 'src', 'collector', 'package.json'), 'utf8'));
 const git = spawnSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: REPO_ROOT, encoding: 'utf8' });
 if (git.status !== 0 || !/^[0-9a-f]{40}$/.test(git.stdout.trim())) {
-  throw new Error('collector artifact: Git SHAを解決できません');
+  throw new Error('artifact: Git SHAを解決できません');
 }
-const manifest = {
-  version,
-  file: ARTIFACT_NAME,
-  git_sha: git.stdout.trim(),
-  checksum: createHash('sha256').update(bytes).digest('hex'),
-};
-writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-console.log(`collector artifact: ${path.relative(REPO_ROOT, ARTIFACT_PATH)} v${version}`);
+const gitSha = git.stdout.trim();
+
+async function buildArtifact(artifact) {
+  const outDir = path.join(DIST_DIR, artifact.name);
+  const artifactPath = path.join(outDir, artifact.file);
+  await build({
+    entryPoints: [path.join(REPO_ROOT, artifact.entry)],
+    outfile: artifactPath,
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node24',
+    // 配布物へsource path・法務コメントを残さず、repositoryやnode_modulesへの依存を持たせない。
+    minify: true,
+    legalComments: 'none',
+    logLevel: 'silent',
+  });
+  const manifest = {
+    version,
+    file: artifact.file,
+    git_sha: gitSha,
+    checksum: createHash('sha256').update(readFileSync(artifactPath)).digest('hex'),
+  };
+  writeFileSync(path.join(outDir, artifact.manifest), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  console.log(`${artifact.name} artifact: ${path.relative(REPO_ROOT, artifactPath)} v${version}`);
+}
+
+for (const artifact of ARTIFACTS) {
+  await buildArtifact(artifact);
+}
