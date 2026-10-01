@@ -695,6 +695,9 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
     const primaries = await loadPrimarySessions(input, originSessionIds);
     const candidates = await loadInferredSessions(input, primaries, excluded);
     if (candidates.length > 0) {
+      // 上限内の推定候補sessionを先に確定し、Jev判定を並列に送って待ち時間を候補数に比例させない。
+      // 採用・打切りの判定は従来どおり候補順に適用し、最初の失敗以降は採用しない。
+      const planned: Array<{ sessionId: string; context: MessageRow[] }> = [];
       for (const sessionId of candidates) {
         if (visitedSessions.size >= SESSION_LIMIT) {
           truncated = true;
@@ -703,10 +706,18 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
         }
         visitedSessions.add(sessionId);
         const context = await loadInferredContext(input, sessionId);
-        if (context.length === 0) {
-          continue;
+        if (context.length > 0) {
+          planned.push({ sessionId, context });
         }
-        const outcome = await evaluateInferredSession(input, sessionId, context);
+      }
+      const settled = await Promise.allSettled(planned.map((item) => evaluateInferredSession(input, item.sessionId, item.context)));
+      for (const [index, item] of planned.entries()) {
+        const result = settled[index];
+        if (result?.status === 'rejected') {
+          // 承認失効などの例外は従来どおり呼出元へ返す。
+          throw result.reason;
+        }
+        const outcome = result?.value;
         if (outcome === 'failed') {
           // 推定探索だけを打ち切り、代表matchをno_matchやfailedへ変えない。
           truncated = true;
@@ -714,7 +725,7 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
           break;
         }
         if (outcome === 'adopted') {
-          for (const row of context) {
+          for (const row of item.context) {
             add(draftOf(row, 'inferred_session_link'));
           }
         }
