@@ -99,6 +99,8 @@ interface Candidate {
   statementStatus: CandidateStatementStatus;
   // sourceに、過去会話の検索結果を伝えただけと分類された発言を含む。一次情報より後ろへ回す。
   relayedHistory: boolean;
+  // sourceが利用者の依頼だけで、答えを含まない。回答を含む候補より後ろへ回す。
+  requestOnly: boolean;
   // この候補をvector経路で最上位に引いた質問の区切り。判定ではこの区切りを質問にする。
   queryChunkIndex: number;
   sources: CandidateSource[];
@@ -240,7 +242,7 @@ const STRATEGY_CANDIDATES_SQL = `
 // sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
-         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, a.statement_status, a.information_source
+         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, m.role, a.statement_status, a.information_source
     FROM search_document_sources s
     JOIN messages m ON m.id = s.message_id
     LEFT JOIN message_analysis a
@@ -270,6 +272,12 @@ interface CandidateRow {
   content: string;
 }
 
+// 答えそのものではない候補を1、それ以外を0にする。伝聞と、識別子の一致がない依頼だけの候補が該当する。
+// 明示識別子が一致した依頼は有用な根拠なので後ろへ回さない。
+function secondaryRank(candidate: Candidate): number {
+  return Number(candidate.relayedHistory || (candidate.requestOnly && !candidate.entityMatched));
+}
+
 // route順位の1/(60+r)を加算し、同じdocument revisionを1件へまとめる。
 function mergeRoutes(
   routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly CandidateRow[]; chunkIndex?: number }>,
@@ -288,6 +296,7 @@ function mergeRoutes(
         retrievalKinds: [],
         statementStatus: 'unknown',
         relayedHistory: false,
+        requestOnly: true,
         queryChunkIndex: 0,
         sources: [],
       };
@@ -454,7 +463,7 @@ async function loadCandidates(
     ]);
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
-      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; information_source: string | null }>(
+      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; information_source: string | null; role: string }>(
         CANDIDATE_SOURCES_SQL,
         [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision), WORKER_POLICY_VERSION],
       );
@@ -463,6 +472,7 @@ async function loadCandidates(
         if (candidate !== undefined) {
           candidate.statementStatus = strongerStatus(candidate.statementStatus, row.statement_status);
           candidate.relayedHistory ||= row.information_source === 'relayed_history';
+          candidate.requestOnly &&= row.role === 'user' && row.statement_status === 'request';
         }
         candidate?.sources.push({
           message_id: row.message_id,
@@ -488,10 +498,10 @@ async function loadCandidates(
       ],
     );
     await client.query('COMMIT');
-    // 伝聞の候補を上限件数で切る前に後ろへ回し、一次情報を候補から押し出させない。除外はせず、他に候補がなければ残す。
+    // 伝聞と依頼だけの候補を上限件数で切る前に後ろへ回し、答えを含む一次情報を候補から押し出させない。
+    // 除外はせず、他に候補がなければ残す。
     return [...candidates.values()].sort(
-      (left, right) =>
-        Number(left.relayedHistory) - Number(right.relayedHistory) || right.rrfScore - left.rrfScore || compareCandidates(left, right),
+      (left, right) => secondaryRank(left) - secondaryRank(right) || right.rrfScore - left.rrfScore || compareCandidates(left, right),
     );
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
@@ -724,7 +734,7 @@ function latestSourceTime(candidate: Candidate): number {
   return latest;
 }
 
-// relevanceを最優先し、同じrelevanceでは一次情報を伝聞より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
+// relevanceを最優先し、同じrelevanceでは答えを含む一次情報を伝聞・依頼だけの候補より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
 // status不明同士は新しさで推測せず、従来のRRF・document ID順を維持する。
 function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAssessment[] {
   return assessments
@@ -734,9 +744,9 @@ function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAss
       if (relevance !== 0) {
         return relevance;
       }
-      const relayed = Number(left.candidate.relayedHistory) - Number(right.candidate.relayedHistory);
-      if (relayed !== 0) {
-        return relayed;
+      const secondary = secondaryRank(left.candidate) - secondaryRank(right.candidate);
+      if (secondary !== 0) {
+        return secondary;
       }
       const entityMatch = Number(right.candidate.entityMatched) - Number(left.candidate.entityMatched);
       if (entityMatch !== 0) {
