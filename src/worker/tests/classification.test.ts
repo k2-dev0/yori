@@ -61,7 +61,8 @@ describe('分類と原文保持', () => {
           retention: 'substantive',
           primary_intent: 'requirements',
           statement_status: 'request',
-          'technical_label:backend': 'yes',
+          'strategy:failure_strategy': 'backpressure',
+          'strategy:performance_strategy': 'batch',
         }),
       ),
     }));
@@ -79,7 +80,11 @@ describe('分類と原文保持', () => {
       assert.equal(analysis.is_searchable, true);
       assert.equal(analysis.primary_intent, 'requirements');
       assert.equal(analysis.statement_status, 'request');
-      assert.ok(analysis.technical_labels.includes('backend'), `technical_labelsが不正: ${analysis.technical_labels.join(',')}`);
+      assert.deepEqual(analysis.technical_labels, [], '質問しない技術領域ラベルを保存している');
+      assert.deepEqual(analysis.strategy_terms, ['failure_strategy:backpressure', 'performance_strategy:batch'], '設計方針fingerprintが不正');
+      const sentQuestions = Object.keys(server.requests[0].body.questions);
+      assert.ok(!sentQuestions.some((id) => id.startsWith('technical_label')), '技術領域ラベルを質問している');
+      assert.equal(sentQuestions.filter((id) => id.startsWith('strategy:')).length, 7, '設計方針の7軸を質問していない');
       assert.equal(analysis.policy_version, 'initial-v1');
       assert.ok(analysis.response_models.length > 0, 'response_modelsが保存されていない');
       assert.ok(analysis.state_hash.length > 0, 'state_hashが保存されていない');
@@ -300,7 +305,7 @@ describe('分類と原文保持', () => {
         request,
         jevChoices({
           retention: { choice: 'progress_only', confidence: 0.5 },
-          'technical_label:backend': { choice: 'yes', confidence: 0.5 },
+          'strategy:consistency_strategy': { choice: 'idempotency', confidence: 0.5 },
         }),
       ),
     }));
@@ -310,7 +315,7 @@ describe('分類と原文保持', () => {
       assert.ok(analysis, 'message_analysisが保存されていない');
       assert.equal(analysis.retention_category, 'unknown', '低信頼分類を採用している');
       assert.equal(analysis.is_searchable, true, '低信頼分類で検索対象から外している');
-      assert.equal(analysis.technical_labels.includes('backend'), false, '低信頼ラベルを採用している');
+      assert.deepEqual(analysis.strategy_terms, [], '低信頼の設計方針を採用している');
     } finally {
       await server.close();
     }
