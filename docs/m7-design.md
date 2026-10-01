@@ -11,7 +11,7 @@ M8の再索引・世代切替・配置・性能検証は対象外。検索の開
 1. `link_session`は引き継ぎ元・先・根拠発言を取り込み元identityで受け、認証社員が所属する同一会社・同一案件の内部IDへ解決して保存する。引き継ぎ先は認証社員本人のセッションとし、別案件・別会社の存在は開示しない。同じ冪等キーの同内容再送は同じリンクを返し、内容違いはconflict、自己リンクはinvalid requestにする。
 2. 代表根拠と同じセッションから、sequence上の前後2発言を現在revisionで取得する。現在入力以降の同一セッション発言、旧revision、別案件は含めない。
 3. 明示セッションリンクを優先して両方向へ探索し、最大3ホップ・合計10セッションで止める。訪問済みセッションIDで循環を検出する。
-4. 同社員・同案件の時刻隣接セッションは前後各3件まで推定候補にする。他社員のセッションは明示リンクまたは代表根拠と共通する明示Issue／PR entityがある場合だけ候補にする。各候補はJevで現在質問と継続元の双方に有用と判定された場合だけ採用し、時刻隣接だけでは採用しない。
+4. 推定のセッション継続はバックグラウンドで判定して保存する。各セッションの文書構築後に`judge_continuity` jobを10分遅延で1件登録し、同社員・同案件の直前3セッションと、共通する明示Issue／PR entityを持つセッションを候補として、1回のJev requestで「作業を引き継いでいるか」を判定する。高信頼の継続だけを`session_continuity_judgments`へ継続として保存し、判定済みの組は再判定しない。時刻隣接だけでは採用しない。検索時はJevを呼ばず、継続と判定されたセッションの文書のうち質問の埋め込みに近いものだけを推定候補として付ける。
 5. `revoke`・`change`の後続関係を最大3ホップで追跡し、元根拠を残したまま訂正・撤回原文と関係種別を返す。訪問済みmessage ID＋revisionで循環を検出する。
 6. 最終コンテキストは既存のVoyage tokenizerで約6,000 tokenを上限とし、代表根拠、訂正・撤回、明示リンク、推定リンクの順で採用する。代表根拠の原文は切り詰めない。候補数・hop・session数・token予算・外部判定失敗で探索を打ち切った場合は`truncated=true`と機械可読なwarningを返す。
 7. 保存直前と結果取得時に、原文のcurrent revision、案件所属、検索対象入力のrevision、relation/linkの有効状態を再検証する。現在入力以降の同一セッション発言は周辺・引き継ぎ・訂正のどの経路でも返さない。
@@ -84,9 +84,9 @@ MCP toolはHTTP APIと同じstrict入力を受け、中央APIの成功応答をs
 2. primary evidenceごとに同一sessionのsequence前後2発言をcurrent revisionで読む。
 3. `message_relations.to -> from`方向（旧target -> source）へ`revoke`・`change`を最大3ホップ探索する。訂正・撤回自身に後続関係があれば同じ上限内で追う。
 4. primary sessionからactiveな明示session linkを両方向へ幅優先探索する。link先に根拠messageが属すればその前後2発言、属さなければ順方向の継続先は先頭5発言、逆方向の引き継ぎ元は末尾5発言を候補文脈にする。
-5. 明示linkを処理した後、同社員・同案件のstarted_at前後各3sessionと、共通Issue／PR entityを持つ同案件sessionを推定候補にする。
-6. 推定候補ごとに、現在質問、代表根拠、継続元文脈、候補文脈をJevへ渡す。現在質問への関連性と継続元との連続性を独立Choiceで判定し、両方が`useful`または`direct`の場合だけ採用する。
-7. 推定候補のJev失敗は代表matchを`no_match`へ変えず、推定探索を打ち切って`truncated=true`、`context_expansion_failed` warningにする。provider障害を「全探索済み」と表示しない。
+5. 明示linkを処理した後、primary sessionとどちら向きでも継続と判定済みの同案件sessionを推定候補にする。既出sessionと、primaryと明示link（active/revoked）でつながるsessionは除く。
+6. 推定候補sessionの公開文書（各session最新200件まで）を質問の埋め込みと比べ、各session最大2件のうち、類似度が0.3以上かつ代表文書の類似度の0.8倍以上の文書だけを採用し、そのsource messageを返す。継続判定は質問に依存しないため、質問との関連はこの近さで確認する。
+7. 検索時の推定探索は外部HTTPを呼ばない。継続判定jobのJev失敗は通常のjob再試行で扱い、判定前のsessionは推定候補にならない。
 
 合計10sessionにはprimary sessionを含む。明示link、推定候補とも最大3ホップを超えない。sessionとmessage revisionの訪問済み集合を別に持ち、循環時に同じ原文を再追加しない。
 
@@ -146,7 +146,7 @@ collector CLIへ同期`notify`と非同期`notify-late`を追加し、既存のc
 - MCP `link_session`のschema、HTTP mapping、応答検証、障害区別、stdout非汚染
 - 前後2発言、現在入力境界、current revision、別案件除外
 - 明示link優先、両方向、3 hop、10 session、循環検知
-- 隣接sessionと共通Issue／PR候補のJev採否、他社員の時刻隣接除外
+- 継続判定jobの候補選定（直前3session・共通Issue／PR・他社員の時刻隣接除外）、1回のJev判定、判定済みの組の再判定防止、検索時の埋め込み近さによる採否
 - `revoke`・`change`の後続取得、chain、循環、原文保持
 - 6,000 token予算、優先順、`truncated`、warning
 - 候補判定中のrevision・link・relation・lease競合
