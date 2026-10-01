@@ -13,6 +13,8 @@ export class VoyageCallError extends Error {
     readonly code: string,
     readonly retryable: boolean,
     readonly retryAfterMs?: number,
+    // 応答検証のどの条件で落ちたかを示す固定識別子。原文や応答値は入れない。
+    readonly detail?: string,
   ) {
     super(code);
   }
@@ -81,36 +83,36 @@ export function extractVoyageInputTokens(json: unknown): number | null {
 // 件数・index・model・次元・有限値・非ゼロ・usageを検証し、index順に入力対応へ並べ直す。
 export function validateVoyageResponse(json: unknown, expectedCount: number): VoyageEmbeddingResponse {
   if (!isRecord(json)) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'response_shape');
   }
   if (json.model !== VOYAGE_MODEL) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'model_mismatch');
   }
   const data = json.data;
   if (!Array.isArray(data) || data.length !== expectedCount) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'data_count');
   }
   const vectors: number[][] = new Array<number[]>(expectedCount);
   const seen = new Set<number>();
   for (const entry of data) {
     if (!isRecord(entry)) {
-      throw new VoyageCallError('provider_contract_invalid', false);
+      throw new VoyageCallError('provider_contract_invalid', false, undefined, 'entry_shape');
     }
     const index = entry.index;
     if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= expectedCount || seen.has(index)) {
-      throw new VoyageCallError('provider_contract_invalid', false);
+      throw new VoyageCallError('provider_contract_invalid', false, undefined, 'entry_index');
     }
     seen.add(index);
     const embedding = entry.embedding;
     if (!Array.isArray(embedding) || embedding.length !== VOYAGE_DIMENSIONS) {
-      throw new VoyageCallError('provider_contract_invalid', false);
+      throw new VoyageCallError('provider_contract_invalid', false, undefined, 'embedding_dimensions');
     }
     const vector: number[] = new Array<number>(embedding.length);
     let hasNonZero = false;
     for (let position = 0; position < embedding.length; position += 1) {
       const value = embedding[position];
       if (typeof value !== 'number' || !Number.isFinite(value)) {
-        throw new VoyageCallError('provider_contract_invalid', false);
+        throw new VoyageCallError('provider_contract_invalid', false, undefined, 'embedding_value');
       }
       vector[position] = value;
       if (value !== 0) {
@@ -118,20 +120,20 @@ export function validateVoyageResponse(json: unknown, expectedCount: number): Vo
       }
     }
     if (!hasNonZero) {
-      throw new VoyageCallError('provider_contract_invalid', false);
+      throw new VoyageCallError('provider_contract_invalid', false, undefined, 'embedding_zero');
     }
     vectors[index] = vector;
   }
   if (seen.size !== expectedCount) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'entry_missing');
   }
   const usage = json.usage;
   if (!isRecord(usage)) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'usage_shape');
   }
   const totalTokens = usage.total_tokens;
   if (typeof totalTokens !== 'number' || !Number.isInteger(totalTokens) || totalTokens < 0) {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'usage_total_tokens');
   }
   return { vectors, model: VOYAGE_MODEL, inputTokens: totalTokens };
 }
@@ -199,7 +201,7 @@ export async function callVoyage(config: WorkerConfig, operation: VoyageOperatio
   try {
     json = JSON.parse(text);
   } catch {
-    throw new VoyageCallError('provider_contract_invalid', false);
+    throw new VoyageCallError('provider_contract_invalid', false, undefined, 'response_not_json');
   }
   return { json, durationMs };
 }
