@@ -428,6 +428,7 @@ export interface StoredAnalysisPart {
   length: number;
   text?: string;
   retention?: string;
+  information_source?: string;
   response_model?: string;
 }
 
@@ -439,6 +440,7 @@ export interface StoredAnalysis {
   decision_action: string;
   continuity: string;
   statement_status: string;
+  information_source: string;
   is_searchable: boolean;
   policy_version: string;
   response_models: string[];
@@ -449,7 +451,7 @@ export interface StoredAnalysis {
 export async function readAnalysis(pool: Pool, messageId: string, revision: number): Promise<StoredAnalysis | undefined> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredAnalysis>(
-    `SELECT retention_category, primary_intent, technical_labels, strategy_terms, decision_action, continuity, statement_status,
+    `SELECT retention_category, primary_intent, technical_labels, strategy_terms, decision_action, continuity, statement_status, information_source,
             is_searchable, policy_version, response_models, state_hash, parts
        FROM message_analysis WHERE message_id = $1 AND revision = $2 AND policy_version = $3`,
     [messageId, revision, WORKER_POLICY_VERSION],
