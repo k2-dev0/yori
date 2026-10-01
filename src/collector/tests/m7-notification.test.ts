@@ -324,7 +324,7 @@ describe('M7 collector補助通知', () => {
             assert.equal(params.get('source_session_id'), 'session-1');
             assert.equal(params.get('source_message_id'), 'turn:turn-1:user', 'turn identityを使っていない');
             assert.equal(params.get('revision'), '1');
-            assert.equal(params.get('wait_ms'), '3000', 'fast pathが3秒待機ではない');
+            assert.equal(params.get('wait_ms'), '5000', 'fast pathが5秒待機ではない');
             assert.ok(JSON.stringify(central.requests).includes('現在の質問本文'), 'hookのprompt本文を収集していない');
           });
         },
@@ -638,7 +638,7 @@ describe('M7 collector補助通知', () => {
     );
   });
 
-  it('fast pathは最大3秒で打ち切り、検索結果の配信待ちを破棄しない', async () => {
+  it('fast pathは最大5秒で打ち切り、検索結果の配信待ちを破棄しない', async () => {
     await withCentral(
       () => ({ hang: true }),
       async (central) => {
@@ -649,9 +649,9 @@ describe('M7 collector補助通知', () => {
           assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
           assert.equal(result.stdout.trim(), '', 'timeoutで追加contextを出力している');
           assert.equal(central.byInputRequests.length, 1, `fast pathが複数回待機している: ${central.byInputRequests.length}`);
-          assert.equal(queryParams(central.byInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '3000');
-          assert.ok(elapsed >= 2_500, `3秒待機より早く終了している: ${elapsed}ms`);
-          assert.ok(elapsed <= 5_000, `3秒を大きく超えて待機している: ${elapsed}ms`);
+          assert.equal(queryParams(central.byInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '5000');
+          assert.ok(elapsed >= 4_500, `5秒待機より早く終了している: ${elapsed}ms`);
+          assert.ok(elapsed <= 7_000, `5秒を大きく超えて待機している: ${elapsed}ms`);
         });
       },
     );
@@ -715,7 +715,7 @@ describe('M7 collector補助通知', () => {
             (request) => queryParams(request).get('source_message_id') === 'turn:turn-1:user',
           );
           assert.equal(firstInputRequests.length, 2, '前回入力をfast path後に再取得していない');
-          assert.equal(queryParams(firstInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '3000');
+          assert.equal(queryParams(firstInputRequests[0] as RecordedHttpRequest).get('wait_ms'), '5000');
           assert.equal(queryParams(firstInputRequests[1] as RecordedHttpRequest).get('wait_ms'), '0');
         });
       },

@@ -16,7 +16,7 @@ import {
 // 最新user message identityをcollector stateから特定し、GET /v1/searches/by-inputをfast/lateの2段階で待つ。
 // 完了結果だけを「過去履歴の資料」としてstdoutへ返し、token・prompt本文・未完了状態を出力しない。
 
-const FAST_WAIT_MS = 3_000;
+const FAST_WAIT_MS = 5_000;
 const LATE_WAIT_MS = 5_000;
 const LATE_START_DELAY_MS = FAST_WAIT_MS + 250;
 const MAX_LATE_WAIT_MS = 60_000;

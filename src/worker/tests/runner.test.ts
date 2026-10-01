@@ -75,7 +75,7 @@ describe('worker runner', () => {
       assert.equal(request.search_action, 'new_search');
       assert.equal(await countJobsByKind(pool, 'build_documents'), 1);
       assert.equal(await countJobsByKind(pool, 'execute_search'), 1);
-      // runnerはclassify_message・build_documents・execute_searchを同じ外部処理laneでclaimする。
+      // runnerはroute_search・execute_searchを検索lane、classify_message・build_documentsを外部処理laneでclaimする。
       assert.equal((await readJob(pool, seeded.classifyJobId)).status, 'completed');
       assert.equal((await readJob(pool, seeded.routeJobId)).status, 'completed');
     } finally {
@@ -113,6 +113,29 @@ describe('worker runner', () => {
       await server.close();
     }
   });
+  it('job登録の通知でpoll間隔を待たずにclaimする', async () => {
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: jevReply(request, jevChoices({ retention: 'substantive', search_action: 'skip' })),
+    }));
+    const controller = new AbortController();
+    try {
+      // poll間隔を長くし、通知なしでは待機中に処理されない条件にする。
+      const running = runWorker({ pool, config: buildWorkerConfig(server.baseUrl), pollIntervalMs: 20_000, signal: controller.signal });
+      // 起動直後の初回claimとLISTEN開始を待ってから登録する。
+      await sleep(500);
+      const sessionId = await seedSession(pool, workspace);
+      const started = Date.now();
+      const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '通知で起こす発言' });
+      await waitFor(async () => (await readJob(pool, seeded.routeJobId)).status === 'completed', 5_000);
+      assert.ok(Date.now() - started < 5_000, '通知でlaneが起きていない');
+      controller.abort();
+      await running;
+    } finally {
+      controller.abort();
+      await server.close();
+    }
+  });
+
   it('poll待機を繰り返してもabort listenerを増やさず、停止後に解放する', async () => {
     const controller = new AbortController();
     const running = runWorker({
@@ -127,7 +150,8 @@ describe('worker runner', () => {
       await sleep(60);
       const during = getEventListeners(controller.signal, 'abort').length;
       assert.ok(during >= 1, `待機中のabort listenerがない: ${during}`);
-      assert.ok(during <= 3, `poll待機でabort listenerが累積している: ${during}`);
+      // 2 lane・回収loop・job通知の待受の4件を超えて累積しない。
+      assert.ok(during <= 4, `poll待機でabort listenerが累積している: ${during}`);
     } finally {
       controller.abort();
       await running;

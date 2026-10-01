@@ -6,12 +6,16 @@ export const ROUTE_SEARCH_PRIORITY = 100;
 export const EXECUTE_SEARCH_PRIORITY = 80;
 export const BUILD_DOCUMENTS_PRIORITY = 20;
 export const CLASSIFY_MESSAGE_PRIORITY = 10;
+// session継続のバックグラウンド判定。利用者を待たせないため最も低くする。
+export const JUDGE_CONTINUITY_PRIORITY = 5;
 export const DEFAULT_JOB_LEASE_MS = 60_000;
+// 新規jobの登録をworkerへ知らせるLISTEN/NOTIFY channel。通知はcommit時に届き、取りこぼしは定期pollで回収する。
+export const JOB_NOTIFY_CHANNEL = 'yori_jobs';
 
 // 同一sessionの分類claimを直列化するadvisory lock key1。key2はsession_idから導出する。
 const SESSION_CLAIM_LOCK_NAMESPACE = 20260923;
 
-export const JOB_KINDS = ['classify_message', 'route_search', 'build_documents', 'execute_search'] as const;
+export const JOB_KINDS = ['classify_message', 'route_search', 'build_documents', 'execute_search', 'judge_continuity'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export const JOB_STATUSES = ['pending', 'running', 'completed', 'failed', 'blocked_policy'] as const;
@@ -202,6 +206,8 @@ export async function enqueueJob(pool: Pool | PoolClient, input: EnqueueJobInput
   );
   const insertedRow = inserted.rows[0];
   if (insertedRow) {
+    // transaction内ならcommit時、外ならすぐに待機中workerを起こす。payloadはjob種別だけで本文を含めない。
+    await pool.query('SELECT pg_notify($1, $2)', [JOB_NOTIFY_CHANNEL, input.kind]);
     return insertedRow.id;
   }
   const existing = await pool.query<{ id: string }>('SELECT id FROM jobs WHERE idempotency_key = $1', [input.idempotencyKey]);

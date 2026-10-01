@@ -63,6 +63,29 @@ describe('Jev評価キャッシュ', () => {
     }
   });
 
+  it('同じstateのrouteとclassifyを同時に処理しても外部評価は1回だけ行う', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '同時評価の対象発言' });
+    // 応答を遅らせ、両jobのcache確認が外部評価の完了前に重なる状況を作る。
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({
+      body: jevReply(request, jevChoices({ retention: 'substantive', search_action: 'new_search' })),
+      delayMs: 300,
+    }));
+    try {
+      const config = buildWorkerConfig(server.baseUrl);
+      const routeJob = await claimJobForMessage(pool, 'route_search', seeded.messageId);
+      const classifyJob = await claimJobForMessage(pool, 'classify_message', seeded.messageId);
+      await Promise.all([processJob(pool, routeJob, config), processJob(pool, classifyJob, config)]);
+      assert.equal(server.requests.length, 1, '同じstateを同時に二重評価している');
+      assert.equal((await readJob(pool, routeJob.id)).status, 'completed');
+      assert.equal((await readJob(pool, classifyJob.id)).status, 'completed');
+      assert.ok(await readAnalysis(pool, seeded.messageId, 1), 'classifyの分析が保存されていない');
+      assert.equal((await readSearchRequest(pool, seeded.searchRequestId)).search_action, 'new_search');
+    } finally {
+      await server.close();
+    }
+  });
+
   it('承認失効時は完了済みcacheがあっても送信せずblocked_policyにする', async () => {
     const sessionId = await seedSession(pool, workspace);
     const seeded = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '失効cacheの対象発言' });

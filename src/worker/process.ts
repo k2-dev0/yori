@@ -47,13 +47,18 @@ import {
   loadDocumentBuildPlan,
   markPendingRevisionsFailed,
 } from './documents.js';
-import { ensureActiveGeneration, VoyageEmbeddingProvider } from './embedding.js';
+import { ensureActiveGeneration, loadPinnedGeneration, VoyageEmbeddingProvider } from './embedding.js';
 import { processExecuteSearch, searchRequestIdFromPayload } from './search.js';
+import { enqueueContinuityJudgment, processJudgeContinuity } from './continuity.js';
 import { GenerationMismatchError, LeaseLostError, PolicyBlockedError, StaleApplyError, TargetMissingError } from './errors.js';
 import { VoyageCallError } from './voyage.js';
 import { hasActiveProviderApproval } from './approvals.js';
 
-type RouteDecision = { kind: 'new_search' | 'skip' } | { kind: 'reuse'; priorSearch: PriorSearch };
+// strategyTermsはreuse不適格で新規検索へ戻る場合にも使う。
+type RouteDecision =
+  | { kind: 'skip' }
+  | { kind: 'new_search'; strategyTerms: string[] }
+  | { kind: 'reuse'; priorSearch: PriorSearch; strategyTerms: string[] };
 
 interface CachedEvaluation {
   responseModel: string;
@@ -108,7 +113,7 @@ async function loadCachedEvaluation(
   return result.rows[0];
 }
 
-// 完了済み評価だけを保存する。同時missでの二重外部評価は許容する。
+// 完了済み評価だけを保存する。同時missはstate_hash単位のlockで直列化し、lock待ちtimeout時だけ二重評価を許容する。
 // 旧行の応答modelがNULLの時は実評価の応答modelと回答で更新し、不明なまま再利用させない。
 async function saveCachedEvaluation(
   pool: Pool,
@@ -187,7 +192,62 @@ async function renewLeaseOrThrow(pool: Pool, job: ClaimedJob, config: WorkerConf
   }
 }
 
-// 承認確認→完了済みcache→外部呼出しの順で各partを評価する。所有を失った場合は適用しない。
+// 同じstate_hashのJev評価を直列化するadvisory lockのkey1。key2はstate_hash先頭4byteから導出する。
+const JEV_EVALUATION_LOCK_NAMESPACE = 20261001;
+// lock待ちの上限。poolのquery_timeout（15秒）より短くし、client側timeoutで待機queryが残る状態を作らない。
+// 超過時はlockなしで評価へ進み、検索を止めない（この場合だけ二重評価になり得る）。
+const JEV_EVALUATION_LOCK_WAIT_MAX_MS = 12_000;
+
+type PlannedEvaluation = EvaluationPlan['evaluations'][number];
+
+// cacheを検証して評価へ変換する。検証できないcacheはundefinedとし、外部評価へ進める。
+function evaluationFromCache(planned: PlannedEvaluation, cached: CachedEvaluation | undefined): PartEvaluation | undefined {
+  if (cached === undefined) {
+    return undefined;
+  }
+  try {
+    const validated = validateJevResponse(
+      { model: cached.responseModel, answers: cached.answers, usage: { input_tokens: null, output_tokens: null } },
+      planned.request.questions,
+    );
+    return { part: planned.part, answers: validated.answers, candidates: planned.candidates, responseModel: validated.model };
+  } catch {
+    return undefined;
+  }
+}
+
+// route_searchと分類は同じuser発言を同じstateで評価する。同時にcache missしても外部評価を1回にするため、
+// state_hash単位のsession advisory lockを外部評価の間だけ保持する。transaction・row lockは保持しない。
+// 接続断ではlockが自動解放される。lock待ちがtimeoutした時はlockなしで続行する（二重評価を許容し、停止しない）。
+async function acquireEvaluationLock(pool: Pool, stateHash: Buffer, config: WorkerConfig): Promise<PoolClient | null> {
+  const client = await pool.connect();
+  try {
+    const waitMs = Math.max(1, Math.min(Math.round(config.requestTimeoutMs), JEV_EVALUATION_LOCK_WAIT_MAX_MS));
+    await client.query(`SET lock_timeout = ${waitMs}`);
+    await client.query('SELECT pg_advisory_lock($1::int, $2::int)', [JEV_EVALUATION_LOCK_NAMESPACE, stateHash.readInt32BE(0)]);
+    await client.query('RESET lock_timeout');
+    return client;
+  } catch {
+    // lock状態が不確かな接続はpoolへ戻さず破棄する。接続終了でsession lockも解放される。
+    client.release(true);
+    return null;
+  }
+}
+
+async function releaseEvaluationLock(client: PoolClient | null, stateHash: Buffer): Promise<void> {
+  if (client === null) {
+    return;
+  }
+  try {
+    await client.query('SELECT pg_advisory_unlock($1::int, $2::int)', [JEV_EVALUATION_LOCK_NAMESPACE, stateHash.readInt32BE(0)]);
+    client.release();
+  } catch (error) {
+    // unlockできない接続はpoolへ戻さず破棄し、session lockを残さない。
+    client.release(error instanceof Error ? error : true);
+  }
+}
+
+// 承認確認→完了済みcache→同state評価のlock→cache再確認→外部呼出しの順で各partを評価する。所有を失った場合は適用しない。
 async function evaluatePlan(
   pool: Pool,
   target: JobTarget,
@@ -200,69 +260,68 @@ async function evaluatePlan(
     if (!(await hasActiveApproval(pool, target.companyId, config))) {
       throw new PolicyBlockedError('承認がありません');
     }
-    const cached = await loadCachedEvaluation(pool, target.companyId, config, planned.stateHash);
-    if (cached !== undefined) {
-      try {
-        const validated = validateJevResponse(
-          { model: cached.responseModel, answers: cached.answers, usage: { input_tokens: null, output_tokens: null } },
-          planned.request.questions,
-        );
-        evaluations.push({
-          part: planned.part,
-          answers: validated.answers,
-          candidates: planned.candidates,
-          responseModel: validated.model,
-        });
-        continue;
-      } catch {
-        // 検証できないcacheは使わず外部評価へ進む。
-      }
+    const fromCache = evaluationFromCache(planned, await loadCachedEvaluation(pool, target.companyId, config, planned.stateHash));
+    if (fromCache !== undefined) {
+      evaluations.push(fromCache);
+      continue;
     }
-    await renewLeaseOrThrow(pool, job, config);
-    // lease更新のDB待機中に承認が失効していたら、HTTP送信の直前にもう一度確認して送信しない。
-    if (!(await hasActiveApproval(pool, target.companyId, config))) {
-      throw new PolicyBlockedError('承認がありません');
-    }
-    const started = Date.now();
-    let json: unknown;
-    let durationMs: number;
+    const lock = await acquireEvaluationLock(pool, planned.stateHash, config);
     try {
-      const called = await callJev(config, planned.bodyText);
-      json = called.json;
-      durationMs = called.durationMs;
-    } catch (error) {
-      const jevError = error instanceof JevCallError ? error : new JevCallError('provider_unavailable', true);
-      await recordUsage(
-        pool,
-        target,
-        job.kind,
-        config,
-        false,
-        Date.now() - started,
-        jevError.code,
-        { input_tokens: null, output_tokens: null },
-        null,
-      );
-      throw jevError;
-    }
-    try {
-      const validated = validateJevResponse(json, planned.request.questions);
-      await recordUsage(pool, target, job.kind, config, true, durationMs, null, validated.usage, validated.model);
-      await saveCachedEvaluation(pool, target.companyId, config, planned.stateHash, validated.model, validated.answers);
-      evaluations.push({
-        part: planned.part,
-        answers: validated.answers,
-        candidates: planned.candidates,
-        responseModel: validated.model,
-      });
-    } catch (error) {
-      const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
-      // 応答本文からmodelを取得できた場合は、検証失敗でも取得できた値だけを記録する。
-      await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractJevUsage(json), extractJevResponseModel(json));
-      throw error instanceof JevCallError ? error : new JevCallError('provider_contract_invalid', false);
+      // lock待ちの間に同じstateを評価した側のcacheがあれば、外部送信せず再利用する。
+      const afterWait = evaluationFromCache(planned, await loadCachedEvaluation(pool, target.companyId, config, planned.stateHash));
+      evaluations.push(afterWait ?? (await callPlannedEvaluation(pool, target, job, planned, config)));
+    } finally {
+      await releaseEvaluationLock(lock, planned.stateHash);
     }
   }
   return evaluations;
+}
+
+async function callPlannedEvaluation(
+  pool: Pool,
+  target: JobTarget,
+  job: ClaimedJob,
+  planned: PlannedEvaluation,
+  config: WorkerConfig,
+): Promise<PartEvaluation> {
+  await renewLeaseOrThrow(pool, job, config);
+  // lease更新のDB待機中に承認が失効していたら、HTTP送信の直前にもう一度確認して送信しない。
+  if (!(await hasActiveApproval(pool, target.companyId, config))) {
+    throw new PolicyBlockedError('承認がありません');
+  }
+  const started = Date.now();
+  let json: unknown;
+  let durationMs: number;
+  try {
+    const called = await callJev(config, planned.bodyText);
+    json = called.json;
+    durationMs = called.durationMs;
+  } catch (error) {
+    const jevError = error instanceof JevCallError ? error : new JevCallError('provider_unavailable', true);
+    await recordUsage(
+      pool,
+      target,
+      job.kind,
+      config,
+      false,
+      Date.now() - started,
+      jevError.code,
+      { input_tokens: null, output_tokens: null },
+      null,
+    );
+    throw jevError;
+  }
+  try {
+    const validated = validateJevResponse(json, planned.request.questions);
+    await recordUsage(pool, target, job.kind, config, true, durationMs, null, validated.usage, validated.model);
+    await saveCachedEvaluation(pool, target.companyId, config, planned.stateHash, validated.model, validated.answers);
+    return { part: planned.part, answers: validated.answers, candidates: planned.candidates, responseModel: validated.model };
+  } catch (error) {
+    const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
+    // 応答本文からmodelを取得できた場合は、検証失敗でも取得できた値だけを記録する。
+    await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractJevUsage(json), extractJevResponseModel(json));
+    throw error instanceof JevCallError ? error : new JevCallError('provider_contract_invalid', false);
+  }
 }
 
 // 現在revisionがjobの対象と一致する時だけ分析・関係・後続jobを同一TXで適用する。
@@ -294,12 +353,13 @@ async function applyAnalysis(
     await client.query(
       `INSERT INTO message_analysis
          (id, message_id, revision, policy_version, retention_category, primary_intent, technical_labels, decision_action,
-          continuity, statement_status, is_searchable, response_models, state_hash, parts)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14::jsonb)
+          continuity, statement_status, is_searchable, response_models, state_hash, parts, strategy_terms)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14::jsonb, $15::text[])
        ON CONFLICT (message_id, revision, policy_version) DO UPDATE
          SET retention_category = EXCLUDED.retention_category,
              primary_intent = EXCLUDED.primary_intent,
              technical_labels = EXCLUDED.technical_labels,
+             strategy_terms = EXCLUDED.strategy_terms,
              decision_action = EXCLUDED.decision_action,
              continuity = EXCLUDED.continuity,
              statement_status = EXCLUDED.statement_status,
@@ -323,6 +383,7 @@ async function applyAnalysis(
         JSON.stringify(aggregate.responseModels),
         stateHash,
         JSON.stringify(aggregate.parts),
+        aggregate.strategyTerms,
       ],
     );
     for (const relation of aggregate.relations) {
@@ -466,9 +527,9 @@ async function applyRouteDecision(
         `UPDATE search_requests
             SET status = 'pending', outcome = NULL, error_code = NULL, search_action = 'new_search',
                 stage = 'awaiting_search', condition_hash = $2, reused_from_request_id = NULL,
-                result = NULL, updated_at = now()
+                result = NULL, strategy_terms = $3::text[], updated_at = now()
           WHERE id = $1`,
-        [searchRequestId, condition],
+        [searchRequestId, condition, decision.strategyTerms],
       );
       await enqueueJob(client, {
         kind: 'execute_search',
@@ -535,6 +596,8 @@ async function processBuild(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     }
     return;
   }
+  // session継続のバックグラウンド判定をsessionごとに1件だけ遅延登録する。検索時のJev判定を不要にする。
+  await enqueueContinuityJudgment(pool, target);
   // 文書planの制限的変更（publication削除・is_searchable・revision状態）は、世代spec検証より先に
   // 外部HTTP前のTXで反映する。世代不一致・retired/failedでも除外対象を残さない。
   const { chunks, snapshot, checkpoint } = await loadDocumentBuildPlan(pool, target.sessionId);
@@ -584,12 +647,42 @@ async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     throw new TargetMissingError('対象message/revisionがありません');
   }
   await resetSearchForRetry(pool, target);
+  // 自動検索の質問は入力原文そのものなので、Jevの経路判定と並行して質問の埋め込みを先に作り、
+  // execute_searchではembedding cacheから即時に取り出す。route処理の完了前に必ず待ち合わせる。
+  const prewarm = prewarmQueryEmbedding(pool, target, config);
+  try {
+    await routeWithEvaluation(pool, job, target, config);
+  } finally {
+    await prewarm;
+  }
+}
+
+// active世代で入力原文のquery埋め込みを作り、embedding cacheへ保存する。承認確認・cache・usage記録は通常と同じ経路を使う。
+// 失敗（未承認・世代なし・provider障害）は経路判定と検索結果へ影響させず、execute_searchが通常どおり埋め込む。
+async function prewarmQueryEmbedding(pool: Pool, target: JobTarget, config: WorkerConfig): Promise<void> {
+  try {
+    const project = await pool.query<{ active_generation_id: string | null }>(
+      'SELECT active_generation_id FROM projects WHERE id = $1 AND company_id = $2',
+      [target.projectId, target.companyId],
+    );
+    const generationId = project.rows[0]?.active_generation_id ?? null;
+    if (generationId === null || !(await hasActiveVoyageApproval(pool, target.companyId, config))) {
+      return;
+    }
+    const generation = await loadPinnedGeneration(pool, { companyId: target.companyId, generationId }, config);
+    await new VoyageEmbeddingProvider(pool, config).embedQuery(target.text, generation);
+  } catch {
+    // 先行実行は最適化に限る。
+  }
+}
+
+async function routeWithEvaluation(pool: Pool, job: ClaimedJob, target: JobTarget, config: WorkerConfig): Promise<void> {
   const priorMessages = await loadPriorMessages(pool, target);
   const priorSearch = await loadPriorSearch(pool, target);
   const plan = planEvaluations(target, priorMessages, priorSearch, config);
   const evaluations = await evaluatePlan(pool, target, job, plan, config);
   const aggregate = aggregateEvaluations(evaluations, config.confidenceThreshold);
-  let decision: RouteDecision = { kind: 'new_search' };
+  let decision: RouteDecision = { kind: 'new_search', strategyTerms: aggregate.strategyTerms };
   if (aggregate.searchAction === 'skip') {
     decision = { kind: 'skip' };
   } else if (
@@ -599,7 +692,7 @@ async function processRoute(pool: Pool, job: ClaimedJob, config: WorkerConfig): 
     plan.evaluations.every((evaluation) => evaluation.priorSearchIncluded) &&
     plan.priorSearch !== undefined
   ) {
-    decision = { kind: 'reuse', priorSearch: plan.priorSearch };
+    decision = { kind: 'reuse', priorSearch: plan.priorSearch, strategyTerms: aggregate.strategyTerms };
   }
   const condition = conditionHash(
     target,
@@ -752,6 +845,10 @@ export async function processJob(pool: Pool, job: ClaimedJob, config: WorkerConf
     }
     if (job.kind === 'execute_search') {
       await processExecuteSearch(pool, job, config);
+      return;
+    }
+    if (job.kind === 'judge_continuity') {
+      await processJudgeContinuity(pool, job, config);
       return;
     }
     throw new TargetMissingError('未対応のjob種別です');

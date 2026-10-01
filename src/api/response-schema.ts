@@ -96,6 +96,12 @@ export const employeeCreateResponseSchema = z.strictObject({
   created_at: occurredAtSchema,
 });
 
+export const employeeRenameResponseSchema = z.strictObject({
+  status: z.literal('done'),
+  employee_id: z.uuid(),
+  display_name: storableString,
+});
+
 export const tokenIssueResponseSchema = z.strictObject({
   status: z.literal('done'),
   token_id: z.uuid(),
@@ -144,6 +150,8 @@ const searchMatchResponseSchema = z.strictObject({
   // 候補評価の生値はworker保存JSONの内部表現であり、公開契約ではoptionalのまま保持する。
   relevance: z.unknown().optional(),
   relevance_kind: z.array(z.string()),
+  // 候補を見つけた検索経路（vector / entity / strategy）。strategyだけなら対象・用語が違う同型設計の類推候補。
+  retrieval_kinds: z.array(z.string()).optional(),
   statement_status: z.unknown().optional(),
   claim_status: z.enum(['agent_reported', 'not_reported']),
   evidence: z.array(evidenceItemResponseSchema).min(1),
@@ -216,6 +224,7 @@ export type ProjectRegistrationResponse = z.infer<typeof projectRegistrationResp
 export type MeResponse = z.infer<typeof meResponseSchema>;
 export type CompanyResponse = z.infer<typeof companyResponseSchema>;
 export type EmployeeCreateResponse = z.infer<typeof employeeCreateResponseSchema>;
+export type EmployeeRenameResponse = z.infer<typeof employeeRenameResponseSchema>;
 export type TokenIssueResponse = z.infer<typeof tokenIssueResponseSchema>;
 export type TokenRevokeResponse = z.infer<typeof tokenRevokeResponseSchema>;
 export type SearchView = z.infer<typeof searchViewResponseSchema>;

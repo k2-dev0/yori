@@ -1,41 +1,25 @@
 import type { Tokenizer } from '@huggingface/tokenizers';
 import type { Pool, PoolClient } from 'pg';
-import type { EventRole } from '../api/contract.js';
-import { hasActiveProviderApproval } from './approvals.js';
 import type { WorkerConfig } from './config.js';
-import {
-  CANDIDATE_RELEVANCE_CRITERIA,
-  JEV_PROVIDER,
-  WORKER_POLICY_VERSION,
-  type JevChoiceQuestion,
-  type JevRequest,
-  type JevState,
-} from './contract.js';
+import { WORKER_POLICY_VERSION } from './contract.js';
 import type { JobTarget } from './context.js';
-import { PolicyBlockedError } from './errors.js';
-import {
-  JevCallError,
-  buildRequest,
-  callJev,
-  extractJevResponseModel,
-  extractJevUsage,
-  serializeRequest,
-  validateJevResponse,
-} from './jev.js';
-import { recordJevUsage } from './usage.js';
 
 // M7の周辺・継続探索。代表候補のsource messageをprimary evidenceとして、同一sessionの前後、
-// 後続の訂正・撤回、activeな明示session link、限定的な推定候補を集める。
-// 外部Jev待ちの間はDB transaction/row lockを持たず、保存TXで再検証する前提の下書きだけを返す。
+// 後続の訂正・撤回、activeな明示session link、推定の継続sessionを集める。
+// 外部HTTPは呼ばない（推定継続はバックグラウンド判定済みの結果と埋め込みの近さで決める）。
+// 保存TXで再検証する前提の下書きだけを返す。
 
 const SESSION_LIMIT = 10;
 const HOP_LIMIT = 3;
 const NEIGHBOR_RADIUS = 2;
 const CONTEXT_WINDOW = 5;
 const TOKEN_BUDGET = 6_000;
-// 明示Issue／PR entity。file/functionは継続候補の根拠に使わない。
-const CONTINUITY_ENTITY_TYPES = ['issue', 'pull_request'];
-const POSITIVE_CHOICES = new Set(['useful', 'direct']);
+// 推定継続sessionから付ける文書。質問との埋め込みの近さで選び、絶対・相対の両しきい値を満たすものだけにする。
+// 相対しきい値は代表文書の類似度に対する比で、埋め込みmodelの類似度の尺度に依存しにくくする。
+const INFERRED_DOCUMENTS_PER_SESSION = 2;
+const INFERRED_SCAN_DOCUMENTS_PER_SESSION = 200;
+const INFERRED_MIN_SIMILARITY = 0.3;
+const INFERRED_RELATIVE_SIMILARITY = 0.8;
 
 export interface SearchWarning {
   code: string;
@@ -96,6 +80,8 @@ export interface ExplorationInput {
   primaryDocumentRevision: number;
   primaryEvidence: readonly PrimarySource[];
   question: string;
+  // 推定継続sessionの文書を選ぶための質問の埋め込み（検索時に作成済みのもの）。
+  queryVector: readonly number[];
   jobKind: string;
 }
 
@@ -344,224 +330,102 @@ async function loadLinkContext(
   return rows.map((row) => draftOf(row, 'explicit_session_link', { linkIds: [...linkIds] }));
 }
 
-// primary evidenceのsession情報。推定隣接のemployee/project/started_atの基準にする。
-interface PrimarySessionInfo {
-  sessionId: string;
-  employeeId: string;
-  startedAt: Date;
+function vectorLiteral(vector: readonly number[]): string {
+  return `[${vector.join(',')}]`;
 }
 
-async function loadPrimarySessions(input: ExplorationInput, sessionIds: readonly string[]): Promise<PrimarySessionInfo[]> {
+// バックグラウンド判定で継続と判定されたsession（どちら向きでも）。既出sessionと、明示link（active/revoked）で
+// primaryとつながるsessionは推定として再浮上させない。開始時刻順に返す。
+async function loadContinuationSessions(
+  input: ExplorationInput,
+  originSessionIds: readonly string[],
+  excludedSessions: ReadonlySet<string>,
+): Promise<string[]> {
+  if (originSessionIds.length === 0) {
+    return [];
+  }
+  const result = await input.pool.query<{ id: string }>(
+    `SELECT o.id, min(o.started_at) AS started_at
+       FROM session_continuity_judgments c
+       JOIN sessions o
+         ON o.id = CASE WHEN c.session_id = ANY($1::uuid[]) THEN c.candidate_session_id ELSE c.session_id END
+       JOIN projects p ON p.id = o.project_id
+      WHERE c.continuous AND c.policy_version = $2
+        AND (c.session_id = ANY($1::uuid[]) OR c.candidate_session_id = ANY($1::uuid[]))
+        AND c.company_id = $3 AND c.project_id = $4 AND o.project_id = $4 AND p.company_id = $3
+        AND o.id <> ALL($5::uuid[])
+        AND NOT EXISTS (
+          SELECT 1 FROM session_links l
+           WHERE l.company_id = $3 AND l.project_id = $4
+             AND (l.from_session_id = ANY($1::uuid[]) OR l.to_session_id = ANY($1::uuid[]))
+             AND (l.from_session_id = o.id OR l.to_session_id = o.id)
+        )
+      GROUP BY o.id
+      ORDER BY min(o.started_at), o.id`,
+    [originSessionIds, WORKER_POLICY_VERSION, input.target.companyId, input.target.projectId, [...excludedSessions]],
+  );
+  return result.rows.map((row) => row.id);
+}
+
+// 推定継続sessionの公開文書のうち、質問に近いものを各session最大2件選び、そのsource messageを返す。
+// 各sessionは最新200文書だけを比べ、計算量をsessionの長さで頭打ちにする。
+async function loadContinuationContext(input: ExplorationInput, sessionIds: readonly string[]): Promise<MessageRow[]> {
   if (sessionIds.length === 0) {
     return [];
   }
-  const result = await input.pool.query<{ id: string; employee_id: string; started_at: Date }>(
-    `SELECT s.id, s.employee_id, s.started_at
-       FROM sessions s
-       JOIN projects p ON p.id = s.project_id
-      WHERE s.id = ANY($1::uuid[]) AND s.project_id = $2 AND p.company_id = $3`,
-    [sessionIds, input.target.projectId, input.target.companyId],
+  const query = vectorLiteral(input.queryVector);
+  const primary = await input.pool.query<{ similarity: number }>(
+    `SELECT 1 - (embedding <=> $1::vector) AS similarity
+       FROM document_embeddings WHERE document_id = $2 AND revision = $3 AND generation_id = $4`,
+    [query, input.primaryDocumentId, input.primaryDocumentRevision, input.generationId],
   );
-  return result.rows.map((row) => ({ sessionId: row.id, employeeId: row.employee_id, startedAt: row.started_at }));
-}
-
-// 各primary sessionの同社員・同案件の前後各3sessionと、代表文書と共通Issue/PR entityを持つsession。
-// 既出sessionと明示link（active/revoked）でつながるsessionは推定候補として再浮上させない。
-async function loadInferredSessions(
-  input: ExplorationInput,
-  primaries: readonly PrimarySessionInfo[],
-  excludedSessions: ReadonlySet<string>,
-): Promise<string[]> {
-  const excluded = [...excludedSessions];
-  const ids: string[] = [];
-  const linkGuard = `
-        AND NOT EXISTS (
-          SELECT 1 FROM session_links l
-           WHERE l.company_id = $2 AND l.project_id = $1
-             AND (l.from_session_id = ANY($7::uuid[]) OR l.to_session_id = ANY($7::uuid[]))
-             AND (l.from_session_id = s.id OR l.to_session_id = s.id)
-        )`;
-  for (const primary of primaries) {
-    const adjacencyParams = [
-      input.target.projectId,
-      input.target.companyId,
-      primary.employeeId,
-      input.target.sessionId,
-      primary.startedAt,
-      excluded,
-      excluded,
-    ];
-    const before = await input.pool.query<{ id: string }>(
-      `SELECT s.id FROM sessions s
-         JOIN projects p ON p.id = s.project_id
-        WHERE s.project_id = $1 AND p.company_id = $2 AND s.employee_id = $3
-          AND s.id <> $4 AND s.started_at <= $5 AND s.id <> ALL($6::uuid[])
-          ${linkGuard}
-        ORDER BY s.started_at DESC, s.id DESC
-        LIMIT 3`,
-      adjacencyParams,
-    );
-    const after = await input.pool.query<{ id: string }>(
-      `SELECT s.id FROM sessions s
-         JOIN projects p ON p.id = s.project_id
-        WHERE s.project_id = $1 AND p.company_id = $2 AND s.employee_id = $3
-          AND s.id <> $4 AND s.started_at >= $5 AND s.id <> ALL($6::uuid[])
-          ${linkGuard}
-        ORDER BY s.started_at ASC, s.id ASC
-        LIMIT 3`,
-      adjacencyParams,
-    );
-    ids.push(...before.rows.map((row) => row.id), ...after.rows.map((row) => row.id));
+  const primarySimilarity = primary.rows[0]?.similarity ?? 1;
+  const threshold = Math.max(INFERRED_MIN_SIMILARITY, primarySimilarity * INFERRED_RELATIVE_SIMILARITY);
+  const documents = await input.pool.query<{ document_id: string; revision: number }>(
+    `SELECT x.document_id, x.revision
+       FROM unnest($1::uuid[]) AS cs(session_id)
+       CROSS JOIN LATERAL (
+         SELECT e.document_id, e.revision, 1 - (e.embedding <=> $2::vector) AS similarity
+           FROM (
+             SELECT d.id FROM search_documents d
+              WHERE d.session_id = cs.session_id AND d.company_id = $3 AND d.project_id = $4 AND d.is_searchable
+              ORDER BY d.created_at DESC, d.id DESC
+              LIMIT ${INFERRED_SCAN_DOCUMENTS_PER_SESSION}
+           ) recent
+           JOIN document_publications pub ON pub.document_id = recent.id AND pub.generation_id = $5
+           JOIN search_document_revisions r
+             ON r.document_id = pub.document_id AND r.revision = pub.revision AND r.status IN ('ready', 'superseded')
+           JOIN document_embeddings e ON e.document_id = pub.document_id AND e.revision = pub.revision AND e.generation_id = $5
+          ORDER BY e.embedding <=> $2::vector ASC, e.document_id ASC
+          LIMIT ${INFERRED_DOCUMENTS_PER_SESSION}
+       ) x
+      WHERE x.similarity >= $6`,
+    [sessionIds, query, input.target.companyId, input.target.projectId, input.generationId, threshold],
+  );
+  if (documents.rows.length === 0) {
+    return [];
   }
-  // 代表文書と同じIssue/PR entityを持つsessionは、他社員でも継続候補にする。
-  const entity = await input.pool.query<{ session_id: string }>(
-    `SELECT DISTINCT d.session_id
-       FROM document_entities e
-       JOIN search_documents d ON d.id = e.document_id
-       JOIN search_document_revisions r ON r.document_id = e.document_id AND r.revision = e.revision AND r.status IN ('ready', 'superseded')
-       JOIN document_publications pub ON pub.document_id = e.document_id AND pub.generation_id = $8 AND pub.revision = e.revision
-      WHERE e.company_id = $1 AND e.project_id = $2 AND d.company_id = $1 AND d.project_id = $2 AND d.is_searchable
-        AND d.session_id <> $3 AND d.session_id <> ALL($4::uuid[])
-        AND e.entity_type = ANY($5::text[])
-        AND (e.entity_type, e.entity_key) IN (
-          SELECT pe.entity_type, pe.entity_key
-            FROM document_entities pe
-           WHERE pe.document_id = $6 AND pe.revision = $7 AND pe.entity_type = ANY($5::text[])
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM session_links l
-           WHERE l.company_id = $1 AND l.project_id = $2
-             AND (l.from_session_id = ANY($4::uuid[]) OR l.to_session_id = ANY($4::uuid[]))
-             AND (l.from_session_id = d.session_id OR l.to_session_id = d.session_id)
-        )`,
+  const rows = await input.pool.query<MessageRow>(
+    `SELECT DISTINCT ${MESSAGE_COLUMNS}
+     ${MESSAGE_JOINS}
+       JOIN search_document_sources sx ON sx.message_id = m.id AND sx.message_revision = m.current_revision
+      WHERE (sx.document_id, sx.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+        AND s.project_id = $3 AND p.company_id = $4
+        AND (m.session_id <> $5 OR m.sequence_no < $6)`,
     [
-      input.target.companyId,
+      documents.rows.map((row) => row.document_id),
+      documents.rows.map((row) => row.revision),
       input.target.projectId,
+      input.target.companyId,
       input.target.sessionId,
-      excluded,
-      CONTINUITY_ENTITY_TYPES,
-      input.primaryDocumentId,
-      input.primaryDocumentRevision,
-      input.generationId,
+      input.target.sequenceNo,
     ],
   );
-  ids.push(...entity.rows.map((row) => row.session_id));
-  return [...new Set(ids)];
-}
-
-async function loadInferredContext(input: ExplorationInput, sessionId: string): Promise<MessageRow[]> {
-  const result = await input.pool.query<MessageRow>(
-    `SELECT ${MESSAGE_COLUMNS}
-     ${MESSAGE_JOINS}
-    WHERE m.session_id = $1 AND s.project_id = $2 AND p.company_id = $3
-    ORDER BY m.sequence_no
-    LIMIT ${CONTEXT_WINDOW}`,
-    [sessionId, input.target.projectId, input.target.companyId],
+  const order = new Map(sessionIds.map((sessionId, index) => [sessionId, index]));
+  return [...rows.rows].sort(
+    (left, right) =>
+      (order.get(left.session_id) ?? 0) - (order.get(right.session_id) ?? 0) || left.sequence_no - right.sequence_no,
   );
-  return result.rows;
-}
-
-// 推定候補のJev判定。現在質問への関連性と継続元との連続性を独立Choiceで聞き、両方positiveだけ採用する。
-async function evaluateInferredSession(
-  input: ExplorationInput,
-  sessionId: string,
-  context: readonly MessageRow[],
-): Promise<'adopted' | 'rejected' | 'failed'> {
-  const approved = await hasActiveProviderApproval(input.pool, {
-    companyId: input.target.companyId,
-    provider: JEV_PROVIDER,
-    accountRef: input.config.accountRef,
-    endpoint: input.config.apiUrl,
-  });
-  if (!approved) {
-    throw new PolicyBlockedError('Jevの送信承認がありません');
-  }
-  const continuation = input.primaryEvidence.slice(0, 6).map((source) => ({
-    message_id: source.message_id,
-    revision: source.message_revision,
-    role: source.role as EventRole,
-    occurred_at: source.occurred_at.toISOString(),
-    text: source.text,
-  }));
-  const state: JevState = {
-    policy_version: WORKER_POLICY_VERSION,
-    current: {
-      message_id: input.target.messageId,
-      revision: input.target.targetRevision,
-      role: input.target.role,
-      occurred_at: input.target.occurredAt,
-      parts: [{ offset: 0, length: input.question.length, text: input.question }],
-    },
-    prior_messages: continuation,
-    prior_search: null,
-    truncation: { omitted_prior_messages: 0, split_current: false, prior_search_omitted: false },
-  };
-  const candidateContext = context.map((row) => row.text).join('\n');
-  const relevanceId = `m7_context_relevance:${sessionId}#0`;
-  const continuityId = `m7_context_continuity:${sessionId}#0`;
-  const contextLabel = `継続候補session ${sessionId} の文脈:\n${candidateContext}`;
-  const questions: Record<string, JevChoiceQuestion> = {
-    [relevanceId]: {
-      type: 'choice',
-      instructions: `${contextLabel}\nこの候補文脈が現在の質問の参考になるかrelevanceを選ぶ。`,
-      criteria: { ...CANDIDATE_RELEVANCE_CRITERIA },
-    },
-    [continuityId]: {
-      type: 'choice',
-      instructions: `${contextLabel}\nこの候補文脈が代表根拠の作業と連続しているかcontinuityを選ぶ。`,
-      criteria: { ...CANDIDATE_RELEVANCE_CRITERIA },
-    },
-  };
-  const request: JevRequest = buildRequest(input.config.model, state, questions);
-  const bodyText = serializeRequest(request);
-  const started = Date.now();
-  let json: unknown;
-  let durationMs: number;
-  try {
-    const called = await callJev(input.config, bodyText);
-    json = called.json;
-    durationMs = called.durationMs;
-  } catch (error) {
-    const jevError = error instanceof JevCallError ? error : new JevCallError('provider_unavailable', true);
-    await recordJevUsage(
-      input.pool,
-      { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
-      false,
-      Date.now() - started,
-      jevError.code,
-      { input_tokens: null, output_tokens: null },
-      null,
-    );
-    return 'failed';
-  }
-  let validated;
-  try {
-    validated = validateJevResponse(json, questions);
-  } catch (error) {
-    const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
-    await recordJevUsage(
-      input.pool,
-      { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
-      false,
-      durationMs,
-      code,
-      extractJevUsage(json),
-      extractJevResponseModel(json),
-    );
-    return 'failed';
-  }
-  await recordJevUsage(
-    input.pool,
-    { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
-    true,
-    durationMs,
-    null,
-    validated.usage,
-    validated.model,
-  );
-  const useful = POSITIVE_CHOICES.has(validated.answers[relevanceId]?.choice);
-  const continuous = POSITIVE_CHOICES.has(validated.answers[continuityId]?.choice);
-  return useful && continuous ? 'adopted' : 'rejected';
 }
 
 export async function exploreSearchContext(input: ExplorationInput): Promise<ExplorationResult> {
@@ -692,33 +556,18 @@ export async function exploreSearchContext(input: ExplorationInput): Promise<Exp
   if (!sessionLimitReached) {
     // 現在inputのsessionは推定候補にしない。他はvisited/related経由の既出sessionを除く。
     const excluded = new Set([...visitedSessions, ...relatedSessions, input.target.sessionId]);
-    const primaries = await loadPrimarySessions(input, originSessionIds);
-    const candidates = await loadInferredSessions(input, primaries, excluded);
-    if (candidates.length > 0) {
-      for (const sessionId of candidates) {
-        if (visitedSessions.size >= SESSION_LIMIT) {
-          truncated = true;
-          warnings.push({ code: 'context_session_limit_exceeded', session_limit: SESSION_LIMIT });
-          break;
-        }
-        visitedSessions.add(sessionId);
-        const context = await loadInferredContext(input, sessionId);
-        if (context.length === 0) {
-          continue;
-        }
-        const outcome = await evaluateInferredSession(input, sessionId, context);
-        if (outcome === 'failed') {
-          // 推定探索だけを打ち切り、代表matchをno_matchやfailedへ変えない。
-          truncated = true;
-          warnings.push({ code: 'context_expansion_failed' });
-          break;
-        }
-        if (outcome === 'adopted') {
-          for (const row of context) {
-            add(draftOf(row, 'inferred_session_link'));
-          }
-        }
+    const continuation: string[] = [];
+    for (const sessionId of await loadContinuationSessions(input, originSessionIds, excluded)) {
+      if (visitedSessions.size >= SESSION_LIMIT) {
+        truncated = true;
+        warnings.push({ code: 'context_session_limit_exceeded', session_limit: SESSION_LIMIT });
+        break;
       }
+      visitedSessions.add(sessionId);
+      continuation.push(sessionId);
+    }
+    for (const row of await loadContinuationContext(input, continuation)) {
+      add(draftOf(row, 'inferred_session_link'));
     }
   }
 

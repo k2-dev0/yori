@@ -4,12 +4,19 @@
 
 ## 対象route
 
-`openapi.json`は計画4節の8 routeとM10のcollector setup 1 routeの計9 routeを含む。
+`openapi.json`は現在実装する16 routeを含む。
 
 | method | path | 主な成功status | 主な失敗status |
 |---|---|---:|---|
 | GET | `/health/live` | 200 | 500 |
 | GET | `/health/ready` | 200 | 503 |
+| GET | `/v1/me` | 200 | 401, 500 |
+| GET | `/v1/company` | 200 | 401, 403, 500 |
+| POST | `/v1/employees` | 201 | 400, 401, 403, 413, 500 |
+| PATCH | `/v1/employees/{employee_id}` | 200 | 400, 401, 403, 404, 413, 500 |
+| POST | `/v1/employees/{employee_id}/tokens` | 201 | 400, 401, 403, 404, 413, 500 |
+| DELETE | `/v1/tokens/{token_id}` | 200 | 400, 401, 403, 404, 409, 500 |
+| POST | `/v1/projects` | 200, 201 | 400, 401, 409, 413, 500 |
 | POST | `/v1/events` | 202 | 400, 401, 403, 409, 413, 500 |
 | POST | `/v1/searches` | 200, 202 | 400, 401, 403, 404, 409, 413, 500 |
 | POST | `/v1/collector/setup` | 200 | 400, 401, 404, 500 |
