@@ -11,6 +11,8 @@ export interface SearchEvalCase {
   name: string;
   question: string;
   expected_message_ids: string[];
+  // 合格条件。省略時は代表根拠になること。in_candidatesはJevの判定へ渡った候補に入ること。
+  pass_when?: 'adopted' | 'in_candidates';
 }
 
 export interface SearchEvalCaseResult {
@@ -99,7 +101,9 @@ async function evaluateSearchCase(pool: Pool, config: WorkerConfig, scope: EvalS
     const adopted = (result.matches?.[0]?.evidence ?? []).some((evidence) => expected.has(evidence.message_id));
     const relevance = evaluations[position]?.relevance ?? null;
     const candidatePosition = position >= 0 ? position + 1 : null;
-    return { name: item.name, status: adopted ? 'hit' : 'miss', in_candidates: position >= 0, candidate_position: candidatePosition, relevance, error_code: null };
+    // 合格条件が「候補に入ること」のケースは、代表根拠にならなくても当たりにする。
+    const passed = item.pass_when === 'in_candidates' ? position >= 0 : adopted;
+    return { name: item.name, status: passed ? 'hit' : 'miss', in_candidates: position >= 0, candidate_position: candidatePosition, relevance, error_code: null };
   } catch {
     return { ...missing, status: 'error', error_code: 'internal_error' };
   } finally {
