@@ -641,7 +641,7 @@ async function tryCutover(
   }
 }
 
-export type GenerationDeleteResult = 'deleted' | 'not_found' | 'generation_referenced' | 'ann_index_drop_failed';
+export type GenerationDeleteResult = 'deleted' | 'not_found' | 'generation_referenced' | 'ann_index_drop_failed' | 'ann_index_dropped';
 
 // 参照がない世代だけを削除する。active project・未完了reindex run・実行中search requestが
 // 参照する世代は削除しない。削除できる場合も、固定世代を失うfailed requestは同一TXでexpiredへ
@@ -653,7 +653,12 @@ export async function deleteGeneration(pool: Pool, generationId: string): Promis
     const generation = await client.query('SELECT 1 FROM embedding_generations WHERE id = $1 FOR UPDATE', [generationId]);
     if (generation.rows.length === 0) {
       await client.query('ROLLBACK');
-      return 'not_found';
+      // 世代の削除後に索引の削除だけ失敗していた場合の再実行。残った索引があれば消す。
+      try {
+        return (await dropAnnIndex(pool, generationId)) === 'dropped' ? 'ann_index_dropped' : 'not_found';
+      } catch {
+        return 'ann_index_drop_failed';
+      }
     }
     const active = await client.query('SELECT 1 FROM projects WHERE active_generation_id = $1 LIMIT 1', [generationId]);
     const runs = await client.query(
@@ -705,7 +710,7 @@ export async function deleteGeneration(pool: Pool, generationId: string): Promis
   }
   // 世代専用の近似索引は世代の削除が確定してから、検索を止めないCONCURRENTLYで消す。
   // TX内のDROP INDEXはdocument_embeddingsの排他lockを取り、待機中も後続の検索を待たせるため使わない。
-  // 失敗しても世代は削除済みで、残った索引はどの行も指さない。ann-index dropで消せる。
+  // 失敗しても世代は削除済みで、残った索引はどの行も指さない。同じ削除の再実行で消せる。
   try {
     await dropAnnIndex(pool, generationId);
   } catch {
