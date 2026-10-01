@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
-import { annIndexName } from './ann.js';
+import { dropAnnIndex } from './ann.js';
 import type { WorkerConfig } from './config.js';
 import { PolicyBlockedError } from './errors.js';
 import {
@@ -641,11 +641,7 @@ async function tryCutover(
   }
 }
 
-export type GenerationDeleteResult = 'deleted' | 'not_found' | 'generation_referenced' | 'ann_index_locked';
-
-const ANN_INDEX_DROP_LOCK_TIMEOUT_MS = 5_000;
-// lock_timeout超過時にPostgreSQLが返すSQLSTATE（lock_not_available）。
-const LOCK_NOT_AVAILABLE_SQLSTATE = '55P03';
+export type GenerationDeleteResult = 'deleted' | 'not_found' | 'generation_referenced' | 'ann_index_drop_failed';
 
 // 参照がない世代だけを削除する。active project・未完了reindex run・実行中search requestが
 // 参照する世代は削除しない。削除できる場合も、固定世代を失うfailed requestは同一TXでexpiredへ
@@ -699,21 +695,21 @@ export async function deleteGeneration(pool: Pool, generationId: string): Promis
         WHERE embedding_generation_id = $1 AND status = 'failed'`,
       [generationId],
     );
-    // 世代専用の近似索引を同じTXで消し、世代だけ消えて索引が残る状態を作らない。
-    // DROP INDEXはdocument_embeddingsの排他lockを待つため、検索を待たせ続けないよう待機時間を限る。
-    await client.query(`SET LOCAL lock_timeout = ${ANN_INDEX_DROP_LOCK_TIMEOUT_MS}`);
-    await client.query(`DROP INDEX IF EXISTS ${annIndexName(generationId)}`);
-    await client.query('SET LOCAL lock_timeout TO DEFAULT');
     await client.query('DELETE FROM embedding_generations WHERE id = $1', [generationId]);
     await client.query('COMMIT');
-    return 'deleted';
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    if ((error as { code?: unknown }).code === LOCK_NOT_AVAILABLE_SQLSTATE) {
-      return 'ann_index_locked';
-    }
     throw error;
   } finally {
     client.release();
   }
+  // 世代専用の近似索引は世代の削除が確定してから、検索を止めないCONCURRENTLYで消す。
+  // TX内のDROP INDEXはdocument_embeddingsの排他lockを取り、待機中も後続の検索を待たせるため使わない。
+  // 失敗しても世代は削除済みで、残った索引はどの行も指さない。ann-index dropで消せる。
+  try {
+    await dropAnnIndex(pool, generationId);
+  } catch {
+    return 'ann_index_drop_failed';
+  }
+  return 'deleted';
 }
