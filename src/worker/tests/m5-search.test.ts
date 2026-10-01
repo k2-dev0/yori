@@ -1970,6 +1970,48 @@ describe('M5 独立候補判定', () => {
     assert.ok(!evidenceIds.includes(messageIds.get('RELAYED-META') as string), '伝聞を一次情報より優先している');
   });
 
+  it('利用者の依頼だけの候補は、類似度で上でも回答を含む候補より下に置く', async () => {
+    const queryVector = basisVector(0, 1);
+    const select = rankingChoiceSelector();
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    // 過去の同じ質問の方が、現在の質問と字面が近く類似度で上になる条件にする。
+    const fixtures = [
+      { marker: 'PAST-QUESTION', role: 'user' as const, statementStatus: 'request', embedding: similarityVector(1) },
+      // 回答の発言状態はunknownにし、既存の発言状態の順位では差が付かない条件にする。
+      { marker: 'PAST-ANSWER', role: 'assistant' as const, statementStatus: 'unknown', embedding: similarityVector(2) },
+    ];
+    const messageIds = new Map<string, string>();
+    for (const [index, fixture] of fixtures.entries()) {
+      const text = `${fixture.marker} 端末値引の実装方針`;
+      const message = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: index + 1, role: fixture.role, text });
+      messageIds.set(fixture.marker, message.messageId);
+      await seedSourceAnalysis(pool, { messageId: message.messageId, statementStatus: fixture.statementStatus });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `request-only-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: fixture.embedding,
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const inputSession = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo: 1, text: '端末値引の実装方針を確認する' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const result = await readStoredResult(pool, seeded.requestId);
+    const evidenceIds = result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+    assert.ok(evidenceIds.includes(messageIds.get('PAST-ANSWER') as string), '回答を含む候補を代表根拠にしていない');
+    assert.ok(!evidenceIds.includes(messageIds.get('PAST-QUESTION') as string), '答えを持たない過去の質問を代表根拠にしている');
+  });
+
   it('伝聞の候補が上限件数を埋めても、一次情報を候補から落とさない', async () => {
     const queryVector = basisVector(0, 1);
     const select = rankingChoiceSelector();
