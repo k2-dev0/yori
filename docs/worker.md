@@ -90,7 +90,6 @@ npm run provider:revoke -- <approval-id>
 |---|---|
 | `npm run worker:start` | route lane 1 + classify/build/execute_searchの外部処理lane 1（計2並列）でjobを処理する |
 | `npm run worker:retry -- <jobId>` | `failed`/`blocked_policy`のjobを、現在の承認を確認してpendingへ戻す。route/execute_searchは対象の検索受付も同一TXで戻す |
-| `npm run worker:reclassify -- <projectId>` | 現行revisionの分類で`information_source`が`unknown`のままのエージェントの回答について、完了済みの`classify_message` jobを再実行待ちへ戻す。件数を`worker: reclassify_requeued <n>`で出力し、分類自体は稼働中のworkerが行う。待機中・実行中・失敗のjob、利用者の発言、他案件には触れない。再分類はJevへ再送するため、他の分類項目（保存価値・発言状態・関係）も現在の判定で上書きされる |
 | `npm run worker:search-eval -- <projectId> <cases.json>` | 正解つきの質問を本番と同じ検索処理（区切り・Voyage・DB検索・Jev判定・順位付け）へ流し、正解の発言が代表根拠になったかをケースごとにJSONで出力する。対象DBへ一時的な会話・発言・検索の受付・jobを書き込み、ケースごとに削除するため、**本番DBの写しに対してだけ実行する**。`SEARCH_EVAL_DATABASE_IS_COPY=yes`がなければ何も書かず`search_eval_requires_database_copy`で終了する。VoyageとJevは実際に呼ぶ |
 | `npm run provider:approve -- <approval.json>` | 承認を登録し、同じendpointの旧承認を失効させる |
 | `npm run provider:revoke -- <approval-id>` | 承認を失効させる |
@@ -147,10 +146,10 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 開始時のactive generationを固定し、Voyageへ`input_type=query`で質問を埋め込む。世代なしは外部送信なしの`no_match`、spec不一致は`embedding_generation_mismatch`。
 - 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
 - 検索質問が1,200 tokenを超える場合は、保存側の文書と同じ800 token以下の連続した区切りへ分け、先頭から最大5区切りを区切りごとに埋め込んでvector検索し、結果をRRFで合流させる。候補は最上位で引いた区切りを保持し、Jevの候補判定にはその区切りを質問として渡す（区切りごとに5件ずつのrequest）。6区切り目以降は検索に使わず、結果へ`question_truncated`のwarningを残す。識別子の抽出は質問全文に対して行う。1,200 token以下の質問は区切らず、従来どおり1回で検索する。route時のquery埋め込みの先行実行も同じ区切りで行う。
-- 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、その中で最も新しい発言を持つ候補を残す。答えそのものではない候補（伝聞・識別子一致のない依頼だけ）で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
+- sourceが利用者の依頼（role=user・`statement_status=request`）だけで、明示識別子の一致もない候補は、上限10件で切る前に答えを含む候補より後ろへ回す。除外はしないので、他に候補がなければ残る。
+- 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、その中で最も新しい発言を持つ候補を残す。識別子一致のない依頼だけの候補で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけ、または全候補が残予算外なら`input_budget_exceeded`。
-- エージェントの回答（role=assistant）の分類では、内容の出どころ`information_source`（`first_hand`／`relayed_history`／`unknown`）も質問し、`message_analysis.information_source`へ保存する。質問定義は入力予算（既定16,000バイト）を使うため、利用者の発言には質問せず`unknown`のままにする。sourceに`relayed_history`の発言を1つでも含む候補は、上限10件で切る前に一次情報の候補より後ろへ回す。除外はしないので、他に候補がなければ残る。過去会話の検索結果を引用・要約した会話が、元の会話を候補から押し出すのを防ぐ。sourceが利用者の依頼（role=user・`statement_status=request`）だけで、明示識別子の一致もない候補も同じ扱いで後ろへ回す。答えを持たない過去の同じ質問が、字面の近さだけで代表根拠になるのを防ぐ。列追加前の分類は`unknown`で、`worker:reclassify`で分類し直す。
-- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、答えを含む一次情報かどうか（伝聞・識別子一致のない依頼だけの候補を後ろ）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
+- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、答えを含むかどうか（識別子一致のない依頼だけの候補を後ろ）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
 - input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
 
 ### 評価キャッシュ
@@ -191,7 +190,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 調整値（質問の区切り、候補の上限、順位付け）を、デプロイせずに手元で比べるための道具。本番DBの写しを手元のDBへ復元し、そのDBを`DATABASE_URL`に指定して実行する。写しのDBに対してworkerを同時に動かさない。
 
-ケースのfileは次の配列。`expected_message_ids`は、その質問で根拠として出るべき発言の`messages.id`。
+ケースのfileは次の配列。`expected_message_ids`は、その質問で根拠として出るべき発言の`messages.id`。`pass_when`は合格条件で、省略時は`adopted`（代表根拠になること）、`in_candidates`はJevの判定へ渡った候補に入れば合格にする。
 
 ```json
 [{ "name": "device-discount", "question": "端末値引きの実装ってどういう方針で誰がやりましたか？", "expected_message_ids": ["<message uuid>"] }]
