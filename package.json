@@ -26,6 +26,7 @@
     "provider:revoke": "tsx src/worker/cli.ts revoke",
     "worker:reindex": "tsx src/worker/cli.ts reindex",
     "worker:reclassify": "tsx src/worker/cli.ts reclassify",
+    "worker:search-eval": "tsx src/worker/cli.ts search-eval",
     "worker:generation-delete": "tsx src/worker/cli.ts generation:delete",
     "worker:metrics": "tsx src/worker/cli.ts metrics",
     "worker:ann-index": "tsx src/worker/cli.ts ann-index",
