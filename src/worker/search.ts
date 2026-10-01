@@ -15,6 +15,7 @@ import {
   JEV_PROVIDER,
   SEARCH_CANDIDATE_BUDGET_TOKENS,
   SEARCH_CANDIDATE_LIMIT,
+  SEARCH_DUPLICATE_SIMILARITY,
   SEARCH_ENTITY_LIMIT,
   SEARCH_CANDIDATE_REQUEST_SIZE,
   SEARCH_MODE_EXACT_VECTOR_AND_ENTITY,
@@ -251,6 +252,18 @@ const CANDIDATE_SOURCES_SQL = `
    ORDER BY s.document_id, s.document_revision, s.display_order
 `;
 
+// 候補同士のうち、埋め込みが閾値以上に近い組だけを返す。同じ組を2回返さないよう順序を固定する。
+const SIMILAR_CANDIDATE_PAIRS_SQL = `
+  SELECT a.document_id AS left_id, a.revision AS left_revision, b.document_id AS right_id, b.revision AS right_revision
+    FROM document_embeddings a
+    JOIN document_embeddings b
+      ON b.generation_id = a.generation_id AND (a.document_id, a.revision) < (b.document_id, b.revision)
+   WHERE a.generation_id = $3
+     AND (a.document_id, a.revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+     AND (b.document_id, b.revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+     AND 1 - (a.embedding <=> b.embedding) >= $4
+`;
+
 function vectorLiteral(vector: readonly number[]): string {
   return `[${vector.join(',')}]`;
 }
@@ -276,6 +289,22 @@ interface CandidateRow {
 // 明示識別子が一致した依頼は有用な根拠なので後ろへ回さない。
 function secondaryRank(candidate: Candidate): number {
   return Number(candidate.relayedHistory || (candidate.requestOnly && !candidate.entityMatched));
+}
+
+// 順位順の候補から、既に残した候補と内容が重複するものを畳む。重複のうち新しい発言を残し、枠の位置は先に残した候補のものを使う。
+// 答えそのものではない候補で、答えを含む候補を置き換えない。
+function collapseSimilarCandidates(ordered: readonly Candidate[], similarPairs: ReadonlySet<string>): { candidates: Candidate[]; collapsed: number } {
+  const kept: Candidate[] = [];
+  for (const candidate of ordered) {
+    const index = kept.findIndex((other) => similarPairs.has(`${candidateKey(other)}|${candidateKey(candidate)}`));
+    const current = kept[index];
+    if (current === undefined) {
+      kept.push(candidate);
+    } else if (latestSourceTime(candidate) > latestSourceTime(current) && secondaryRank(candidate) <= secondaryRank(current)) {
+      kept[index] = candidate;
+    }
+  }
+  return { candidates: kept, collapsed: ordered.length - kept.length };
 }
 
 // route順位の1/(60+r)を加算し、同じdocument revisionを1件へまとめる。
@@ -408,7 +437,7 @@ async function loadCandidates(
     // 一致経路に使う入力fingerprint。nullまたは最小一致数未満なら経路を実行しない。
     strategyTerms: readonly string[] | null;
   },
-): Promise<Candidate[]> {
+): Promise<{ candidates: Candidate[]; collapsed: number }> {
   // 検索の識別子経路は検索質問から抽出する。autoはinput原文、manualは受付へ保存した質問を使う。
   const identifiers = extractEntityReferences(input.question);
   const startedAt = Date.now();
@@ -461,8 +490,18 @@ async function loadCandidates(
       { kind: 'entity', rows: entityRows },
       { kind: 'strategy', rows: strategyRows },
     ]);
+    const similarPairs = new Set<string>();
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
+      const keys = [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision)];
+      const pairs = await client.query<{ left_id: string; left_revision: number; right_id: string; right_revision: number }>(
+        SIMILAR_CANDIDATE_PAIRS_SQL,
+        [...keys, input.generation.id, SEARCH_DUPLICATE_SIMILARITY],
+      );
+      for (const pair of pairs.rows) {
+        const [left, right] = [`${pair.left_id}:${pair.left_revision}`, `${pair.right_id}:${pair.right_revision}`];
+        similarPairs.add(`${left}|${right}`).add(`${right}|${left}`);
+      }
       const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; information_source: string | null; role: string }>(
         CANDIDATE_SOURCES_SQL,
         [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision), WORKER_POLICY_VERSION],
@@ -500,9 +539,11 @@ async function loadCandidates(
     await client.query('COMMIT');
     // 伝聞と依頼だけの候補を上限件数で切る前に後ろへ回し、答えを含む一次情報を候補から押し出させない。
     // 除外はせず、他に候補がなければ残す。
-    return [...candidates.values()].sort(
+    const ordered = [...candidates.values()].sort(
       (left, right) => secondaryRank(left) - secondaryRank(right) || right.rrfScore - left.rrfScore || compareCandidates(left, right),
     );
+    // 同じ内容の繰り返しが上限件数の枠を占めないよう、切る前に1件へ畳む。
+    return collapseSimilarCandidates(ordered, similarPairs);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
@@ -1444,10 +1485,14 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   const queryVectors = await Promise.all(chunks.map((chunk) => provider.embedQuery(chunk, generation)));
   // manual検索の質問は入力発言と異なるため、入力のfingerprintを流用しない。
   const strategyTerms = request.trigger === 'auto' ? request.strategy_terms : null;
-  const candidates = await loadCandidates(pool, { target, generation, queryVectors, question, strategyTerms });
+  const loaded = await loadCandidates(pool, { target, generation, queryVectors, question, strategyTerms });
+  const candidates = loaded.candidates;
   const selection = await selectCandidates(candidates, questionTokens);
   const { selected } = selection;
   const warnings = [...selection.warnings];
+  if (loaded.collapsed > 0) {
+    warnings.push({ code: 'similar_candidates_collapsed', excluded_count: loaded.collapsed });
+  }
   if (truncated) {
     // 上限件数より後ろの入力は検索に使っていない。全文で検索したと誤認させない。
     warnings.push({ code: 'question_truncated', searched_chunks: chunks.length });
