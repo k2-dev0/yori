@@ -425,7 +425,7 @@ export class VoyageEmbeddingProvider implements EmbeddingProvider {
 
     return vectors.map((vector) => {
       if (vector === undefined) {
-        throw new VoyageCallError('provider_contract_invalid', false);
+        throw new VoyageCallError('provider_contract_invalid', false, undefined, 'vector_missing');
       }
       return vector;
     });
