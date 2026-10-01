@@ -9,7 +9,6 @@ import { JEV_PROVIDER, VOYAGE_PROVIDER } from './contract.js';
 import { isVoyageEndpoint, isWorkerEndpoint, loadWorkerConfig } from './config.js';
 import { loadProjectMetrics } from './metrics.js';
 import { retryJob } from './process.js';
-import { reclassifyMessages } from './reclassify.js';
 import { evaluateSearchCases, type SearchEvalCase } from './search-eval.js';
 import { deleteGeneration, reindexProject } from './reindex.js';
 import { runWorker } from './runner.js';
@@ -175,23 +174,13 @@ async function runRevoke(env: NodeJS.ProcessEnv, approvalId: string | undefined)
   }
 }
 
-// 再分類はDBだけを必要とし、Jev credentialは要求しない。再実行待ちへ戻したjobは稼働中のworkerが処理する。
-async function runReclassify(env: NodeJS.ProcessEnv, projectId: string | undefined): Promise<number> {
-  const databaseUrl = requireDatabaseUrl(env);
-  if (projectId === undefined || !z.uuid().safeParse(projectId).success || databaseUrl === null) {
-    return fail(databaseUrl === null ? 'invalid_worker_config' : 'invalid_project_id');
-  }
-  const pool = createPool(databaseUrl);
-  try {
-    process.stdout.write(`worker: reclassify_requeued ${await reclassifyMessages(pool, projectId)}\n`);
-    return 0;
-  } finally {
-    await pool.end();
-  }
-}
-
 const searchEvalCasesSchema = z.array(
-  z.strictObject({ name: z.string().min(1), question: z.string().min(1), expected_message_ids: z.array(z.uuid()).min(1) }),
+  z.strictObject({
+    name: z.string().min(1),
+    question: z.string().min(1),
+    expected_message_ids: z.array(z.uuid()).min(1),
+    pass_when: z.enum(['adopted', 'in_candidates']).optional(),
+  }),
 );
 
 // 評価は対象DBへ一時的なデータを書き込む。本番の写しだと明示された時だけ、接続とfile読込へ進む。
@@ -388,9 +377,6 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
   }
   if (command === 'search-eval') {
     return runSearchEval(env, rest[0], rest[1]);
-  }
-  if (command === 'reclassify') {
-    return runReclassify(env, rest[0]);
   }
   if (command === 'reindex') {
     return runReindex(env, rest[0]);
