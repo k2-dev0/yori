@@ -8,10 +8,11 @@ import {
   SAME_CONDITION_VALUES,
   SEARCH_ACTIONS,
   STATEMENT_STATUSES,
-  TECHNICAL_LABELS,
+  STRATEGY_AXES,
+  STRATEGY_AXIS_NAMES,
   jevQuestionId,
   jevRelationExplicitQuestionId,
-  jevTechnicalLabelQuestionId,
+  jevStrategyQuestionId,
   type JevAnswer,
   type JevChoiceQuestion,
   type JevRequest,
@@ -101,7 +102,6 @@ const SAME_CONDITION_CRITERIA = criteriaFrom(SAME_CONDITION_VALUES, {
   unknown: '判断不能',
 });
 
-const TECHNICAL_LABEL_CRITERIA = { yes: '当てはまる', no: '当てはまらない', unknown: '判断不能' };
 
 // partごとの質問を、fieldの意味と判定基準がinstructionから分かるように組み立てる。
 export function buildQuestions(part: JevStatePart, candidateIds: readonly string[], includeSameConditions: boolean): Record<string, JevChoiceQuestion> {
@@ -148,11 +148,12 @@ export function buildQuestions(part: JevStatePart, candidateIds: readonly string
     instructions: `${partLabel}が対象とする直前発言をrelation_targetから選ぶ。候補がなければnone、判断できなければunknown。`,
     criteria: relationCriteria,
   };
-  for (const label of TECHNICAL_LABELS) {
-    questions[jevTechnicalLabelQuestionId(label, 0)] = {
+  // 対象名・用語ではなく、設計上の問題構造と採用手段を軸ごとに1つ選ぶ。原文にない方針は推定せずnoneにする。
+  for (const axis of STRATEGY_AXIS_NAMES) {
+    questions[jevStrategyQuestionId(axis, 0)] = {
       type: 'choice',
-      instructions: `${partLabel}がtechnical_label=${label}に当てはまるか選ぶ。`,
-      criteria: TECHNICAL_LABEL_CRITERIA,
+      instructions: `${partLabel}の${STRATEGY_AXES[axis].instruction}。対象名に依存しない`,
+      criteria: { ...STRATEGY_AXES[axis].criteria },
     };
   }
   if (includeSameConditions) {
