@@ -38,7 +38,10 @@ async function annIndexState(db: Pool | PoolClient, indexName: string): Promise<
   return row.indisvalid ? 'valid' : 'invalid';
 }
 
-export type AnnIndexCreateResult = 'created' | 'already_exists' | 'generation_not_found' | 'ann_index_busy';
+// 作成時は所要時間と索引サイズを返す。CONCURRENTLYは検索を止めないため、本番での実行がそのまま実測になる。
+export type AnnIndexCreateResult =
+  | { status: 'created'; durationMs: number; indexBytes: number }
+  | { status: 'already_exists' | 'generation_not_found' | 'ann_index_busy' };
 
 // 指定世代専用の部分HNSW索引を作る。CONCURRENTLYはTX内で実行できないため、1 sessionで順に実行する。
 export async function createAnnIndex(pool: Pool, generationId: string): Promise<AnnIndexCreateResult> {
@@ -49,23 +52,24 @@ export async function createAnnIndex(pool: Pool, generationId: string): Promise<
     const generationExists = async (): Promise<boolean> =>
       (await client.query('SELECT 1 FROM embedding_generations WHERE id = $1', [generationId])).rows.length > 0;
     if (!(await generationExists())) {
-      return 'generation_not_found';
+      return { status: 'generation_not_found' };
     }
     // 構築中の索引もINVALIDに見える。同じ索引の同時作成が互いの構築中索引を消さないよう直列化する。
     const lock = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [indexName]);
     locked = lock.rows[0]?.locked === true;
     if (!locked) {
-      return 'ann_index_busy';
+      return { status: 'ann_index_busy' };
     }
     const state = await annIndexState(client, indexName);
     if (state === 'valid') {
-      return 'already_exists';
+      return { status: 'already_exists' };
     }
     // 索引構築は通常のstatement_timeoutを超えるため、このsessionだけ無効にする。
     await client.query('SET statement_timeout = 0');
     if (state === 'invalid') {
       await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${indexName}`);
     }
+    const startedAt = performance.now();
     await client.query(
       `CREATE INDEX CONCURRENTLY ${indexName} ON document_embeddings
          USING hnsw ((embedding::halfvec(${VOYAGE_DIMENSIONS})) halfvec_cosine_ops)
@@ -74,9 +78,11 @@ export async function createAnnIndex(pool: Pool, generationId: string): Promise<
     // 構築中に世代が削除された場合、何も指さない索引を残さない。
     if (!(await generationExists())) {
       await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${indexName}`);
-      return 'generation_not_found';
+      return { status: 'generation_not_found' };
     }
-    return 'created';
+    const durationMs = Math.round(performance.now() - startedAt);
+    const size = await client.query<{ bytes: string }>('SELECT pg_relation_size($1::regclass)::text AS bytes', [indexName]);
+    return { status: 'created', durationMs, indexBytes: Number(size.rows[0]?.bytes ?? 0) };
   } finally {
     await client.query('RESET statement_timeout').catch(() => undefined);
     if (locked) {
@@ -169,7 +175,11 @@ function approximateTopSql(generationId: string): string {
 export interface AnnRecallReport {
   project_id: string;
   generation_id: string;
+  // requested_samplesは要求した件数、samplesは実際に比べた件数。cache済みの質問を持つ検索要求が
+  // 足りなければsamplesは要求より少なくなる。skipped_samplesは厳密検索の結果が空で比べられなかった件数。
+  requested_samples: number;
   samples: number;
+  skipped_samples: number;
   recall: { mean: number; min: number };
   exact_duration_ms: { p50: number; p95: number };
   approximate_duration_ms: { p50: number; p95: number };
@@ -256,7 +266,10 @@ export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimi
     timeout,
     `SET LOCAL hnsw.iterative_scan = ${ANN_ITERATIVE_SCAN}`,
     `SET LOCAL hnsw.ef_search = ${ANN_EF_SEARCH}`,
+    // 索引を使うかどうかをplannerの統計任せにしない。seq scanと、別の経路で読んでから距離で並べ直す計画の
+    // 両方を不利にし、HNSW索引の順序走査を選ばせる。
     'SET LOCAL enable_seqscan = off',
+    'SET LOCAL enable_sort = off',
   ];
   const approximateSql = approximateTopSql(generationId);
   const paramsFor = (query: (typeof queries.rows)[number]): unknown[] => [
@@ -307,7 +320,9 @@ export async function measureAnnRecall(pool: Pool, projectId: string, sampleLimi
     report: {
       project_id: projectId,
       generation_id: generationId,
+      requested_samples: sampleLimit,
       samples: recalls.length,
+      skipped_samples: queries.rows.length - recalls.length,
       recall: {
         mean: recalls.reduce((sum, value) => sum + value, 0) / recalls.length,
         min: Math.min(...recalls),
