@@ -86,6 +86,9 @@ const relationEntrySchema = z.object({
 });
 
 const evidenceItemSchema = z.object({
+  // get_evidenceの入力になる識別子。欠けた根拠は原文を取得できないため通知しない。
+  message_id: z.uuid(),
+  revision: z.int(),
   text: z.string(),
   source_kind: z.string().optional(),
   relation: z.string().nullable().optional(),
@@ -97,6 +100,7 @@ const evidenceItemSchema = z.object({
 const foundSchema = z.object({
   lookup_status: z.literal('found'),
   request_id: z.uuid().nullable(),
+  project_id: z.uuid(),
   status: z.string().min(1),
   outcome: z.string().nullable(),
   error_code: z.string().nullable().optional(),
@@ -167,12 +171,13 @@ function buildNotificationContext(payload: unknown): string | null {
   if (view.outcome !== 'matched') {
     return `Yori: request_id=${view.request_id ?? 'unknown'} outcome=${view.outcome}`;
   }
-  const lines = [MATCHED_GUIDANCE, `request_id: ${view.request_id ?? 'unknown'}`, 'status: completed', 'outcome: matched'];
-  const evidenceTexts = (view.matches ?? [])
+  const lines = [MATCHED_GUIDANCE, `request_id: ${view.request_id ?? 'unknown'}`, `project_id: ${view.project_id}`];
+  lines.push('status: completed', 'outcome: matched');
+  const evidenceLines = (view.matches ?? [])
     .flatMap((match) => match.evidence ?? [])
-    .map((item) => truncateContextText(item.text))
-    .filter((text) => text.length > 0)
-    .slice(0, 5);
+    .filter((item) => truncateContextText(item.text).length > 0)
+    .slice(0, 5)
+    .map((item) => `- [message_id=${item.message_id} revision=${item.revision}] ${truncateContextText(item.text)}`);
   // 訂正・撤回をneighborより先に、同種内は元の安定順で最大5件まで併記する。
   const relatedItems = (view.matches ?? []).flatMap((match) => match.related_evidence ?? []);
   const orderedRelated = [...relatedItems].sort(
@@ -188,7 +193,7 @@ function buildNotificationContext(payload: unknown): string | null {
     if (text.length === 0) {
       continue;
     }
-    const line = `- ${relationLabel(item)} ${text}`;
+    const line = `- ${relationLabel(item)} [message_id=${item.message_id} revision=${item.revision}] ${text}`;
     if (item.source_kind === 'correction') {
       correctionLines.push(line);
     } else {
@@ -199,11 +204,9 @@ function buildNotificationContext(payload: unknown): string | null {
     lines.push('現在の訂正・撤回:');
     lines.push(...correctionLines);
   }
-  if (evidenceTexts.length > 0) {
+  if (evidenceLines.length > 0) {
     lines.push(correctionLines.length > 0 ? '元の根拠（訂正・撤回前を含みます）:' : '根拠:');
-    for (const text of evidenceTexts) {
-      lines.push(`- ${text}`);
-    }
+    lines.push(...evidenceLines);
   }
   if (otherRelatedLines.length > 0) {
     lines.push('関連根拠:');
