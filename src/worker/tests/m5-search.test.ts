@@ -40,7 +40,9 @@ import {
   CHUNK_MAX_TOKENS,
 } from '../contract.js';
 import { ensureActiveGeneration } from '../embedding.js';
+import { runCli } from '../cli.js';
 import { processJob, retryJob } from '../process.js';
+import { evaluateSearchCases } from '../search-eval.js';
 import { runWorker } from '../runner.js';
 import { loadVoyageTokenizer } from '../tokenizer.js';
 import {
@@ -3924,5 +3926,98 @@ describe('M5 設計方針fingerprint経路', () => {
       (result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'strategy_fingerprint_unavailable'),
       `部分検索のwarningがない: ${JSON.stringify(result.warnings)}`,
     );
+  });
+});
+
+describe('検索の評価コマンド', () => {
+  // 一時的な会話・発言・検索の受付・jobを作るtableの件数。評価の前後で変わらないことを確かめる。
+  async function countEvalTables(): Promise<Record<string, string>> {
+    const counts: Record<string, string> = {};
+    for (const table of ['sessions', 'messages', 'message_revisions', 'search_requests', 'jobs']) {
+      const result = await pool.query<{ count: string }>(`SELECT count(*) FROM ${table}`);
+      counts[table] = result.rows[0]?.count ?? '';
+    }
+    return counts;
+  }
+
+  // 類似度1位の候補・2位の候補・文書を持たない発言を用意する。全候補は同じrelevanceに判定される。
+  async function seedEvalCandidates(config: WorkerConfig): Promise<{ top: string; second: string; absent: string }> {
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sourceSession = await seedSession(pool, workspace);
+    const ids: string[] = [];
+    for (const [index, marker] of ['EVAL-TOP', 'EVAL-SECOND'].entries()) {
+      const text = `${marker} 候補本文`;
+      const message = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: index + 1, role: 'assistant', text });
+      ids.push(message.messageId);
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sourceSession,
+        documentKey: `search-eval-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+    const absent = await seedMessage(pool, { sessionId: sourceSession, sequenceNo: 3, role: 'assistant', text: 'EVAL-ABSENT 文書のない発言' });
+    return { top: ids[0] as string, second: ids[1] as string, absent: absent.messageId };
+  }
+
+  it('正解が代表根拠か、候補止まりか、候補にないかをケースごとに報告し、件数をまとめる', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
+    const seeded = await seedEvalCandidates(config);
+    const result = await evaluateSearchCases(pool, config, workspace.projectId, [
+      { name: 'hit', question: '評価用の質問A', expected_message_ids: [seeded.top] },
+      { name: 'candidate-only', question: '評価用の質問B', expected_message_ids: [seeded.second] },
+      { name: 'absent', question: '評価用の質問C', expected_message_ids: [seeded.absent] },
+    ]);
+    assert.equal(result.ok, true, `評価が失敗した: ${JSON.stringify(result)}`);
+    const report = result.ok ? result.report : null;
+    assert.deepEqual({ total: report?.total, hits: report?.hits }, { total: 3, hits: 1 });
+    const byName = new Map((report?.cases ?? []).map((item) => [item.name, item]));
+    assert.deepEqual(
+      { status: byName.get('hit')?.status, in_candidates: byName.get('hit')?.in_candidates, position: byName.get('hit')?.candidate_position },
+      { status: 'hit', in_candidates: true, position: 1 },
+    );
+    const candidateOnly = byName.get('candidate-only');
+    assert.deepEqual(
+      { status: candidateOnly?.status, in_candidates: candidateOnly?.in_candidates, position: candidateOnly?.candidate_position },
+      { status: 'miss', in_candidates: true, position: 2 },
+    );
+    assert.equal(candidateOnly?.relevance, 'direct', '候補止まりの正解へのJevの判定を報告していない');
+    assert.deepEqual(
+      { status: byName.get('absent')?.status, in_candidates: byName.get('absent')?.in_candidates, position: byName.get('absent')?.candidate_position },
+      { status: 'miss', in_candidates: false, position: null },
+    );
+  });
+
+  it('正常終了でも外部呼び出しの失敗でも、一時的なデータを残さず既存の件数を変えない', async () => {
+    let failJev = false;
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => (failJev ? { status: 500, body: {} } : { body: jevReply(request, m5ChoiceSelector('direct')) }),
+      voyageResponder: vectorQueryResponder(basisVector(0, 1)),
+    });
+    const seeded = await seedEvalCandidates(config);
+    const before = await countEvalTables();
+    const cases = [{ name: 'cleanup', question: '後片付けの質問', expected_message_ids: [seeded.top] }];
+
+    const succeeded = await evaluateSearchCases(pool, config, workspace.projectId, cases);
+    assert.equal(succeeded.ok && succeeded.report.cases[0]?.status, 'hit');
+    assert.deepEqual(await countEvalTables(), before, '正常終了後に一時的なデータが残っている');
+
+    failJev = true;
+    const failed = await evaluateSearchCases(pool, config, workspace.projectId, [{ ...cases[0], question: '失敗する質問' }]);
+    assert.equal(failed.ok && failed.report.cases[0]?.status, 'error', '外部呼び出しの失敗をerrorとして報告していない');
+    assert.equal(failed.ok && failed.report.cases[0]?.error_code, 'provider_unavailable');
+    assert.deepEqual(await countEvalTables(), before, '失敗したケースの一時的なデータが残っている');
+  });
+
+  it('写しだと明示する環境変数がなければ、何も書かずに終了する', async () => {
+    const before = await countEvalTables();
+    const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: requireDatabaseUrl() };
+    delete env.SEARCH_EVAL_DATABASE_IS_COPY;
+    assert.equal(await runCli(['search-eval', workspace.projectId, '/nonexistent/cases.json'], env), 1, '明示なしで評価を開始している');
+    assert.deepEqual(await countEvalTables(), before, '明示なしでDBへ書き込んでいる');
   });
 });
