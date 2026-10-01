@@ -22,7 +22,7 @@
 | `JEV_API_URL` | `https://api.typesafe.ai/v1/systemone` | 完全endpoint。loopback HTTPは開発用のみ |
 | `JEV_MODEL` | `jev-latest` | 送信model |
 | `JEV_CONFIDENCE_THRESHOLD` | `0.8` | 採用閾値。未満はunknown・不採用・new_search |
-| `JEV_INPUT_BUDGET_BYTES` | `8000` | 質問・JSONメタデータ込みの送信body上限（実トークン数ではない保守的上限） |
+| `JEV_INPUT_BUDGET_BYTES` | `16000` | 質問・JSONメタデータ込みの送信body上限。日本語だけの入力でも8,000 token相当を超えない目安（1 token約2 byte）で、実トークン数ではない |
 | `JEV_REQUEST_TIMEOUT_MS` | `20000` | 1回の外部呼出しtimeout。`JEV_JOB_LEASE_MS`より短くする |
 | `JEV_JOB_LEASE_MS` | `60000` | job lease。処理中は半分の間隔で延長する |
 | `JEV_WORKER_POLL_MS` | `1000` | 新規jobが無い時のpoll間隔 |
@@ -103,7 +103,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 - 同sessionの対象sequenceより前の最新6発言を最新revisionでstateへ入れる。現在発言はjobの`target_revision`固定。
 - 直前の完全発言、直近先行検索の元入力、現在発言の順に予算へ入れる。入り切らない文脈は除外数をstateへ明示する。
-- 入力が8,000バイト予算を超える場合は、Unicodeを壊さない連続UTF-16範囲のpartへ分割し、1request 1partで送る。原文範囲（offset/length）は判定と一緒に保存し、原文は切り捨てない。
+- 入力が16,000バイト予算を超える場合は、Unicodeを壊さない連続UTF-16範囲のpartへ分割し、1request 1partで送る。原文範囲（offset/length）は判定と一緒に保存し、原文は切り捨てない。
 - retentionは`substantive`→`decision_signal`→`unknown`→`progress_only`の順に保守的に統合する。全partが高信頼`progress_only`の時だけ`is_searchable=false`。
 - retention以外の単一分類は全part一致時だけ採用し、不一致はunknownにする。technical_labelsは採用ラベルの和集合。低信頼は採用しない。
 - `message_analysis.response_models`は全partの実応答modelを重複除去した出現順のjsonb文字列配列にする。`parts[].response_model`へpartごとの応答modelを保存し、旧`parts[].model_version`からの移行時も他のkeyを維持する。
@@ -145,7 +145,8 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 開始時のactive generationを固定し、Voyageへ`input_type=query`で質問を埋め込む。世代なしは外部送信なしの`no_match`、spec不一致は`embedding_generation_mismatch`。
 - 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけ、または全候補が残予算外なら`input_budget_exceeded`。
-- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
+- エージェントの回答（role=assistant）の分類では、内容の出どころ`information_source`（`first_hand`／`relayed_history`／`unknown`）も質問し、`message_analysis.information_source`へ保存する。質問定義は入力予算（既定16,000バイト）を使うため、利用者の発言には質問せず`unknown`のままにする。sourceに`relayed_history`の発言を1つでも含む候補は、上限10件で切る前に一次情報の候補より後ろへ回す。除外はしないので、他に候補がなければ残る。過去会話の検索結果を引用・要約した会話が、元の会話を候補から押し出すのを防ぐ。列追加前の分類は`unknown`で、再分類の手段は未実装。
+- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、情報源（一次情報を伝聞より先）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
 - input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
 
 ### 評価キャッシュ
