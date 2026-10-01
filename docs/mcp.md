@@ -32,6 +32,21 @@ MCPホストには、リポジトリ直下で`npm run --silent mcp:start`を起�
 
 接続先URLに資格情報、query、fragmentは指定できない。tokenをコマンド引数、設定ファイル、ログへ書かない。
 
+## 配布artifact
+
+yoriのcheckoutを持たない社員端末向けに、`npm run build`が`deployment/build-artifacts.mjs`でMCPを単一fileへbundleする。
+
+- `dist/mcp/yori-mcp.mjs`: Node 24以上だけで起動でき、`node_modules`を必要としない
+- `dist/mcp/mcp-manifest.json`: `{ "version", "file", "git_sha", "checksum" }`。`checksum`は`yori-mcp.mjs`のSHA-256、`git_sha`はbuild時のHEAD
+
+`version`は`src/collector/package.json`を唯一の出どころとし、同じbuildの`dist/collector/collector-manifest.json`と必ず同じ値になる。`git_sha`はHEADを指すため、配布用buildは未コミットの変更がないtreeで行う。
+
+起動は引数なしのstdioで、設定と環境変数は上記と同じものを使う。
+
+```sh
+node yori-mcp.mjs
+```
+
 ## 公開ツール
 
 | ツール | 用途 |
