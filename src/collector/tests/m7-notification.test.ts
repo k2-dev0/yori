@@ -583,6 +583,105 @@ describe('M7 collector補助通知', () => {
     );
   });
 
+  it('matched通知の根拠行へ、原文取得に使うmessage_idとrevisionを本文の前に付ける', async () => {
+    const evidenceMessageId = uuidv7();
+    const evidenceRevision = 3;
+    const responseBody = searchView();
+    const match = (responseBody.matches as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    match.evidence = [
+      {
+        message_id: evidenceMessageId,
+        revision: evidenceRevision,
+        employee_id: uuidv7(),
+        role: 'assistant',
+        occurred_at: '2026-09-21T01:00:00.000Z',
+        text: 'M7-EVIDENCE-TEXT 過去の対応記録',
+      },
+    ];
+
+    await withCentral(
+      () => ({ status: 200, body: responseBody }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          const context = hookContext(result.stdout);
+          assert.ok(
+            context.includes(`- [message_id=${evidenceMessageId} revision=${evidenceRevision}] M7-EVIDENCE-TEXT 過去の対応記録`),
+            `根拠行にmessage_idとrevisionがない: ${context}`,
+          );
+          assert.ok(!result.stdout.includes('token-a'), 'tokenを出力している');
+        });
+      },
+    );
+  });
+
+  it('matched通知の訂正・周辺の関連根拠行へ各自のmessage_idとrevisionを付け、種別と訂正優先を保つ', async () => {
+    const correctionMessageId = uuidv7();
+    const correctionRevision = 2;
+    const neighborMessageId = uuidv7();
+    const neighborRevision = 1;
+
+    await withCentral(
+      () => ({
+        status: 200,
+        body: searchView({}, [
+          {
+            message_id: neighborMessageId,
+            revision: neighborRevision,
+            employee_id: uuidv7(),
+            role: 'assistant',
+            occurred_at: '2026-09-21T01:02:00.000Z',
+            text: 'M7-RELATED-NEIGHBOR 周辺本文',
+            source_kind: 'neighbor',
+          },
+          {
+            message_id: correctionMessageId,
+            revision: correctionRevision,
+            employee_id: uuidv7(),
+            role: 'assistant',
+            occurred_at: '2026-09-21T01:01:00.000Z',
+            text: 'M7-CORRECTION-TEXT 訂正本文',
+            source_kind: 'correction',
+            relation: 'change',
+            related_to_message_id: uuidv7(),
+            related_to_revision: 1,
+          },
+        ]),
+      }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          const context = hookContext(result.stdout);
+          const correctionLine = `- [correction:change] [message_id=${correctionMessageId} revision=${correctionRevision}] M7-CORRECTION-TEXT 訂正本文`;
+          const neighborLine = `- [neighbor] [message_id=${neighborMessageId} revision=${neighborRevision}] M7-RELATED-NEIGHBOR 周辺本文`;
+          assert.ok(context.includes(correctionLine), `訂正行にmessage_idとrevisionがない: ${context}`);
+          assert.ok(context.includes(neighborLine), `周辺行にmessage_idとrevisionがない: ${context}`);
+          assert.ok(context.indexOf(correctionLine) < context.indexOf('M7-EVIDENCE-TEXT'), '訂正より先に元の根拠を提示している');
+          assert.ok(context.indexOf(correctionLine) < context.indexOf(neighborLine), '訂正より先に周辺根拠を提示している');
+        });
+      },
+    );
+  });
+
+  it('根拠にmessage_idがない応答では追加contextを出力せずに終了する', async () => {
+    const responseBody = searchView();
+    const match = (responseBody.matches as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    match.evidence = [{ revision: 1, text: 'M7-EVIDENCE-WITHOUT-ID 識別子のない根拠' }];
+
+    await withCentral(
+      () => ({ status: 200, body: responseBody }),
+      async (central) => {
+        await withFixture(central, {}, async (fixture) => {
+          const result = await runNotify(fixture);
+          assert.equal(result.code, 0, `notifyが失敗した: ${result.stderr}`);
+          assert.equal(result.stdout.trim(), '', 'message_idのない根拠を追加contextへ出力している');
+        });
+      },
+    );
+  });
+
   it('訂正をneighborより優先し、省略件数と打切り注意をadditionalContextへ明示する', async () => {
     const targetOne = uuidv7();
     const targetTwo = uuidv7();
