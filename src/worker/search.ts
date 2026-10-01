@@ -98,8 +98,6 @@ interface Candidate {
   retrievalKinds: RetrievalKind[];
   // source messageの分類済みstatement_statusから決めた候補の報告状態。Jevへは質問しない。
   statementStatus: CandidateStatementStatus;
-  // sourceに、過去会話の検索結果を伝えただけと分類された発言を含む。一次情報より後ろへ回す。
-  relayedHistory: boolean;
   // sourceが利用者の依頼だけで、答えを含まない。回答を含む候補より後ろへ回す。
   requestOnly: boolean;
   // この候補をvector経路で最上位に引いた質問の区切り。判定ではこの区切りを質問にする。
@@ -243,7 +241,7 @@ const STRATEGY_CANDIDATES_SQL = `
 // sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
-         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, m.role, a.statement_status, a.information_source
+         s.start_offset, s.end_offset, s.source_kind, m.occurred_at, m.role, a.statement_status
     FROM search_document_sources s
     JOIN messages m ON m.id = s.message_id
     LEFT JOIN message_analysis a
@@ -285,14 +283,14 @@ interface CandidateRow {
   content: string;
 }
 
-// 答えそのものではない候補を1、それ以外を0にする。伝聞と、識別子の一致がない依頼だけの候補が該当する。
+// 答えそのものではない候補を1、それ以外を0にする。識別子の一致がない依頼だけの候補が該当する。
 // 明示識別子が一致した依頼は有用な根拠なので後ろへ回さない。
 function secondaryRank(candidate: Candidate): number {
-  return Number(candidate.relayedHistory || (candidate.requestOnly && !candidate.entityMatched));
+  return Number(candidate.requestOnly && !candidate.entityMatched);
 }
 
 // 順位順の候補から、既に残した候補と内容が重複するものを畳む。重複のうち新しい発言を残し、枠の位置は先に残した候補のものを使う。
-// 答えそのものではない候補で、答えを含む候補を置き換えない。
+// 依頼だけの候補で、答えを含む候補を置き換えない。
 function collapseSimilarCandidates(ordered: readonly Candidate[], similarPairs: ReadonlySet<string>): { candidates: Candidate[]; collapsed: number } {
   const kept: Candidate[] = [];
   for (const candidate of ordered) {
@@ -324,7 +322,6 @@ function mergeRoutes(
         entityMatched: false,
         retrievalKinds: [],
         statementStatus: 'unknown',
-        relayedHistory: false,
         requestOnly: true,
         queryChunkIndex: 0,
         sources: [],
@@ -502,7 +499,7 @@ async function loadCandidates(
         const [left, right] = [`${pair.left_id}:${pair.left_revision}`, `${pair.right_id}:${pair.right_revision}`];
         similarPairs.add(`${left}|${right}`).add(`${right}|${left}`);
       }
-      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; information_source: string | null; role: string }>(
+      const sources = await client.query<CandidateSource & { document_id: string; document_revision: number; statement_status: string | null; role: string }>(
         CANDIDATE_SOURCES_SQL,
         [entries.map((candidate) => candidate.documentId), entries.map((candidate) => candidate.revision), WORKER_POLICY_VERSION],
       );
@@ -510,7 +507,6 @@ async function loadCandidates(
         const candidate = candidates.get(`${row.document_id}:${row.document_revision}`);
         if (candidate !== undefined) {
           candidate.statementStatus = strongerStatus(candidate.statementStatus, row.statement_status);
-          candidate.relayedHistory ||= row.information_source === 'relayed_history';
           candidate.requestOnly &&= row.role === 'user' && row.statement_status === 'request';
         }
         candidate?.sources.push({
@@ -537,7 +533,7 @@ async function loadCandidates(
       ],
     );
     await client.query('COMMIT');
-    // 伝聞と依頼だけの候補を上限件数で切る前に後ろへ回し、答えを含む一次情報を候補から押し出させない。
+    // 依頼だけの候補を上限件数で切る前に後ろへ回し、答えを含む候補を押し出させない。
     // 除外はせず、他に候補がなければ残す。
     const ordered = [...candidates.values()].sort(
       (left, right) => secondaryRank(left) - secondaryRank(right) || right.rrfScore - left.rrfScore || compareCandidates(left, right),
@@ -775,7 +771,7 @@ function latestSourceTime(candidate: Candidate): number {
   return latest;
 }
 
-// relevanceを最優先し、同じrelevanceでは答えを含む一次情報を伝聞・依頼だけの候補より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
+// relevanceを最優先し、同じrelevanceでは答えを含む候補を依頼だけの候補より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
 // status不明同士は新しさで推測せず、従来のRRF・document ID順を維持する。
 function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAssessment[] {
   return assessments
