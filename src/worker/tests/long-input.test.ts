@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import { resetDatabase, seedWorkspace, type WorkspaceFixture } from '../../db/tests/fixtures.js';
+import { DEFAULT_INPUT_BUDGET_BYTES } from '../contract.js';
 import { processJob } from '../process.js';
 import {
   advanceRevision,
@@ -103,8 +104,8 @@ describe('長文と応答検証', () => {
     const sessionId = await seedSession(pool, workspace);
     const priors: Array<{ messageId: string; text: string }> = [];
     for (let sequenceNo = 1; sequenceNo <= 6; sequenceNo += 1) {
-      // 6件合計は8,000バイト予算を超えるが、最新1件と質問定義は収まるサイズにする。
-      const text = `過去文脈-${sequenceNo}:` + 'あ'.repeat(600);
+      // 6件合計は既定の入力予算を超えるが、最新1件と質問定義は収まるサイズにする。
+      const text = `過去文脈-${sequenceNo}:` + 'あ'.repeat(1_200);
       const seeded = await seedMessage(pool, { sessionId, sequenceNo, role: sequenceNo % 2 === 0 ? 'assistant' : 'user', text });
       priors.push({ messageId: seeded.messageId, text });
     }
@@ -115,7 +116,7 @@ describe('長文と応答検証', () => {
       await processClassify(current.messageId, server.baseUrl);
       const request = server.requests[0];
       assert.ok(request, 'Jevへ送信していない');
-      assert.ok(Buffer.byteLength(request.rawBody, 'utf8') <= 8_000, '送信bodyが入力予算を超えている');
+      assert.ok(Buffer.byteLength(request.rawBody, 'utf8') <= DEFAULT_INPUT_BUDGET_BYTES, '送信bodyが入力予算を超えている');
       const state = request.body.state;
       assert.equal(state.truncation.split_current, false);
       assert.ok(state.truncation.omitted_prior_messages >= 1, '除外した文脈数がstateにない');
@@ -145,7 +146,7 @@ describe('長文と応答検証', () => {
       assert.ok(server.requests.length >= 2, '1回の予算へ収まらない長文が複数callへ分割されていない');
       for (const request of server.requests) {
         assert.equal(request.body.state.current.message_id, current.messageId, '別messageを送信している');
-        assert.ok(Buffer.byteLength(request.rawBody, 'utf8') <= 8_000, '送信ごとのbodyが入力予算を超えている');
+        assert.ok(Buffer.byteLength(request.rawBody, 'utf8') <= DEFAULT_INPUT_BUDGET_BYTES, '送信ごとのbodyが入力予算を超えている');
       }
       const sentParts = server.requests.flatMap((request) => request.body.state.current.parts);
       assert.ok(sentParts.length >= 2, '長文が分割されていない');
