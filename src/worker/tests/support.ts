@@ -177,7 +177,7 @@ export function mergeChoices(...selectors: JevChoiceSelector[]): JevChoiceSelect
   };
 }
 
-// field単位の既定回答。technical_labelはno、relation_targetはnone、same_conditionsはunknownにする。
+// field単位の既定回答。設計方針(strategy:*)はnone、relation_targetはnone、same_conditionsはunknownにする。
 export function jevChoices(overrides: Record<string, string | ChoiceSelection> = {}): JevChoiceSelector {
   return (question) => {
     const field = questionField(question.id);
@@ -189,8 +189,8 @@ export function jevChoices(overrides: Record<string, string | ChoiceSelection> =
     if (byField !== undefined) {
       return byField;
     }
-    if (field.startsWith('technical_label')) {
-      return 'no';
+    if (field.startsWith('strategy:')) {
+      return 'none';
     }
     if (field === 'relation_target') {
       return 'none';
@@ -434,6 +434,7 @@ export interface StoredAnalysis {
   retention_category: string;
   primary_intent: string;
   technical_labels: string[];
+  strategy_terms: string[];
   decision_action: string;
   continuity: string;
   statement_status: string;
@@ -447,7 +448,7 @@ export interface StoredAnalysis {
 export async function readAnalysis(pool: Pool, messageId: string, revision: number): Promise<StoredAnalysis | undefined> {
   await assertM3Tables(pool);
   const result = await pool.query<StoredAnalysis>(
-    `SELECT retention_category, primary_intent, technical_labels, decision_action, continuity, statement_status,
+    `SELECT retention_category, primary_intent, technical_labels, strategy_terms, decision_action, continuity, statement_status,
             is_searchable, policy_version, response_models, state_hash, parts
        FROM message_analysis WHERE message_id = $1 AND revision = $2 AND policy_version = $3`,
     [messageId, revision, WORKER_POLICY_VERSION],
