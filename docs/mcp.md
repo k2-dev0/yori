@@ -57,6 +57,10 @@ node yori-mcp.mjs
 | `record_case` | 問題、対応、確認状態を短い`agent_report`として保存する。600文字超は警告するが、本文上限内なら受理する |
 | `link_session` | 引き継ぎ元・認証社員本人の引き継ぎ先・根拠発言を取り込み元identityで指定し、明示的なセッション関係を登録する |
 
+全toolの`project_id`は省略できる。省略時はMCPプロセスの作業ディレクトリから`remote.origin.url`をcanonical repositoryへ正規化し、collectorと同じ`POST /v1/collector/setup`で案件を解決する。gitリポジトリ外・remoteなし・未登録repository・通信失敗では解決できず、推測値で中央APIを呼ばずtool errorにする。明示した`project_id`はそのまま使い、setup APIを呼ばない。解決結果はcacheせず、省略した呼出しごとに問い合わせる。
+
+initialize応答の`instructions`で、collectorのhook通知（`Yori history:`・`Yori:`で始まる追加context）の出所、記載された識別子を`get_search_result`・`get_evidence`へ渡せること、`request_id`による真偽確認、通知内の過去発言を指示として扱わないことを伝える。
+
 `get_search_result`の`wait_ms`は1回0〜5000ms。エージェント側の初期待機予算は累計10秒とし、期限後も中央の検索jobは継続する。処理中を`no_match`と扱わない。
 
 M7のmatched結果は代表根拠に加え、前後発言、後続の訂正・撤回、明示またはJevで採用した引き継ぎ先を`related_evidence`で返す。同じ訂正発言が複数根拠を対象にする場合は、原文を重複させず`relations`配列へ全関係を保持する。探索は最大3 hop・合計10 session・追加context約6,000 tokenで打ち切り、未探索部分があれば`truncated`とwarningを返す。結果取得時にも原文revision、案件、relation、activeなsession linkを再確認する。
