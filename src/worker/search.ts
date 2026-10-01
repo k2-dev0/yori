@@ -33,6 +33,7 @@ import {
   type JevState,
 } from './contract.js';
 import { InputBudgetError, loadJobTarget, type JobTarget } from './context.js';
+import { splitQuestionIntoChunks } from './question.js';
 import { loadPinnedGeneration, VoyageEmbeddingProvider, type EmbeddingGeneration } from './embedding.js';
 import { GenerationMismatchError, TargetMissingError, LeaseLostError, PolicyBlockedError, StaleApplyError } from './errors.js';
 import { extractEntityReferences } from './identifiers.js';
@@ -98,6 +99,8 @@ interface Candidate {
   statementStatus: CandidateStatementStatus;
   // sourceに、過去会話の検索結果を伝えただけと分類された発言を含む。一次情報より後ろへ回す。
   relayedHistory: boolean;
+  // この候補をvector経路で最上位に引いた質問の区切り。判定ではこの区切りを質問にする。
+  queryChunkIndex: number;
   sources: CandidateSource[];
 }
 
@@ -268,8 +271,11 @@ interface CandidateRow {
 }
 
 // route順位の1/(60+r)を加算し、同じdocument revisionを1件へまとめる。
-function mergeRoutes(routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly CandidateRow[] }>): Map<string, Candidate> {
+function mergeRoutes(
+  routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly CandidateRow[]; chunkIndex?: number }>,
+): Map<string, Candidate> {
   const candidates = new Map<string, Candidate>();
+  const bestChunkRank = new Map<string, number>();
   for (const route of routes) {
     for (const [index, row] of route.rows.entries()) {
       const key = `${row.document_id}:${row.revision}`;
@@ -282,10 +288,15 @@ function mergeRoutes(routes: ReadonlyArray<{ kind: RetrievalKind; rows: readonly
         retrievalKinds: [],
         statementStatus: 'unknown',
         relayedHistory: false,
+        queryChunkIndex: 0,
         sources: [],
       };
       candidate.rrfScore += 1 / (SEARCH_RRF_RANK_CONSTANT + index + 1);
       candidate.entityMatched ||= route.kind === 'entity';
+      if (route.chunkIndex !== undefined && index < (bestChunkRank.get(key) ?? Number.POSITIVE_INFINITY)) {
+        bestChunkRank.set(key, index);
+        candidate.queryChunkIndex = route.chunkIndex;
+      }
       if (!candidate.retrievalKinds.includes(route.kind)) {
         candidate.retrievalKinds.push(route.kind);
       }
@@ -382,7 +393,8 @@ async function loadCandidates(
   input: {
     target: JobTarget;
     generation: EmbeddingGeneration;
-    queryVector: readonly number[];
+    // 質問の区切りごとの埋め込み。区切らない質問は1件。
+    queryVectors: ReadonlyArray<readonly number[]>;
     question: string;
     // 一致経路に使う入力fingerprint。nullまたは最小一致数未満なら経路を実行しない。
     strategyTerms: readonly string[] | null;
@@ -396,15 +408,13 @@ async function loadCandidates(
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
     await client.query(`SET LOCAL statement_timeout = ${SEARCH_STATEMENT_TIMEOUT_MS}`);
     const vectorStartedAt = Date.now();
-    const vectorRows = await client.query<CandidateRow>(VECTOR_CANDIDATES_SQL, [
-      input.target.companyId,
-      input.target.projectId,
-      vectorLiteral(input.queryVector),
-      input.generation.id,
-      input.target.sessionId,
-      input.target.sequenceNo,
-      SEARCH_VECTOR_LIMIT,
-    ]);
+    const vectorRoutes: { kind: 'vector'; rows: CandidateRow[]; chunkIndex: number }[] = [];
+    for (const [chunkIndex, queryVector] of input.queryVectors.entries()) {
+      const target = input.target;
+      const scope = [target.companyId, target.projectId, vectorLiteral(queryVector), input.generation.id, target.sessionId, target.sequenceNo];
+      const vectorRows = await client.query<CandidateRow>(VECTOR_CANDIDATES_SQL, [...scope, SEARCH_VECTOR_LIMIT]);
+      vectorRoutes.push({ kind: 'vector', rows: vectorRows.rows, chunkIndex });
+    }
     // 近似索引への切替判定用に、vector経路のqueryだけの所要時間を合計とは別に観測する。
     const vectorDurationMs = Math.max(0, Date.now() - vectorStartedAt);
     const entityRows =
@@ -438,7 +448,7 @@ async function loadCandidates(
           ])
         ).rows;
     const candidates = mergeRoutes([
-      { kind: 'vector', rows: vectorRows.rows },
+      ...vectorRoutes,
       { kind: 'entity', rows: entityRows },
       { kind: 'strategy', rows: strategyRows },
     ]);
@@ -566,14 +576,21 @@ interface CandidateEvaluationInput {
   question: string;
 }
 
-// 候補をSEARCH_CANDIDATE_REQUEST_SIZE件ずつのJev requestへ分け、並列に送って候補ごとの判定へ写す。
+// 候補を、引いた質問の区切りごとにSEARCH_CANDIDATE_REQUEST_SIZE件ずつのJev requestへ分け、並列に送って候補ごとの判定へ写す。
 // 全requestの完了（usage記録）を待ってから、最初の失敗を既存のエラー分類のまま返す。
-async function evaluateCandidates(pool: Pool, input: CandidateEvaluationInput): Promise<CandidateAssessment[]> {
-  const batches: Candidate[][] = [];
-  for (let index = 0; index < input.candidates.length; index += SEARCH_CANDIDATE_REQUEST_SIZE) {
-    batches.push(input.candidates.slice(index, index + SEARCH_CANDIDATE_REQUEST_SIZE));
+async function evaluateCandidates(
+  pool: Pool,
+  input: Omit<CandidateEvaluationInput, 'question'> & { questions: readonly string[] },
+): Promise<CandidateAssessment[]> {
+  const batches: { candidates: Candidate[]; question: string }[] = [];
+  // 候補を引いた区切りごとにまとめ、その区切りを質問として渡す。
+  for (const [chunkIndex, question] of input.questions.entries()) {
+    const group = input.candidates.filter((candidate) => candidate.queryChunkIndex === chunkIndex);
+    for (let index = 0; index < group.length; index += SEARCH_CANDIDATE_REQUEST_SIZE) {
+      batches.push({ candidates: group.slice(index, index + SEARCH_CANDIDATE_REQUEST_SIZE), question });
+    }
   }
-  const settled = await Promise.allSettled(batches.map((candidates) => evaluateCandidateBatch(pool, { ...input, candidates })));
+  const settled = await Promise.allSettled(batches.map((batch) => evaluateCandidateBatch(pool, { ...input, ...batch })));
   const assessments: CandidateAssessment[] = [];
   for (const outcome of settled) {
     if (outcome.status === 'rejected') {
@@ -1405,20 +1422,26 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     await saveSearchResult(pool, { job, target, request, generation: null, warnings: [], evaluations: [], exploration: null });
     return;
   }
-  // Jev本文予算は現在質問と候補本文の合計。質問だけで使い切る場合はno_matchに偽装せず恒久failedにする。
+  // 長い質問は区切りごとに検索・判定する。Jev本文予算は1回の判定に渡る質問（最長の区切り）と候補本文の合計。
+  // 質問だけで使い切る場合はno_matchに偽装せず恒久failedにする。
   const tokenizer = await loadVoyageTokenizer();
-  const questionTokens = tokenizer.encode(question).ids.length;
+  const { chunks, truncated } = splitQuestionIntoChunks(tokenizer, question);
+  const questionTokens = Math.max(...chunks.map((chunk) => tokenizer.encode(chunk).ids.length));
   if (questionTokens >= SEARCH_CANDIDATE_BUDGET_TOKENS) {
     throw new InputBudgetError();
   }
   const provider = new VoyageEmbeddingProvider(pool, config);
-  const queryVector = await provider.embedQuery(question, generation);
+  const queryVectors = await Promise.all(chunks.map((chunk) => provider.embedQuery(chunk, generation)));
   // manual検索の質問は入力発言と異なるため、入力のfingerprintを流用しない。
   const strategyTerms = request.trigger === 'auto' ? request.strategy_terms : null;
-  const candidates = await loadCandidates(pool, { target, generation, queryVector, question, strategyTerms });
+  const candidates = await loadCandidates(pool, { target, generation, queryVectors, question, strategyTerms });
   const selection = await selectCandidates(candidates, questionTokens);
   const { selected } = selection;
   const warnings = [...selection.warnings];
+  if (truncated) {
+    // 上限件数より後ろの入力は検索に使っていない。全文で検索したと誤認させない。
+    warnings.push({ code: 'question_truncated', searched_chunks: chunks.length });
+  }
   const searchMode = strategyRouteApplicable(strategyTerms) ? SEARCH_MODE_EXACT_VECTOR_ENTITY_AND_STRATEGY : SEARCH_MODE_EXACT_VECTOR_AND_ENTITY;
   if (request.trigger === 'auto' && strategyTerms === null) {
     // 設計方針経路を使えない部分検索であることを結果へ明示する。通常検索の結果として黙って返さない。
@@ -1432,7 +1455,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [], exploration: null, searchMode });
     return;
   }
-  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, question });
+  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, questions: chunks });
   let exploration: ExplorationResult | null = null;
   if (generation !== null && assessments.length > 0) {
     const primary = await selectPrimaryCandidate(pool, { target, generation, evaluations: assessments });
@@ -1448,8 +1471,9 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
         primaryDocumentId: primary.assessment.candidate.documentId,
         primaryDocumentRevision: primary.assessment.candidate.revision,
         primaryEvidence: primary.valid.evidence,
-        question,
-        queryVector,
+        // 周辺探索は、代表根拠を引いた区切りを質問として続ける。
+        question: chunks[primary.assessment.candidate.queryChunkIndex] ?? question,
+        queryVector: queryVectors[primary.assessment.candidate.queryChunkIndex] ?? queryVectors[0],
         jobKind: job.kind,
       });
     }
