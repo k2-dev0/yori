@@ -1,9 +1,13 @@
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { parseClaudeTranscriptLine } from './adapters/claude.js';
 import { parseCodexTranscriptLine } from './adapters/codex.js';
-import { DEEPSEEK_HARNESS_VERSION, createDeepSeekTranscriptParser, deepSeekSessionMetadata } from './adapters/deepseek.js';
+import {
+  SUPPORTED_DEEPSEEK_HARNESS_VERSIONS,
+  createDeepSeekTranscriptParser,
+  decompressDeepSeekTranscript,
+  deepSeekSessionMetadata,
+} from './adapters/deepseek.js';
 import { collectFromHook } from './collect.js';
 import type { CollectorConfig } from './config.js';
 import { resolveRepositoryFromCwd } from './remote.js';
@@ -189,10 +193,11 @@ function discoverDeepSeek(home: string, repository: string): DiscoveryResult {
   const summary = emptySummary();
   const sessions: DiscoveredSession[] = [];
   const versions = new Set<string>();
-  const repositoryHash = createHash('sha256').update(repository).digest('hex');
-  const root = path.join(home, 'Library', 'Application Support', 'deepseek-bridge', 'dsh-home', repositoryHash, 'sessions');
-  for (const transcriptPath of filesRecursively(root, 'session.v3.jsonl')) {
-    const lines = readLines(transcriptPath);
+  // デスクトップ版は全リポジトリの会話を1箇所へ置く。対象の絞り込みはsession行のcwdで行う。
+  const root = path.join(home, 'Library', 'Application Support', 'dsh-desktop', 'harness', 'sessions');
+  const transcriptPaths = SUPPORTED_DEEPSEEK_HARNESS_VERSIONS.flatMap((version) => filesRecursively(root, `session.v${version}.jsonl.zstd`));
+  for (const transcriptPath of transcriptPaths.sort()) {
+    const lines = decompressDeepSeekTranscript(readFileSync(transcriptPath)).toString('utf8').split('\n').filter((line) => line.length > 0);
     const sessionLine = lines.find((line) => parseJson(line)?.type === 'session');
     if (sessionLine === undefined) {
       continue;
@@ -201,7 +206,7 @@ function discoverDeepSeek(home: string, repository: string): DiscoveryResult {
     if (metadata === null || metadata.cwd !== repository) {
       continue;
     }
-    if (metadata.version !== DEEPSEEK_HARNESS_VERSION || metadata.delegationDepth !== 0 || metadata.isSeeded) {
+    if (!SUPPORTED_DEEPSEEK_HARNESS_VERSIONS.includes(metadata.version) || metadata.delegationDepth !== 0 || metadata.isSeeded) {
       summary.excluded += 1;
       addVersion(versions, String(metadata.version));
       continue;
