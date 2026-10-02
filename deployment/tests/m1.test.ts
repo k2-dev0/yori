@@ -108,7 +108,8 @@ it('POST /v1/eventsで保存した原文はコンテナ再作成後も残る', a
     sequence_no: 1,
     revision: 1,
     role: 'user',
-    occurred_at: '2026-09-21T01:00:00.000Z',
+    // 今の入力として送る。過去の時刻だと履歴の取り込みとして自動検索が作られない。
+    occurred_at: new Date().toISOString(),
     text: RAW_TEXT,
   };
 
