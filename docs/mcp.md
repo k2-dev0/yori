@@ -51,7 +51,7 @@ node yori-mcp.mjs
 
 | ツール | 用途 |
 |---|---|
-| `search_history` | 現在入力のID・revisionを固定して追加検索する。同じ質問は自動受付を再利用し、別質問または`force_refresh`はmanual受付を作る |
+| `search_history` | 現在入力のID・revisionを固定して追加検索する。同じ質問は自動受付を再利用し、別質問または`force_refresh`はmanual受付を作る。`primary_only=true`は検索結果の注入を受けて書かれたエージェントの回答を根拠から外し、自動受付を再利用しない。利用者が一次資料・当時の原文を求めた時だけ指定する |
 | `get_search_result` | request ID、内部input ID、または取り込み元identityで現在入力の結果を取得する。`not_received`、処理中、失敗、`skipped`、`no_match`、`matched`を区別する |
 | `get_evidence` | 検索結果のmessage ID・revisionから保存済み原文を取得する |
 | `record_case` | 問題、対応、確認状態を短い`agent_report`として保存する。600文字超は警告するが、本文上限内なら受理する |
