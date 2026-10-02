@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { renameSync, statSync } from 'node:fs';
+import { appendFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { zstdCompressSync } from 'node:zlib';
 import { collectFromHook, flushCollector, ingestTranscript } from '../collect.js';
 import { parseCollectorConfig } from '../config.js';
 import { closeCollectorState, collectorNamespace, listCollectorDiagnostics, openCollectorState } from '../state.js';
@@ -91,6 +92,53 @@ describe('会話の収集', () => {
 
       await collectFromHook(options);
       assert.equal(mock.requests.length, 1, '追記がない再読込で再送している');
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
+  it('DeepSeekは会話fileに書かれる前の入力をhookの発言IDで取り込み、前のturnの回答より後ろへ並べ、fileへ書かれた後も重複させない', async () => {
+    const projectId = randomUUID();
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: projectId } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'session.v4.jsonl.zstd');
+      const frame = (value: unknown): Buffer => zstdCompressSync(`${JSON.stringify(value)}\n`);
+      const userLine = (id: string, time: number, text: string): Buffer =>
+        frame({ type: 'user/message', time, data: { id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] } });
+      const assistant = { id: 'assistant-1', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '前のturnの回答' }] };
+      writeFileSync(
+        transcript,
+        Buffer.concat([
+          frame({ type: 'session', id: 'session-desktop', cwd: realpathSync(fixture.repoDir), version: 4, delegationDepth: 0, isSeeded: false }),
+          userLine('user-1', 1_789_000_000_001, '最初の入力'),
+          frame({ type: 'assistant/message', time: 1_789_000_000_002, data: { turn: 1, message: assistant } }),
+          frame({ type: 'turn/end', time: 1_789_000_000_003, data: { turn: 1, reason: { kind: 'completed' } } }),
+        ]),
+      );
+      const base = { session_id: 'session-desktop', transcript_path: transcript, cwd: fixture.repoDir };
+      const options = { source: 'deepseek_harness' as const, config: fixture.config, token: 'token-a' };
+
+      // 入力時点。2件目の入力はまだ会話fileに無く、hookが発言IDと本文を渡す。
+      const submitted = await collectFromHook({
+        ...options,
+        hook: buildHook({ ...base, extra: { hook_event_name: 'UserPromptSubmit', message_id: 'user-2', prompt: '今の入力' } }),
+      });
+      assert.deepEqual(submitted.confirmedUserInputs.map((item) => [item.sourceMessageId, item.sequenceNo]), [['user-2', 3]]);
+
+      // harnessが2件目の入力を会話fileへ書いた後の取り込み。同じIDなので増えない。
+      appendFileSync(transcript, userLine('user-2', 1_789_000_000_004, '今の入力'));
+      await collectFromHook({ ...options, hook: buildHook(base) });
+
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.role, event.sequence_no, event.revision, event.text]),
+        [
+          ['user-1', 'user', 1, 1, '最初の入力'],
+          ['assistant-1', 'assistant', 2, 1, '前のturnの回答'],
+          ['user-2', 'user', 3, 1, '今の入力'],
+        ],
+      );
     } finally {
       mock.restore();
       await fixture.cleanup();
