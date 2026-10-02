@@ -90,6 +90,7 @@ npm run collector:diagnostics -- --config ~/.yori-collector.json
 - DeepSeek Harnessはデスクトップ版だけを対象にする。会話fileは`~/Library/Application Support/dsh-desktop/harness/sessions/<cwd由来の名前>/<session>/session.v<版>.jsonl.zstd`で、版は3と4を受理する。全リポジトリの会話が同じ場所に置かれるため、対象の絞り込みはsession行の`cwd`で行う。bridge版（`deepseek-bridge/dsh-home`配下の無圧縮`session.v3.jsonl`）は読まない。
 - DeepSeekの会話fileは追記のたびにzstdのフレームが足される。取り込みのたびにfile全体を読み、フレームを先頭から順に展開した本文を行単位で読む。書込み途中で欠けた末尾のフレームは、Nodeの版によって読まれないか展開できた分だけ読まれ、どちらでも改行で終わらない末尾行は未完行として次回へ回す。診断のbyte offsetは展開後の本文上の位置になる。
 - DeepSeekは`collect`・`notify`・`notify-late`のhook入力（`session_id`、`transcript_path`、`cwd`）も受理する。取り込むのはroot session（`delegationDepth=0`かつ`isSeeded=false`）のuser発言と、`turn/end`が`completed`のturnで最後に本文を持つassistant発言だけ。デスクトップ版からhookを呼ぶ仕組みはこのリポジトリに含まない。
+- DeepSeek Harnessは入力時のhookを回した後で発言を会話fileへ書くため、入力時点の会話fileに今の入力は無い。`UserPromptSubmit`のhook入力に`message_id`（harnessが会話記録へ書く発言のID）と`prompt`があれば、その入力を同じIDで先に取り込む。同じ呼出しの中で会話fileを先に読み、前のturnの回答を今の入力より前の順番にする。後で会話fileから同じIDの発言を読んでも、本文が同じならrevisionもsequenceも増えない。
 - 完成行を文字列へ変換する前にUTF-8を検証する。不正バイトを含む行は置換せず除外し、`transcript_invalid_utf8`とoffsetを記録する。正常なUnicodeと後続行は保持する。未完行の途中で切れた文字は完成まで判定しない。
 - session不一致で保留したscanは、そのscanで積んだmessage/outbox/採番/cursorを一体でrollbackし、保留原因の診断だけを残す。原因が解消すると同じ行を先頭から同じ順で読み直し、重複しないsequenceを採番する。
 - 1MiB超の行は本文を保持せず改行まで読み捨てる。読み捨て中の元行startと読取済みoffsetは`file_cursors`へ保存し、次回は途中から再開する。4MiBの読取予算は読み捨て中の読取も含む。inode交換・短縮・fingerprint不一致の再読込時は読み捨て状態も捨てる。旧schemaのstateには列を後方互換で追加する。
