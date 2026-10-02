@@ -100,6 +100,8 @@ export function createDeepSeekTranscriptParser(options: { repository?: string } 
   let sessionId: string | null = null;
   let accepted = false;
   let transcriptVersion = '';
+  // 思考量は発言行に無く、設定が変わるたびに書かれるrequest/header行にある。直近の値を以降のassistant発言へ付ける。
+  let reasoningEffort: string | null = null;
   const pendingAssistants = new Map<string, TranscriptMessageRecord>();
 
   return {
@@ -118,12 +120,19 @@ export function createDeepSeekTranscriptParser(options: { repository?: string } 
           (options.repository === undefined || metadata.cwd === options.repository);
         sessionId = accepted && metadata !== null ? metadata.sessionId : null;
         transcriptVersion = metadata === null ? '' : String(metadata.version);
+        reasoningEffort = null;
         pendingAssistants.clear();
         return accepted && metadata !== null
           ? [{ kind: 'session', source_session_id: metadata.sessionId, transcript_version: String(metadata.version) }]
           : [{ kind: 'ignored' }];
       }
       if (!accepted || sessionId === null) {
+        return [{ kind: 'ignored' }];
+      }
+      if (value.type === 'request/header') {
+        const header = isRecord(value.data) && isRecord(value.data.header) ? value.data.header : null;
+        const effort = header !== null && isRecord(header.config) ? header.config.reasoningEffort : undefined;
+        reasoningEffort = typeof effort === 'string' ? effort : null;
         return [{ kind: 'ignored' }];
       }
       if (value.type === 'user/message') {
@@ -173,6 +182,7 @@ export function createDeepSeekTranscriptParser(options: { repository?: string } 
             occurred_at: occurredAt,
             role: 'assistant',
             ...(typeof message.source.model === 'string' ? { model_id: message.source.model } : {}),
+            ...(typeof message.source.model === 'string' && reasoningEffort !== null ? { reasoning_effort: reasoningEffort } : {}),
             text,
           });
         }
