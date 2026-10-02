@@ -77,6 +77,8 @@ interface SearchRequestRow {
   embedding_generation_id: string | null;
   // route_searchで得た入力の設計方針fingerprint。NULLは未評価（manual検索・旧受付）。
   strategy_terms: string[] | null;
+  // 一次資料だけを求める明示検索。自動受付は常にfalse。
+  primary_only: boolean;
 }
 
 interface CandidateSource {
@@ -291,6 +293,22 @@ const PROVENANCE_CANDIDATES_SQL = `
    ORDER BY e.document_id ASC, e.revision ASC
 `;
 
+// 候補のうち、検索結果の注入を受けて書かれた回答をsourceに持つ文書を返す。判定は元を辿る経路と同じで、
+// 回答の直前の入力に対する検索がmatchedで完了していること。一次資料だけの検索で候補から外す。
+const DERIVED_CANDIDATES_SQL = `
+  SELECT DISTINCT s.document_id, s.document_revision
+    FROM search_document_sources s
+    JOIN messages m ON m.id = s.message_id AND m.role = 'assistant'
+    JOIN LATERAL (
+      SELECT sr.status, sr.outcome
+        FROM search_requests sr
+       WHERE sr.session_id = m.session_id AND sr.input_sequence_no < m.sequence_no
+       ORDER BY sr.input_sequence_no DESC, sr.created_at DESC
+       LIMIT 1
+    ) nearest ON nearest.status = 'completed' AND nearest.outcome = 'matched'
+   WHERE (s.document_id, s.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+`;
+
 // sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
@@ -494,6 +512,8 @@ async function loadCandidates(
     question: string;
     // 一致経路に使う入力fingerprint。nullまたは最小一致数未満なら経路を実行しない。
     strategyTerms: readonly string[] | null;
+    // trueなら、検索結果の注入を受けて書かれた回答をsourceに持つ候補を外す。
+    primaryOnly: boolean;
   },
 ): Promise<{ candidates: Candidate[]; collapsed: number }> {
   // 検索の識別子経路は検索質問から抽出する。autoはinput原文、manualは受付へ保存した質問を使う。
@@ -633,6 +653,13 @@ async function loadCandidates(
           source_kind: row.source_kind,
           occurred_at: row.occurred_at,
         });
+      }
+      if (input.primaryOnly) {
+        // 元を辿る経路で加えた文書は残る。辿った先も派生なら、同じ判定で外れる。
+        const derived = await client.query<{ document_id: string; document_revision: number }>(DERIVED_CANDIDATES_SQL, keys);
+        for (const row of derived.rows) {
+          candidates.delete(`${row.document_id}:${row.document_revision}`);
+        }
       }
     }
     // DB候補検索のdurationだけをproject/generation scopeで観測する。本文・質問は保存しない。
@@ -1477,7 +1504,7 @@ export function searchRequestIdFromPayload(payload: unknown): string | null {
 async function loadSearchRequest(pool: Pool, target: JobTarget, requestId: string): Promise<SearchRequestRow> {
   const result = await pool.query<SearchRequestRow>(
     `SELECT id, trigger, search_action, status, result, input_message_id, input_message_revision, input_sequence_no, question,
-              embedding_generation_id, strategy_terms
+              embedding_generation_id, strategy_terms, primary_only
        FROM search_requests
       WHERE id = $1
         AND input_message_id = $2 AND input_message_revision = $3 AND input_sequence_no = $4
@@ -1601,7 +1628,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
   const queryVectors = await Promise.all(chunks.map((chunk) => provider.embedQuery(chunk, generation)));
   // manual検索の質問は入力発言と異なるため、入力のfingerprintを流用しない。
   const strategyTerms = request.trigger === 'auto' ? request.strategy_terms : null;
-  const loaded = await loadCandidates(pool, { target, generation, queryVectors, question, strategyTerms });
+  const loaded = await loadCandidates(pool, { target, generation, queryVectors, question, strategyTerms, primaryOnly: request.primary_only });
   const candidates = loaded.candidates;
   const selection = await selectCandidates(candidates, questionTokens);
   const { selected } = selection;
