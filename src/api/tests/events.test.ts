@@ -63,7 +63,7 @@ describe('POST /v1/events 正常保存', () => {
     assert.deepEqual(session.rows, [{ source: 'deepseek_harness', source_session_id: 'deepseek-session-1' }]);
   });
 
-  it('Cursorイベントのsourceと選択modelをmessage revisionへ保存する', async () => {
+  it('Cursorイベントのsourceと選択modelを保存し、modelはmessage_metadataへ置く', async () => {
     const event = {
       ...buildEventInput({
         idempotency_key: 'cursor-model-1',
@@ -82,22 +82,68 @@ describe('POST /v1/events 正常保存', () => {
     assert.equal(response.statusCode, 202, response.body);
     const session = await pool.query<{ source: string; source_session_id: string }>('SELECT source, source_session_id FROM sessions');
     assert.deepEqual(session.rows, [{ source: 'cursor', source_session_id: 'conversation-1' }]);
-    const revision = await pool.query<{ text: string; model_id: string | null; client_version: string | null }>(
-      'SELECT text, model_id, client_version FROM message_revisions',
-    );
-    assert.deepEqual(revision.rows, [{ text: 'Cursorの回答', model_id: 'anthropic/claude-sonnet-4', client_version: '1.7.2' }]);
+    const revision = await pool.query<{ text: string; client_version: string | null }>('SELECT text, client_version FROM message_revisions');
+    assert.deepEqual(revision.rows, [{ text: 'Cursorの回答', client_version: '1.7.2' }]);
+    const metadata = await pool.query('SELECT revision, model_id, reasoning_effort FROM message_metadata');
+    assert.deepEqual(metadata.rows, [{ revision: 1, model_id: 'anthropic/claude-sonnet-4', reasoning_effort: null }]);
   });
 
-  it('model_idを持たない既存clientのイベントを従来どおり保存する', async () => {
+  it('model_idを持たないイベントは従来どおり保存し、message_metadataへ行を作らない', async () => {
     const event = buildEventInput({ idempotency_key: 'without-model-1', text: '既存clientの本文' });
 
     const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
 
     assert.equal(response.statusCode, 202, response.body);
-    const revision = await pool.query<{ model_id: string | null; client_version: string | null }>(
-      'SELECT model_id, client_version FROM message_revisions',
-    );
-    assert.deepEqual(revision.rows, [{ model_id: null, client_version: null }]);
+    const revision = await pool.query<{ client_version: string | null }>('SELECT client_version FROM message_revisions');
+    assert.deepEqual(revision.rows, [{ client_version: null }]);
+    assert.equal((await pool.query('SELECT 1 FROM message_metadata')).rowCount, 0);
+  });
+
+  it('modelと思考量を保存して原文取得だけで返し、modelが無い発言の原文取得には項目を出さない', async () => {
+    const user = buildEventInput({ idempotency_key: 'effort-user-1', source_message_id: 'effort-user', sequence_no: 1, text: '質問' });
+    const assistant = {
+      ...buildEventInput({ idempotency_key: 'effort-assistant-1', source_message_id: 'effort-assistant', sequence_no: 2, role: 'assistant', text: '回答' }),
+      model_id: 'claude-opus-5-5',
+      reasoning_effort: 'medium',
+    };
+
+    const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [user, assistant]) });
+
+    assert.equal(response.statusCode, 202, response.body);
+    const stored = await pool.query<{ id: string; role: string }>('SELECT id, role FROM messages ORDER BY sequence_no');
+    const evidenceOf = async (messageId: string) =>
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/v1/evidence/${messageId}?project_id=${workspace.projectId}&revision=1`,
+          headers: { authorization: `Bearer ${workspace.token}` },
+        })
+      ).json<Record<string, unknown>>();
+    const assistantEvidence = await evidenceOf(stored.rows[1].id);
+    assert.equal(assistantEvidence.model_id, 'claude-opus-5-5');
+    assert.equal(assistantEvidence.reasoning_effort, 'medium');
+    const userEvidence = await evidenceOf(stored.rows[0].id);
+    assert.equal(userEvidence.text, '質問');
+    assert.ok(!('model_id' in userEvidence) && !('reasoning_effort' in userEvidence), 'modelが無い発言に項目を出している');
+  });
+
+  it('model_idなしのreasoning_effortを400で拒否し、同じrevisionを違う思考量で再送すると409にする', async () => {
+    const base = buildEventInput({ idempotency_key: 'effort-conflict-1', source_message_id: 'effort-conflict', role: 'assistant', text: '回答' });
+
+    const withoutModel = await postEvents(app, {
+      token: workspace.token,
+      body: buildEventBatch(workspace.projectId, [{ ...base, reasoning_effort: 'high' }]),
+    });
+    assert.equal(withoutModel.statusCode, 400, withoutModel.body);
+    await assertNoEventWrites(pool);
+
+    const first = { ...base, model_id: 'gpt-5.6-sol', reasoning_effort: 'high' };
+    assert.equal((await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [first]) })).statusCode, 202);
+    const changed = { ...first, idempotency_key: 'effort-conflict-2', reasoning_effort: 'low' };
+    const conflict = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [changed]) });
+    assert.equal(conflict.statusCode, 409, conflict.body);
+    const metadata = await pool.query('SELECT model_id, reasoning_effort FROM message_metadata');
+    assert.deepEqual(metadata.rows, [{ model_id: 'gpt-5.6-sol', reasoning_effort: 'high' }]);
   });
 
   it('userイベントを202で受理し、原文・classify job・自動検索受付を同一TXで保存する', async () => {
