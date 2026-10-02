@@ -1145,6 +1145,30 @@ describe('M6 POST /v1/searches 受付', () => {
     assert.equal(autoRow.search_action, null);
   });
 
+  it('primary_only=trueは同じ原文でも自動受付を再利用せず、指定を保存したmanual受付を作る', async () => {
+    const input = await ingestUserInput('一次資料を求める原文');
+    const idempotencyKey = `idem-${randomUUID()}`;
+    const body = buildSearchBody({ messageId: input.messageId, query: '一次資料を求める原文', idempotencyKey });
+    const response = await postSearch(app, { token: workspace.token, body: { ...body, primary_only: true } });
+    assertAccepted(response, 'primary_onlyのmanual受付に失敗');
+    const requestId = response.json<{ request_id: string }>().request_id;
+    assert.notEqual(requestId, input.requestId, 'primary_only=trueで自動受付を返している');
+    const stored = await pool.query<{ id: string; trigger: string; primary_only: boolean }>(
+      'SELECT id, trigger, primary_only FROM search_requests ORDER BY trigger',
+    );
+    assert.deepEqual(stored.rows, [
+      { id: input.requestId, trigger: 'auto', primary_only: false },
+      { id: requestId, trigger: 'manual', primary_only: true },
+    ]);
+    assert.equal(await countJobs(pool, 'execute_search'), 1);
+
+    const withoutFlag = await postSearch(app, { token: workspace.token, body });
+    assert.equal(withoutFlag.statusCode, 409, `primary_only違いの再送を受理した: ${withoutFlag.body}`);
+    assert.equal(errorCode(withoutFlag), 'conflict');
+    const invalid = await postSearch(app, { token: workspace.token, body: { ...body, primary_only: 'yes' } });
+    assert.equal(invalid.statusCode, 400, `真偽値でないprimary_onlyを受理した: ${invalid.body}`);
+  });
+
   it('同じ冪等キー・同じ内容の再送は同じmanual requestを返し、重複を作らない', async () => {
     const input = await ingestUserInput('再送対象の入力');
     const idempotencyKey = `idem-${randomUUID()}`;
