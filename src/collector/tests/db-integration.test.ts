@@ -55,7 +55,8 @@ describeWithDatabase('collector → 既存APIの縦通し (DATABASE_URL必須)',
       const transcript = path.join(fixture.root, 'codex.jsonl');
       await writeTranscript(transcript, [
         codexSessionLine('session-db'),
-        codexMessageLine({ sessionId: 'session-db', messageId: 'item-user', role: 'user', text: '質問本文' }),
+        // 今の入力として送る。過去の時刻だと履歴の取り込みとして自動検索が作られない。
+        codexMessageLine({ sessionId: 'session-db', messageId: 'item-user', role: 'user', text: '質問本文', timestamp: new Date().toISOString() }),
         codexMessageLine({ sessionId: 'session-db', messageId: 'item-assistant', role: 'assistant', text: '回答本文' }),
       ]);
       const options = {
