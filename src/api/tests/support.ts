@@ -5,6 +5,10 @@ import { MAX_BATCH_SIZE, RECEIPT_PAYLOAD_KEYS, type EventInput, type EventsReque
 import { countRows, sha256Bytes } from '../../db/tests/fixtures.js';
 import type { Pool } from 'pg';
 
+// 既定の発言時刻は今の入力にする。固定の過去日時にすると、履歴の取り込みとして自動検索が作られない。
+// 同じmessageのrevision更新で時刻が変わらないよう、process内で1回だけ決める。
+export const DEFAULT_OCCURRED_AT = new Date().toISOString();
+
 // テストのイベント既定値。上書きしたいfieldだけ渡す。
 export function buildEventInput(overrides: Partial<EventInput> = {}): EventInput {
   return {
@@ -16,7 +20,7 @@ export function buildEventInput(overrides: Partial<EventInput> = {}): EventInput
     sequence_no: 1,
     revision: 1,
     role: 'user',
-    occurred_at: '2026-09-21T01:00:00.000Z',
+    occurred_at: DEFAULT_OCCURRED_AT,
     text: '保存対象の発言',
     ...overrides,
   };
