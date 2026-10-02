@@ -48,6 +48,8 @@ export interface CollectorHookInput {
   cwd?: string;
   hook_event_name?: string;
   turn_id?: string;
+  // DeepSeek Harnessが会話記録へ書く発言のID。入力時点では会話fileに無い発言を、同じIDで先に取り込む。
+  message_id?: string;
   generation_id?: string;
   prompt?: string;
   text?: string;
@@ -169,6 +171,9 @@ function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookM
       };
     }
     return { kind: 'empty' };
+  }
+  if (source === 'deepseek_harness' && hook.hook_event_name === 'UserPromptSubmit' && hook.message_id !== undefined && hook.prompt !== undefined) {
+    return { kind: 'message', sourceMessageId: hook.message_id, role: 'user', text: hook.prompt };
   }
   if (source !== 'codex') {
     return { kind: 'transcript' };
@@ -916,6 +921,12 @@ export async function collectFromHook(input: CollectFromHookInput): Promise<Coll
     }
     resolvedTargets.add(resolvedTargetKey(projectId, repository));
     const hookMessage = selectHookMessage(input.source, hook);
+    if (input.source === 'deepseek_harness' && hookMessage.kind === 'message') {
+      // 前のturnの回答は会話fileにしか無い。今の入力より先に取り込み、発言の順番を保つ。
+      // file側が保留になっても、入力の取り込みは同じ検査を自分で行うので止めない。
+      const knownSecrets = input.knownSecrets ?? [];
+      ingestTranscript(state, { namespace, source: input.source, hook, repository, projectId, policy, knownSecrets });
+    }
     let result: IngestResult;
     if (hookMessage.kind === 'message') {
       result = ingestHookMessage(state, {
