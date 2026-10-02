@@ -69,7 +69,7 @@ describe('Cursor公式hookの会話収集', () => {
           event.revision,
         ]),
         [
-          ['cursor', 'conversation-1', 'generation:generation-1:user', 'user', 'Cursorからの依頼', 'anthropic/claude-sonnet-4', 'high', '1.7.2', 1],
+          ['cursor', 'conversation-1', 'generation:generation-1:user', 'user', 'Cursorからの依頼', undefined, undefined, '1.7.2', 1],
           [
             'cursor',
             'conversation-1',
