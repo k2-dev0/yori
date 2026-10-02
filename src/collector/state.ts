@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   role TEXT NOT NULL,
   occurred_at TEXT NOT NULL,
   model_id TEXT,
+  reasoning_effort TEXT,
   client_version TEXT,
   text TEXT NOT NULL,
   created_at INTEGER NOT NULL,
@@ -181,6 +182,7 @@ export function openCollectorState(stateDir: string): CollectorState {
   ensureColumn(db, 'file_cursors', 'skip_start', 'INTEGER');
   ensureColumn(db, 'file_cursors', 'skip_offset', 'INTEGER');
   ensureColumn(db, 'outbox', 'model_id', 'TEXT');
+  ensureColumn(db, 'outbox', 'reasoning_effort', 'TEXT');
   ensureColumn(db, 'outbox', 'client_version', 'TEXT');
   return { stateDir, dbPath, db };
 }
@@ -259,6 +261,7 @@ export interface OutboxRow {
   role: EventRole;
   occurred_at: string;
   model_id: string | null;
+  reasoning_effort: string | null;
   client_version: string | null;
   text: string;
 }
@@ -525,6 +528,7 @@ export function enqueueOutbox(
     role: EventRole;
     occurred_at: string;
     model_id?: string;
+    reasoning_effort?: string;
     client_version?: string;
     text: string;
   },
@@ -533,8 +537,8 @@ export function enqueueOutbox(
     .prepare(
       `INSERT INTO outbox
          (namespace, idempotency_key, project_id, source, source_scope, source_session_id, source_message_id,
-          sequence_no, revision, role, occurred_at, model_id, client_version, text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          sequence_no, revision, role, occurred_at, model_id, reasoning_effort, client_version, text, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (namespace, idempotency_key) DO NOTHING`,
     )
     .run(
@@ -550,6 +554,7 @@ export function enqueueOutbox(
       input.role,
       input.occurred_at,
       input.model_id ?? null,
+      input.reasoning_effort ?? null,
       input.client_version ?? null,
       input.text,
       Date.now(),
