@@ -563,7 +563,7 @@ describe('会話の収集', () => {
     }
   });
 
-  it('modelなしで取り込み済みの発言をmodel付きで読み直してもrevisionを増やさず、新しい発言にはmodelを付けて送る', async () => {
+  it('modelなしで取り込み済みの発言をmodel付きで読み直してもrevisionを増やさず、新しい発言にはmodelと思考量を付けて送る', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
     try {
@@ -585,14 +585,14 @@ describe('会話の収集', () => {
       const replacement = path.join(fixture.root, 'replacement.jsonl');
       await writeTranscript(replacement, [
         claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-1', role: 'assistant', content: '収集済みの回答', model: 'claude-opus-5-5' }),
-        claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-2', role: 'assistant', content: '新しい回答', model: 'claude-opus-5-5' }),
+        claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-2', role: 'assistant', content: '新しい回答', model: 'claude-opus-5-5', extra: { effort: 'high' } }),
       ]);
       renameSync(replacement, transcript);
 
       await collectFromHook(options);
       assert.deepEqual(
-        sentEvents([mock.requests[1]]).map((event) => [event.source_message_id, event.revision, event.model_id]),
-        [['a-2', 1, 'claude-opus-5-5']],
+        sentEvents([mock.requests[1]]).map((event) => [event.source_message_id, event.revision, event.model_id, event.reasoning_effort]),
+        [['a-2', 1, 'claude-opus-5-5', 'high']],
       );
     } finally {
       mock.restore();
