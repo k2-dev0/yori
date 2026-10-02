@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { zstdCompressSync } from 'node:zlib';
 import { flushCollector } from '../collect.js';
 import { closeCollectorState, collectorNamespace, openCollectorState } from '../state.js';
 import {
@@ -20,6 +22,42 @@ import {
 } from './support.js';
 
 describe('collector CLI', () => {
+  it('deepseek_harnessのhookは、圧縮された会話fileから発言を取り込んで送信する', async () => {
+    const fixture = await createCollectorFixture({ binding: null });
+    const projectId = randomUUID();
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'session.v4.jsonl.zstd');
+      const sessionId = 'session-desktop';
+      const lines = [
+        { type: 'session', id: sessionId, cwd: realpathSync(fixture.repoDir), version: 4, delegationDepth: 0, isSeeded: false, agentPreset: 'standard' },
+        { type: 'user/message', seq: 2, time: 1_789_000_000_001, data: { id: 'desktop-user', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'デスクトップ版の入力' }] } },
+      ].map((value) => `${JSON.stringify(value)}\n`);
+      // 追記と同じく、行ごとに別フレームで書く。
+      await writeFile(transcript, Buffer.concat(lines.map((value) => zstdCompressSync(value))));
+      const configPath = path.join(fixture.root, 'collector.json');
+      await writeFile(configPath, JSON.stringify(fixture.config), 'utf8');
+      const hook = { session_id: sessionId, transcript_path: transcript, cwd: fixture.repoDir, hook_event_name: 'UserPromptSubmit' };
+
+      const result = await runCollectorCli(['collect', '--source', 'deepseek_harness', '--config', configPath], {
+        stdin: JSON.stringify(hook),
+        env: { YORI_TEST_TOKEN: 'token-a' },
+      });
+      assert.equal(result.code, 0, `CLIが失敗した: ${result.stderr}`);
+      // CLIは別プロセスで、通信の差し替えが効かない。未登録のまま取り込み、登録後にこのプロセスのflushで送る。
+      const registered = buildCollectorConfig({ state_dir: fixture.stateDir, projects: [{ repository: 'github.com/Org/Repo', project_id: projectId }] });
+      await flushCollector({ config: registered, token: 'token-a' });
+      const events = parseSentBatches(mock.requests).flatMap((batch) => batch.events);
+      assert.deepEqual(
+        events.map((event) => [event.source, event.role, event.text]),
+        [['deepseek_harness', 'user', 'デスクトップ版の入力']],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('未登録sourceを保留し、登録後に別プロセスのflushが送信する', async () => {
     const fixture = await createCollectorFixture({ binding: null });
     const projectId = randomUUID();
