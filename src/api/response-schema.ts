@@ -50,6 +50,8 @@ export const projectRegistrationResponseSchema = z.strictObject({
   repository: canonicalRepository,
 });
 
+export const projectRemovalResponseSchema = z.strictObject({ status: z.literal('done'), project_id: z.uuid() });
+
 const companySummaryResponseSchema = z.strictObject({
   company_id: z.uuid(),
   name: storableString,
@@ -221,7 +223,8 @@ export type ErrorBody = z.infer<typeof errorResponseSchema>;
 export type EventResult = z.infer<typeof eventResultSchema>;
 export type EventsResponse = z.infer<typeof eventsResponseSchema>;
 export type ProjectRegistrationResponse = z.infer<typeof projectRegistrationResponseSchema>;
-export type MeResponse = z.infer<typeof meResponseSchema>;
+export type ProjectRemovalResponse = z.infer<typeof projectRemovalResponseSchema>;
+export type MeResponse =z.infer<typeof meResponseSchema>;
 export type CompanyResponse = z.infer<typeof companyResponseSchema>;
 export type EmployeeCreateResponse = z.infer<typeof employeeCreateResponseSchema>;
 export type EmployeeRenameResponse = z.infer<typeof employeeRenameResponseSchema>;
