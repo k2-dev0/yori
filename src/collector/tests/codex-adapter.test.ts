@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { describe, it } from 'node:test';
-import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine } from '../adapters/codex.js';
-import { codexMessageLine, codexSessionLine } from './support.js';
+import { SUPPORTED_CODEX_CLI_VERSIONS, parseCodexTranscriptLine, readCodexTurnContexts } from '../adapters/codex.js';
+import { codexMessageLine, codexSessionLine, makeTempDir, removeTempDir, writeTranscript } from './support.js';
 
 describe('Codex transcriptアダプター', () => {
   it('session_metaのsession IDと確認済みcli_versionを返す', () => {
@@ -152,6 +153,56 @@ describe('Codex transcriptアダプター', () => {
       role: 'assistant',
       text: 'fixture-assistant-final-text',
     });
+  });
+
+  it('会話ログのturn_contextからturnごとのmodelと思考量を引き、回答行にだけ付ける', async () => {
+    const dir = await makeTempDir();
+    try {
+      const transcript = path.join(dir, 'codex.jsonl');
+      const turnContext = (turnId: string, payload: Record<string, unknown>) => JSON.stringify({ type: 'turn_context', payload: { turn_id: turnId, ...payload } });
+      const itemLine = (item: Record<string, unknown>) =>
+        JSON.stringify({
+          timestamp: '2026-09-21T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'item_completed', thread_id: 'session-1', turn_id: 'turn-1', item },
+        });
+      await writeTranscript(transcript, [
+        turnContext('turn-1', { model: 'gpt-5.6-sol', effort: 'high' }),
+        turnContext('turn-2', { model: 'gpt-6-astra' }),
+        turnContext('turn-3', { effort: 'low' }),
+        '{"type":"turn_context", broken',
+      ]);
+
+      const contexts = readCodexTurnContexts(transcript);
+      assert.deepEqual(
+        [...contexts],
+        [
+          ['turn-1', { model_id: 'gpt-5.6-sol', reasoning_effort: 'high' }],
+          ['turn-2', { model_id: 'gpt-6-astra' }],
+        ],
+      );
+      assert.deepEqual([...readCodexTurnContexts(path.join(dir, 'missing.jsonl'))], [], '読めないfileを空の表にしていない');
+
+      const answer = parseCodexTranscriptLine(
+        itemLine({ id: 'item-final', type: 'AgentMessage', phase: 'final_answer', content: [{ type: 'Text', text: '回答' }] }),
+        () => contexts,
+      );
+      assert.deepEqual(answer, {
+        kind: 'message',
+        model_id: 'gpt-5.6-sol',
+        reasoning_effort: 'high',
+        source_session_id: 'session-1',
+        transcript_version: null,
+        source_message_id: 'turn:turn-1:assistant',
+        occurred_at: '2026-09-21T00:00:01.000Z',
+        role: 'assistant',
+        text: '回答',
+      });
+      const question = parseCodexTranscriptLine(itemLine({ id: 'item-user', type: 'UserMessage', content: [{ type: 'text', text: '質問' }] }), () => contexts);
+      assert.ok(question.kind === 'message' && question.model_id === undefined && question.reasoning_effort === undefined, 'user発言にmodelを付けている');
+    } finally {
+      await removeTempDir(dir);
+    }
   });
 
   it('既知の非会話top-level recordをignoredとして扱う', () => {
