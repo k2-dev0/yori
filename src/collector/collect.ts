@@ -166,8 +166,7 @@ function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookM
         sourceMessageId: `generation:${hook.generation_id}:user`,
         role: 'user',
         text: hook.prompt,
-        modelId: hook.model_id,
-        reasoningEffort: hook.reasoning_effort,
+        // modelと思考量は回答を生成した側の情報なので、他のsourceと同じくuser発言には付けない。
         clientVersion: hook.client_version,
       };
     }
