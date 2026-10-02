@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { buildApp } from '../app.js';
-import { projectRegistrationResponseSchema } from '../response-schema.js';
+import { projectRegistrationResponseSchema, projectRemovalResponseSchema } from '../response-schema.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
   countRows,
   insertCompany,
+  insertEmployee,
+  insertMessage,
   insertProject,
+  insertSession,
+  issueAuthToken,
   resetDatabase,
   seedWorkspace,
   type WorkspaceFixture,
@@ -102,5 +106,83 @@ describe('project登録API', () => {
       assert.ok(!response.body.includes(primaryProjectId), '衝突先projectを開示している');
     }
     assert.equal(await countRows(pool, 'projects'), before);
+  });
+});
+
+describe('project削除API', () => {
+  it('company admin tokenで案件を収集済みデータごと削除し、他の案件のデータは残す', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const keptProjectId = await insertProject(pool, workspace.companyId, 'github.com/org/kept');
+    const removedSessionId = await insertSession(pool, { projectId: workspace.projectId, employeeId: workspace.employeeId });
+    await insertMessage(pool, { sessionId: removedSessionId, sourceMessageId: 'removed-1', sequenceNo: 1 });
+    const keptSessionId = await insertSession(pool, { projectId: keptProjectId, employeeId: workspace.employeeId });
+    await insertMessage(pool, { sessionId: keptSessionId, sourceMessageId: 'kept-1', sequenceNo: 1 });
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/projects/${workspace.projectId}`,
+      headers: authorization(adminToken, false),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(projectRemovalResponseSchema.parse(response.json()), { status: 'done', project_id: workspace.projectId });
+
+    const projects = await pool.query<{ id: string }>('SELECT id FROM projects');
+    assert.deepEqual(projects.rows, [{ id: keptProjectId }]);
+    const sessions = await pool.query<{ id: string }>('SELECT id FROM sessions');
+    assert.deepEqual(sessions.rows, [{ id: keptSessionId }]);
+    assert.equal(await countRows(pool, 'messages'), 1);
+    assert.equal(await countRows(pool, 'message_revisions'), 1);
+    assert.equal(await countRows(pool, 'project_members'), 0);
+    assert.equal(await countRows(pool, 'employees'), 1);
+
+    const again = await app.inject({
+      method: 'DELETE',
+      url: `/v1/projects/${workspace.projectId}`,
+      headers: authorization(adminToken, false),
+    });
+    assert.equal(again.statusCode, 404, again.body);
+    assert.equal(errorCode(again), 'not_found');
+  });
+
+  it('社員tokenは403、token無しは401で拒否し、案件を消さない', async () => {
+    const url = `/v1/projects/${workspace.projectId}`;
+    const employee = await app.inject({ method: 'DELETE', url, headers: authorization(workspace.token, false) });
+    assert.equal(employee.statusCode, 403, employee.body);
+    assert.equal(errorCode(employee), 'forbidden');
+
+    const anonymous = await app.inject({ method: 'DELETE', url });
+    assert.equal(anonymous.statusCode, 401, anonymous.body);
+    assert.equal(errorCode(anonymous), 'unauthorized');
+    assert.equal(await countRows(pool, 'projects'), 1);
+  });
+
+  it('別companyのcompany admin tokenには存在を開示せず404を返し、案件を消さない', async () => {
+    const otherCompanyId = await insertCompany(pool, 'company-b');
+    const otherEmployeeId = await insertEmployee(pool, otherCompanyId, 'employee-b');
+    const otherAdminToken = await issueAuthToken(pool, otherCompanyId, otherEmployeeId, 'company_admin');
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/projects/${workspace.projectId}`,
+      headers: authorization(otherAdminToken, false),
+    });
+    assert.equal(response.statusCode, 404, response.body);
+    assert.equal(errorCode(response), 'not_found');
+    assert.equal(await countRows(pool, 'projects'), 1);
+  });
+
+  it('UUIDでないproject_idとbody付きの要求を400で拒否する', async () => {
+    const adminToken = await issueAuthToken(pool, workspace.companyId, workspace.employeeId, 'company_admin');
+    const malformed = await app.inject({ method: 'DELETE', url: '/v1/projects/not-a-uuid', headers: authorization(adminToken, false) });
+    assert.equal(malformed.statusCode, 400, malformed.body);
+
+    const withBody = await app.inject({
+      method: 'DELETE',
+      url: `/v1/projects/${workspace.projectId}`,
+      headers: authorization(adminToken),
+      payload: { repository: 'repo-a' },
+    });
+    assert.equal(withBody.statusCode, 400, withBody.body);
+    assert.equal(await countRows(pool, 'projects'), 1);
   });
 });
