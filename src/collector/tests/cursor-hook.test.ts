@@ -64,11 +64,12 @@ describe('Cursor公式hookの会話収集', () => {
           event.role,
           event.text,
           (event as unknown as { model_id?: string }).model_id,
+          event.reasoning_effort,
           (event as unknown as { client_version?: string }).client_version,
           event.revision,
         ]),
         [
-          ['cursor', 'conversation-1', 'generation:generation-1:user', 'user', 'Cursorからの依頼', 'anthropic/claude-sonnet-4', '1.7.2', 1],
+          ['cursor', 'conversation-1', 'generation:generation-1:user', 'user', 'Cursorからの依頼', 'anthropic/claude-sonnet-4', 'high', '1.7.2', 1],
           [
             'cursor',
             'conversation-1',
@@ -76,6 +77,7 @@ describe('Cursor公式hookの会話収集', () => {
             'assistant',
             'Cursorからの回答',
             'anthropic/claude-sonnet-4',
+            'high',
             '1.7.2',
             1,
           ],
