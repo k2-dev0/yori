@@ -206,7 +206,12 @@ const foundSearchResponseSchema = z.strictObject({
 
 export const searchLookupResponseSchema = z.union([notReceivedResponseSchema, foundSearchResponseSchema]);
 
-export const evidenceResponseSchema = evidenceItemResponseSchema;
+// 発言を生成したmodelと思考量は、明示の原文取得だけが返す。検索結果の根拠には載せず、自動注入へ流さない。
+export const evidenceResponseSchema = z.strictObject({
+  ...evidenceItemResponseSchema.shape,
+  model_id: z.string().optional(),
+  reasoning_effort: z.string().optional(),
+});
 
 export const sessionLinkResponseSchema = z.strictObject({
   link_id: z.uuid(),
