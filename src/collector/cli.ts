@@ -33,7 +33,7 @@ function fail(code: string): never {
   process.exit(1);
 }
 
-const HOOK_SOURCES = ['codex', 'claude_code', 'cursor'] as const;
+const HOOK_SOURCES = ['codex', 'claude_code', 'cursor', 'deepseek_harness'] as const;
 
 function parseCommandLine(argv: string[]): {
   command: string;
