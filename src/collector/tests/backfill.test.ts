@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 import { describe, it } from 'node:test';
 import { BackfillExecutionError, backfillCollector } from '../backfill.js';
 import {
@@ -57,7 +58,7 @@ function claudeMessage(sessionId: string, cwd: string, uuid: string, role: 'user
 
 function deepSeekLines(sessionId: string, cwd: string, userText: string, assistantText: string): string[] {
   return [
-    JSON.stringify({ type: 'session', id: sessionId, cwd, version: 3, delegationDepth: 0, isSeeded: false, createdAt: 1_789_000_000_000 }),
+    JSON.stringify({ type: 'session', id: sessionId, cwd, version: 4, delegationDepth: 0, isSeeded: false, createdAt: 1_789_000_000_000 }),
     JSON.stringify({
       type: 'user/message',
       seq: 2,
@@ -106,10 +107,21 @@ async function installHistory(home: string, repository: string): Promise<{ secre
   await writeTranscript(path.join(claudeProject, 'subagents', 'ignored.jsonl'), [claudeMessage('claude-child', repository, 'child-user', 'user', secret)]);
 
   const sessionId = 'deepseek-root';
-  const repositoryHash = createHash('sha256').update(repository).digest('hex');
-  const deepSeekDir = path.join(home, 'Library', 'Application Support', 'deepseek-bridge', 'dsh-home', repositoryHash, 'sessions', 'fixture');
+  // デスクトップ版は追記のたびにフレームを足す。session行と残りを別フレームにし、連結フレームを読めることを確かめる。
+  const sessionsRoot = path.join(home, 'Library', 'Application Support', 'dsh-desktop', 'harness', 'sessions');
+  const deepSeekDir = path.join(sessionsRoot, 'fixture-repository', sessionId);
   await mkdir(deepSeekDir, { recursive: true });
-  await writeTranscript(path.join(deepSeekDir, 'session.v3.jsonl'), deepSeekLines(sessionId, repository, 'DeepSecret AcmeSecret', 'deepseek final'));
+  const [sessionLine, ...rest] = deepSeekLines(sessionId, repository, 'DeepSecret AcmeSecret', 'deepseek final');
+  const frames = [zstdCompressSync(`${sessionLine}\n`), zstdCompressSync(`${rest.join('\n')}\n`)];
+  await writeFile(path.join(deepSeekDir, 'session.v4.jsonl.zstd'), Buffer.concat(frames));
+  // 別リポジトリの会話は同じ置き場所にあっても対象にしない。
+  const otherDir = path.join(sessionsRoot, 'other-repository', 'deepseek-other');
+  await mkdir(otherDir, { recursive: true });
+  await writeFile(path.join(otherDir, 'session.v4.jsonl.zstd'), zstdCompressSync(`${deepSeekLines('deepseek-other', '/other', secret, 'other')[0]}\n`));
+  // bridge版の無圧縮fileは読まない。
+  const bridgeDir = path.join(home, 'Library', 'Application Support', 'deepseek-bridge', 'dsh-home', 'hash', 'sessions', 'fixture');
+  await mkdir(bridgeDir, { recursive: true });
+  await writeTranscript(path.join(bridgeDir, 'session.v3.jsonl'), deepSeekLines('deepseek-bridge', repository, secret, 'bridge'));
   return { secret, sessionId };
 }
 
@@ -148,7 +160,7 @@ describe('collector backfill', { concurrency: false }, () => {
         sources: {
           codex: { sessions: 2, candidates: 3, excluded: 1, versions: ['0.156.1'] },
           claude_code: { sessions: 1, candidates: 2, excluded: 0, versions: ['2.1.220'] },
-          deepseek_harness: { sessions: 1, candidates: 2, excluded: 0, versions: ['3'] },
+          deepseek_harness: { sessions: 1, candidates: 2, excluded: 0, versions: ['4'] },
         },
         totals: { sessions: 4, candidates: 7, excluded: 1 },
       });
