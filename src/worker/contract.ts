@@ -318,6 +318,9 @@ export interface JevRequest {
 // ---- M5 検索・候補判定の固定契約（計画9.2.1、9.3、10.3） ----
 // vector/識別子の各経路の取得上限と、Jevへ渡す候補上限・本文予算。
 export const SEARCH_VECTOR_LIMIT = 20;
+// vector経路で実際に取得する件数。内容が重複する候補を除いて別々の内容がSEARCH_VECTOR_LIMIT件そろうところまでを使う。
+// 同じ質問への回答の繰り返しが上位を埋めても、別の内容を候補に残すための余裕。
+export const SEARCH_VECTOR_FETCH_LIMIT = 60;
 export const SEARCH_ENTITY_LIMIT = 20;
 // 候補の回答が受け取った検索結果から辿って候補へ加える、元の発言の文書の上限。
 export const SEARCH_PROVENANCE_LIMIT = 10;
