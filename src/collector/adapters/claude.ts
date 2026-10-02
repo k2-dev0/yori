@@ -3,6 +3,9 @@ import type { TranscriptRecord } from '../transcript.js';
 // ローカルClaude Codeの確認済み版。未知versionはpipelineで診断し、構造検証はこのadapterで行う。
 export const SUPPORTED_CLAUDE_CODE_VERSION = '2.1.220';
 
+// modelを呼ばずにClaude Code自身が作ったassistant行に入るmodel名。実在のmodelではないので保存しない。
+const SYNTHETIC_MODEL = '<synthetic>';
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -66,8 +69,10 @@ export function parseClaudeTranscriptLine(line: string): TranscriptRecord {
   if (text === null) {
     return { kind: 'ignored' };
   }
+  const model = value.type === 'assistant' ? value.message.model : undefined;
   return {
     kind: 'message',
+    ...(typeof model === 'string' && model !== SYNTHETIC_MODEL ? { model_id: model } : {}),
     source_session_id: value.sessionId,
     transcript_version: value.version,
     source_message_id: value.uuid,
