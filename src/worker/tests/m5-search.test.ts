@@ -3914,6 +3914,20 @@ describe('内容が重複する候補の集約', () => {
     assert.ok(allJevRawBody(jev).includes('OTHER-TOPIC'), '重複する候補が枠を占め、別の内容の候補が判定へ渡っていない');
   });
 
+  it('重複する候補がvector経路の取得件数を超えて溜まっても、別の内容の候補を判定へ渡す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
+    const sessionId = await seedSession(pool, workspace);
+    // 繰り返しだけでvector経路の上位件数を埋め切り、別の内容の候補をその外へ押し出す。
+    const repeats = SEARCH_VECTOR_LIMIT + 5;
+    for (let index = 0; index < repeats; index += 1) {
+      await seedCandidate(config, sessionId, { marker: `REPEAT-${index + 1}`, sequenceNo: index + 1, embedding: repeatedVector(index + 1) });
+    }
+    await seedCandidate(config, sessionId, { marker: 'OTHER-TOPIC', sequenceNo: repeats + 1, embedding: distinctVector(1) });
+
+    await runSearch(config);
+    assert.ok(allJevRawBody(jev).includes('OTHER-TOPIC'), '繰り返しがvector経路を埋め、別の内容の候補が判定へ渡っていない');
+  });
+
   it('埋め込みが近くない候補は畳まず、どちらも判定へ渡す', async () => {
     const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: vectorQueryResponder(basisVector(0, 1)) });
     const sessionId = await seedSession(pool, workspace);
