@@ -14,6 +14,8 @@ export interface TranscriptMessageRecord {
   occurred_at: string;
   role: 'user' | 'assistant';
   model_id?: string;
+  // modelへ指定した思考量。model_idがある発言にだけ付ける。
+  reasoning_effort?: string;
   client_version?: string;
   text: string;
 }
