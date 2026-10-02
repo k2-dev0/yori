@@ -21,6 +21,8 @@ export interface SearchEvalCaseResult {
   in_candidates: boolean;
   candidate_position: number | null;
   relevance: string | null;
+  // 正解の候補を引いた検索経路。候補に入らなかった時はnull。
+  retrieval_kinds: string[] | null;
   error_code: string | null;
 }
 
@@ -55,7 +57,7 @@ const CANDIDATE_MESSAGES_SQL = `
 
 const storedResultSchema = z.looseObject({
   matches: z.array(z.looseObject({ evidence: z.array(z.looseObject({ message_id: z.string() })).optional() })).optional(),
-  candidate_evaluations: z.array(z.looseObject({ document_id: z.string(), revision: z.number(), relevance: z.string() })).optional(),
+  candidate_evaluations: z.array(z.looseObject({ document_id: z.string(), revision: z.number(), relevance: z.string(), retrieval_kinds: z.array(z.string()).optional() })).optional(),
 });
 
 interface EvalScope {
@@ -68,7 +70,7 @@ interface EvalScope {
 async function evaluateSearchCase(pool: Pool, config: WorkerConfig, scope: EvalScope, item: SearchEvalCase): Promise<SearchEvalCaseResult> {
   const [sessionId, messageId, requestId, jobId, leaseToken] = [uuidv7(), uuidv7(), uuidv7(), uuidv7(), uuidv7()];
   const hash = createHash('sha256').update(item.question, 'utf8').digest();
-  const missing = { name: item.name, in_candidates: false, candidate_position: null, relevance: null };
+  const missing = { name: item.name, in_candidates: false, candidate_position: null, relevance: null, retrieval_kinds: null };
   const leaseExpiresAt = new Date(Date.now() + DEFAULT_JOB_LEASE_MS);
   const payload = { search_request_id: requestId };
   const job: ClaimedJob = { id: jobId, kind: 'execute_search', priority: EXECUTE_SEARCH_PRIORITY, sessionId, messageId, targetRevision: 1, payload, leaseToken, leaseExpiresAt, attempts: 1 };
@@ -103,7 +105,7 @@ async function evaluateSearchCase(pool: Pool, config: WorkerConfig, scope: EvalS
     const candidatePosition = position >= 0 ? position + 1 : null;
     // 合格条件が「候補に入ること」のケースは、代表根拠にならなくても当たりにする。
     const passed = item.pass_when === 'in_candidates' ? position >= 0 : adopted;
-    return { name: item.name, status: passed ? 'hit' : 'miss', in_candidates: position >= 0, candidate_position: candidatePosition, relevance, error_code: null };
+    return { name: item.name, status: passed ? 'hit' : 'miss', in_candidates: position >= 0, candidate_position: candidatePosition, relevance, retrieval_kinds: evaluations[position]?.retrieval_kinds ?? null, error_code: null };
   } catch {
     return { ...missing, status: 'error', error_code: 'internal_error' };
   } finally {
