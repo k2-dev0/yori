@@ -4132,7 +4132,8 @@ describe('検索結果の注入を受けて書かれた回答から、元の発�
     await runSearch(config);
 
     const metrics = await loadProjectMetrics(pool, workspace.projectId);
-    assert.deepEqual(metrics?.provenance, { searches: 1, origin_adopted: 1, derived_demoted: 1 });
+    // 完了済みの検索は、fixtureの過去の検索と今回の検索の2件。元を辿って代表になったのは今回の1件だけ。
+    assert.deepEqual(metrics?.provenance, { searches: 2, origin_adopted: 1, derived_demoted: 1 });
   });
 });
 
