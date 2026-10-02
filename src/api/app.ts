@@ -25,6 +25,7 @@ import {
   healthReadyResponseSchema,
   meResponseSchema,
   projectRegistrationResponseSchema,
+  projectRemovalResponseSchema,
   searchAcceptedResponseSchema,
   searchLookupResponseSchema,
   searchViewResponseSchema,
@@ -39,6 +40,7 @@ import {
   employeeParamsSchema,
   employeeRenameRequestSchema,
   evidenceQuerySchema,
+  projectParamsSchema,
   projectRegistrationRequestSchema,
   searchByInputQuerySchema,
   searchDetailQuerySchema,
@@ -53,7 +55,7 @@ import {
   SessionLinkNotFoundError,
   createSessionLink,
 } from './session-links.js';
-import { ProjectRepositoryConflictError, registerProject } from './projects.js';
+import { ProjectNotFoundError, ProjectRepositoryConflictError, registerProject, removeProject } from './projects.js';
 import {
   AccountTargetNotFoundError,
   createCompanyEmployee,
@@ -229,6 +231,29 @@ export function buildApp(deps: { pool: Pool; releaseSha?: string }): FastifyInst
     } catch (error) {
       if (error instanceof ProjectRepositoryConflictError || isUniqueViolation(error)) {
         return reply.code(409).send(errorBody('repository_conflict'));
+      }
+      return reply.code(500).send(errorBody('internal_error'));
+    }
+  });
+
+  app.delete('/v1/projects/:project_id', async (request, reply) => {
+    const auth = await authenticate(deps.pool, request.headers.authorization);
+    if (!auth) {
+      return reply.code(401).send(errorBody('unauthorized'));
+    }
+    if (auth.tokenScope !== 'company_admin') {
+      return reply.code(403).send(errorBody('forbidden'));
+    }
+    const params = projectParamsSchema.safeParse(request.params);
+    if (!params.success || request.body !== undefined) {
+      return reply.code(400).send(errorBody('invalid_request'));
+    }
+    try {
+      const removed = await removeProject(deps.pool, auth, params.data.project_id);
+      return reply.code(200).send(projectRemovalResponseSchema.parse(removed));
+    } catch (error) {
+      if (error instanceof ProjectNotFoundError) {
+        return reply.code(404).send(errorBody('not_found'));
       }
       return reply.code(500).send(errorBody('internal_error'));
     }
