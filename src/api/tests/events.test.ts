@@ -142,7 +142,7 @@ describe('POST /v1/events 正常保存', () => {
     assert.equal(messageRows.rows[1].role, 'assistant');
     assert.equal(messageRows.rows[0].sequence_no, 1);
     assert.equal(messageRows.rows[1].sequence_no, 2);
-    assert.equal(messageRows.rows[0].occurred_at.toISOString(), '2026-09-21T01:00:00.000Z');
+    assert.equal(messageRows.rows[0].occurred_at.toISOString(), user.occurred_at);
     assert.equal(messageRows.rows[0].current_revision, 1);
     assert.equal(messageRows.rows[1].current_revision, 1);
 
