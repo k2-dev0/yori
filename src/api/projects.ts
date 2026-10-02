@@ -1,9 +1,19 @@
 import type { Pool } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import type { AuthContext } from './events.js';
-import type { ProjectRegistrationResponse } from './response-schema.js';
+import type { ProjectRegistrationResponse, ProjectRemovalResponse } from './response-schema.js';
 
 export class ProjectRepositoryConflictError extends Error {}
+export class ProjectNotFoundError extends Error {}
+
+// 認証会社のproject行を物理削除する。所属・alias・収集済みデータは外部キーのON DELETE CASCADEで同じ文の中で消える。
+export async function removeProject(pool: Pool, auth: AuthContext, projectId: string): Promise<ProjectRemovalResponse> {
+  const removed = await pool.query('DELETE FROM projects WHERE id = $1 AND company_id = $2', [projectId, auth.companyId]);
+  if (removed.rowCount !== 1) {
+    throw new ProjectNotFoundError();
+  }
+  return { status: 'done', project_id: projectId };
+}
 
 export async function registerProject(
   pool: Pool,
