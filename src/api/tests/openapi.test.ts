@@ -93,6 +93,16 @@ const ROUTES: RouteContract[] = [
     queryParams: [],
     hasBody: true,
   },
+  {
+    path: '/v1/projects/{project_id}',
+    method: 'delete',
+    secured: true,
+    success: ['200'],
+    errors: ['400', '401', '403', '404', '500'],
+    pathParams: ['project_id'],
+    queryParams: [],
+    hasBody: false,
+  },
   { path: '/v1/me', method: 'get', secured: true, success: ['200'], errors: ['401', '500'], pathParams: [], queryParams: [], hasBody: false },
   { path: '/v1/company', method: 'get', secured: true, success: ['200'], errors: ['401', '403', '500'], pathParams: [], queryParams: [], hasBody: false },
   {
@@ -326,7 +336,7 @@ function effectiveSecurity(document: OpenApiDocument, pathItem: OpenApiPathItem,
 }
 
 describe('OpenAPI 3.1契約の生成', () => {
-  it('OpenAPI 3.1として16 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
+  it('OpenAPI 3.1として17 routeをpathsへ1回ずつ定義し、operationIdを固定する', async () => {
     const { document } = await generatedOpenApi();
     assert.match(String(document.openapi), /^3\.1\.\d+$/, 'OpenAPI 3.1.xではない');
     assert.equal(document.info?.version, '1.0.0', 'API契約版が1.0.0ではない');
