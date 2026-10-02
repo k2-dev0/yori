@@ -145,7 +145,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '18');
+    assert.equal(versions.rows[0].count, '19');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
