@@ -28,6 +28,7 @@ const REQUIRED_TABLES = [
   'sessions',
   'messages',
   'message_revisions',
+  'message_metadata',
   'event_receipts',
   'jobs',
   'search_requests',
@@ -137,6 +138,7 @@ describe('migration管理', () => {
       '0017_vector_duration.sql',
       '0018_search_error_detail.sql',
       '0019_search_primary_only.sql',
+      '0020_message_metadata.sql',
     ]);
   });
 
@@ -145,7 +147,7 @@ describe('migration管理', () => {
     assert.deepEqual(first, []);
     assert.deepEqual(second, []);
     const versions = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM schema_migrations');
-    assert.equal(versions.rows[0].count, '19');
+    assert.equal(versions.rows[0].count, '20');
   });
 
   it('migrationは明示SQLファイルとして存在する', async () => {
@@ -417,7 +419,7 @@ describe('CHECK制約', () => {
         tokenHash,
       ]);
 
-      assert.deepEqual(await runMigrations(legacy), ['0013_auth_token_scope.sql', '0014_document_build_state.sql', '0015_strategy_fingerprint.sql', '0016_session_continuity.sql', '0017_vector_duration.sql', '0018_search_error_detail.sql', '0019_search_primary_only.sql']);
+      assert.deepEqual(await runMigrations(legacy), ['0013_auth_token_scope.sql', '0014_document_build_state.sql', '0015_strategy_fingerprint.sql', '0016_session_continuity.sql', '0017_vector_duration.sql', '0018_search_error_detail.sql', '0019_search_primary_only.sql', '0020_message_metadata.sql']);
       const migrated = await legacy.query<{ scope: string }>('SELECT scope FROM auth_tokens WHERE token_hash = $1', [tokenHash]);
       assert.deepEqual(migrated.rows, [{ scope: 'employee' }]);
     } finally {
