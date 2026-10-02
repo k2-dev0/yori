@@ -147,6 +147,57 @@ describe('hookの安定fieldを使う会話収集', () => {
     }
   });
 
+  it('Codexの回答にはhook経路でも会話ログ経路でも同じmodelと思考量を付け、hookで取り込んだ回答を読み直してもrevisionを増やさない', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'codex.jsonl');
+      const turnContext = (turnId: string, model: string, effort: string) => JSON.stringify({ type: 'turn_context', payload: { turn_id: turnId, model, effort } });
+      const head = [
+        JSON.stringify({ timestamp: '2026-09-30T00:00:00.000Z', type: 'session_meta', payload: { id: 'session-1', cli_version: '99.0.0-future' } }),
+        turnContext('turn-1', 'gpt-5.6-sol', 'high'),
+      ];
+      await writeTranscript(transcript, head);
+      const hookOf = (extra: Record<string, unknown>) => ({
+        source: 'codex' as const,
+        hook: buildHook({ session_id: 'session-1', transcript_path: transcript, cwd: fixture.repoDir, extra }),
+        config: fixture.config,
+        token: 'token-a',
+      });
+
+      await collectFromHook(hookOf({ hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', prompt: '質問1' }));
+      await collectFromHook(hookOf({ hook_event_name: 'Stop', turn_id: 'turn-1', last_assistant_message: '回答1' }));
+      const viaHook = sentEvents(mock.requests).map((event) => [event.source_message_id, event.revision, event.model_id, event.reasoning_effort]);
+      assert.deepEqual(viaHook, [
+        ['turn:turn-1:user', 1, undefined, undefined],
+        ['turn:turn-1:assistant', 1, 'gpt-5.6-sol', 'high'],
+      ]);
+
+      // turn-1はhookで取り込み済み、turn-2はhookを通らず会話ログだけにある。
+      await writeTranscript(transcript, [
+        ...head,
+        codexTurnLine({ sessionId: 'session-1', turnId: 'turn-1', itemId: 'item-user-1', role: 'user', text: '質問1' }),
+        codexTurnLine({ sessionId: 'session-1', turnId: 'turn-1', itemId: 'item-final-1', role: 'assistant', text: '回答1' }),
+        turnContext('turn-2', 'gpt-6-astra', 'xhigh'),
+        codexTurnLine({ sessionId: 'session-1', turnId: 'turn-2', itemId: 'item-user-2', role: 'user', text: '質問2' }),
+        codexTurnLine({ sessionId: 'session-1', turnId: 'turn-2', itemId: 'item-final-2', role: 'assistant', text: '回答2' }),
+      ]);
+      const sentBefore = mock.requests.length;
+      await collectFromHook(hookOf({}));
+
+      assert.deepEqual(
+        sentEvents(mock.requests.slice(sentBefore)).map((event) => [event.source_message_id, event.revision, event.model_id, event.reasoning_effort]),
+        [
+          ['turn:turn-2:user', 1, undefined, undefined],
+          ['turn:turn-2:assistant', 1, 'gpt-6-astra', 'xhigh'],
+        ],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('未知Claude Code版でも既知構造のuser/assistant発言を収集する', async () => {
     const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
     const mock = installFetchMock(ackResponse);
