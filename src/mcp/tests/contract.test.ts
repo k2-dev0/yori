@@ -109,6 +109,10 @@ const EXPECTED_TOOLS = [
         query: CONVERSATION_TEXT_INPUT_JSON_SCHEMA,
         idempotency_key: IDEMPOTENCY_KEY_INPUT_JSON_SCHEMA,
         force_refresh: { type: 'boolean' },
+        primary_only: {
+          description: '利用者が一次資料・当時の原文を求めた時だけtrueにする。検索結果を受けて書かれた回答を除く',
+          type: 'boolean',
+        },
       },
       ['input_id', 'input_revision', 'query', 'idempotency_key', 'force_refresh'],
     ),
