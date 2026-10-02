@@ -16,6 +16,8 @@ export interface ProjectMetrics {
   generations: GenerationMetrics[];
   reindex: { pending_documents: number };
   search_duration_ms: { samples: number; p50: number; p95: number };
+  // 直近の完了済み検索のうち、元を辿った候補が代表になった件数と、派生を後ろへ回した件数。
+  provenance: { searches: number; origin_adopted: number; derived_demoted: number };
   ann_recommendation: AnnRecommendation;
   jobs: Record<'pending' | 'running' | 'completed' | 'failed' | 'blocked_policy', number>;
 }
@@ -35,6 +37,8 @@ const JOB_STATUSES = ['pending', 'running', 'completed', 'failed', 'blocked_poli
 const ANN_MIN_SAMPLES = 50;
 // 「直近」の範囲。active世代でvector経路の時間を記録済みのsampleを新しい順にこの件数まで見る。
 const ANN_SAMPLE_WINDOW = 200;
+// 元を辿る処理の働きを数える、直近の完了済み検索の件数。
+const PROVENANCE_SEARCH_WINDOW = 500;
 const ANN_VECTOR_P95_THRESHOLD_MS = 100;
 const ANN_DOCUMENT_THRESHOLD = 20_000;
 
@@ -169,6 +173,24 @@ export async function loadProjectMetrics(pool: Pool, projectId: string): Promise
   );
   const vectorDurationRow = vectorDuration.rows[0];
 
+  // 保存済みの検索結果から数える。代表になった候補の経路と、派生を後ろへ回した警告だけを見て、本文は読まない。
+  const provenance = await pool.query<{ searches: number; origin_adopted: number; derived_demoted: number }>(
+    `SELECT count(*)::int AS searches,
+            count(*) FILTER (WHERE EXISTS (
+              SELECT 1 FROM jsonb_array_elements(COALESCE(recent.result->'candidate_evaluations', '[]'::jsonb)) e
+               WHERE e->>'adopted' = 'true' AND e->'retrieval_kinds' ? 'provenance'))::int AS origin_adopted,
+            count(*) FILTER (WHERE EXISTS (
+              SELECT 1 FROM jsonb_array_elements(COALESCE(recent.result->'warnings', '[]'::jsonb)) w
+               WHERE w->>'code' = 'derived_candidates_demoted'))::int AS derived_demoted
+       FROM (
+         SELECT result FROM search_requests
+          WHERE project_id = $1 AND status = 'completed' AND result IS NOT NULL
+          ORDER BY updated_at DESC, id DESC
+          LIMIT $2
+       ) recent`,
+    [projectId, PROVENANCE_SEARCH_WINDOW],
+  );
+
   const jobRows = await pool.query<{ status: string; count: number }>(
     `SELECT j.status, count(*)::int AS count
        FROM jobs j
@@ -189,6 +211,7 @@ export async function loadProjectMetrics(pool: Pool, projectId: string): Promise
     project_id: projectId,
     generations,
     reindex: { pending_documents: pendingDocuments },
+    provenance: provenance.rows[0] ?? { searches: 0, origin_adopted: 0, derived_demoted: 0 },
     search_duration_ms: {
       samples: durationRow?.samples ?? 0,
       p50: durationRow?.p50 ?? 0,
