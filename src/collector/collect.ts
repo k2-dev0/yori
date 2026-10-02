@@ -1,12 +1,12 @@
 import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, SUSPECTED_SECRET_OBSERVED, type EventSource } from '../api/contract.js';
 import { emptyRedactionPolicy, redactConversationText, sanitizeConversationText, type RedactionPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
 import { SUPPORTED_CODEX_CLI_VERSIONS, codexTurnMessageId, parseCodexTranscriptLine } from './adapters/codex.js';
-import { DEEPSEEK_HARNESS_VERSION, createDeepSeekTranscriptParser } from './adapters/deepseek.js';
+import { SUPPORTED_DEEPSEEK_HARNESS_VERSIONS, createDeepSeekTranscriptParser, decompressDeepSeekTranscript } from './adapters/deepseek.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending, resolvedTargetKey } from './send.js';
 import { decryptCachedPolicy, encryptCachedPolicy } from './policy-cache.js';
@@ -114,7 +114,7 @@ function isSupportedTranscriptVersion(source: EventSource, version: string): boo
   if (source === 'claude_code') {
     return version === SUPPORTED_CLAUDE_CODE_VERSION;
   }
-  return source === 'deepseek_harness' && version === String(DEEPSEEK_HARNESS_VERSION);
+  return source === 'deepseek_harness' && SUPPORTED_DEEPSEEK_HARNESS_VERSIONS.map(String).includes(version);
 }
 
 function createTranscriptLineParser(source: EventSource): (line: string) => TranscriptRecord[] {
@@ -251,6 +251,8 @@ interface ScanInput {
   onOversize: (byteOffset: number) => void;
   onInvalidUtf8: (byteOffset: number) => void;
   maxReadBytes?: number;
+  // 圧縮された会話fileの展開済み本文。指定時はfdではなくこの本文を読み、offsetも本文上の位置になる。
+  content?: Buffer;
 }
 
 // 4MiB予算の範囲で改行単位に読み、未完の末尾行はcursorへ含めない。1MiB超の行は本文を保持せず読み飛ばす。
@@ -267,7 +269,7 @@ function scanLines(input: ScanInput): { cursor: number; skipStart: number | null
   while (consumed < maxReadBytes && !input.shouldStop()) {
     const toRead = Math.min(READ_CHUNK_BYTES, maxReadBytes - consumed);
     const buffer = Buffer.allocUnsafe(toRead);
-    const read = readSync(input.fd, buffer, 0, toRead, position);
+    const read = input.content === undefined ? readSync(input.fd, buffer, 0, toRead, position) : input.content.copy(buffer, 0, position, position + toRead);
     if (read === 0) {
       break;
     }
@@ -716,6 +718,7 @@ export function ingestTranscript(
         onOversize: (offset) => recordDiagnostic(state, input.namespace, 'transcript_line_too_long', offset),
         onInvalidUtf8: (offset) => recordDiagnostic(state, input.namespace, 'transcript_invalid_utf8', offset),
         maxReadBytes: input.source === 'deepseek_harness' ? Number.MAX_SAFE_INTEGER : undefined,
+        content: input.source === 'deepseek_harness' ? decompressDeepSeekTranscript(readFileSync(fd)) : undefined,
       });
       if (ctx.held) {
         // 同scanで積んだ先行message/outbox/採番/cursorは一体で戻し、保留原因の診断だけを残す。
