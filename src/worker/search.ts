@@ -25,6 +25,7 @@ import {
   SEARCH_STATEMENT_TIMEOUT_MS,
   SEARCH_STRATEGY_LIMIT,
   SEARCH_STRATEGY_MIN_MATCHED_TERMS,
+  SEARCH_VECTOR_FETCH_LIMIT,
   SEARCH_VECTOR_LIMIT,
   WORKER_POLICY_VERSION,
   type CandidateRelevance,
@@ -253,17 +254,23 @@ const PROVENANCE_CANDIDATES_SQL = `
      WHERE (s.document_id, s.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
        AND m.role = 'assistant'
   ),
-  origin AS (
-    SELECT DISTINCT d.derived_id, d.derived_revision, (evidence->>'message_id')::uuid AS message_id
+  turn AS (
+    -- 同じターンの発言は同じ検索を指す。大きいresultを読む前に、文書ごとの検索のIDだけへ絞る。
+    SELECT DISTINCT d.derived_id, d.derived_revision, nearest.id AS request_id
       FROM derived d
       JOIN LATERAL (
-        SELECT sr.status, sr.outcome, sr.result
+        SELECT sr.id, sr.status, sr.outcome
           FROM search_requests sr
          WHERE sr.session_id = d.session_id AND sr.input_sequence_no < d.sequence_no
          ORDER BY sr.input_sequence_no DESC, sr.created_at DESC
          LIMIT 1
-      ) turn ON turn.status = 'completed' AND turn.outcome = 'matched'
-      CROSS JOIN LATERAL jsonb_array_elements(turn.result->'matches') AS matched
+      ) nearest ON nearest.status = 'completed' AND nearest.outcome = 'matched'
+  ),
+  origin AS (
+    SELECT DISTINCT t.derived_id, t.derived_revision, (evidence->>'message_id')::uuid AS message_id
+      FROM turn t
+      JOIN search_requests sr ON sr.id = t.request_id
+      CROSS JOIN LATERAL jsonb_array_elements(sr.result->'matches') AS matched
       CROSS JOIN LATERAL jsonb_array_elements(matched->'evidence') AS evidence
   )
   SELECT DISTINCT o.derived_id, o.derived_revision, e.document_id, e.revision, r.content
@@ -297,15 +304,17 @@ const CANDIDATE_SOURCES_SQL = `
 `;
 
 // 候補同士のうち、埋め込みが閾値以上に近い組だけを返す。同じ組を2回返さないよう順序を固定する。
+// 距離の計算を候補の文書だけに限るため、先に候補の埋め込みを取り出してから総当たりする。
 const SIMILAR_CANDIDATE_PAIRS_SQL = `
+  WITH picked AS MATERIALIZED (
+    SELECT document_id, revision, embedding
+      FROM document_embeddings
+     WHERE generation_id = $3 AND (document_id, revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+  )
   SELECT a.document_id AS left_id, a.revision AS left_revision, b.document_id AS right_id, b.revision AS right_revision
-    FROM document_embeddings a
-    JOIN document_embeddings b
-      ON b.generation_id = a.generation_id AND (a.document_id, a.revision) < (b.document_id, b.revision)
-   WHERE a.generation_id = $3
-     AND (a.document_id, a.revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
-     AND (b.document_id, b.revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
-     AND 1 - (a.embedding <=> b.embedding) >= $4
+    FROM picked a
+    JOIN picked b ON (a.document_id, a.revision) < (b.document_id, b.revision)
+   WHERE 1 - (a.embedding <=> b.embedding) >= $4
 `;
 
 function vectorLiteral(vector: readonly number[]): string {
@@ -499,8 +508,30 @@ async function loadCandidates(
     for (const [chunkIndex, queryVector] of input.queryVectors.entries()) {
       const target = input.target;
       const scope = [target.companyId, target.projectId, vectorLiteral(queryVector), input.generation.id, target.sessionId, target.sequenceNo];
-      const vectorRows = await client.query<CandidateRow>(VECTOR_CANDIDATES_SQL, [...scope, SEARCH_VECTOR_LIMIT]);
+      const vectorRows = await client.query<CandidateRow>(VECTOR_CANDIDATES_SQL, [...scope, SEARCH_VECTOR_FETCH_LIMIT]);
       vectorRoutes.push({ kind: 'vector', rows: vectorRows.rows, chunkIndex });
+    }
+    // 多めに取った行のうち、別々の内容が上限件数そろうところまでを使う。繰り返しが上位を埋めても別の内容が残る。
+    const fetched = vectorRoutes.flatMap((route) => route.rows);
+    const fetchedPairs = await client.query<{ left_id: string; left_revision: number; right_id: string; right_revision: number }>(
+      SIMILAR_CANDIDATE_PAIRS_SQL,
+      [fetched.map((row) => row.document_id), fetched.map((row) => row.revision), input.generation.id, SEARCH_DUPLICATE_SIMILARITY],
+    );
+    const fetchedSimilar = new Set(
+      fetchedPairs.rows.flatMap((pair) => {
+        const [left, right] = [`${pair.left_id}:${pair.left_revision}`, `${pair.right_id}:${pair.right_revision}`];
+        return [`${left}|${right}`, `${right}|${left}`];
+      }),
+    );
+    for (const route of vectorRoutes) {
+      const distinct: string[] = [];
+      // 重複は順位どおりに残したまま、別々の内容だけを数える。後段の集約が重複のうち残す1件を選ぶ。
+      const end = route.rows.findIndex((row) => {
+        const key = `${row.document_id}:${row.revision}`;
+        const repeated = distinct.some((other) => fetchedSimilar.has(`${other}|${key}`));
+        return !repeated && distinct.push(key) > SEARCH_VECTOR_LIMIT;
+      });
+      route.rows = end === -1 ? route.rows : route.rows.slice(0, end);
     }
     // 近似索引への切替判定用に、vector経路のqueryだけの所要時間を合計とは別に観測する。
     const vectorDurationMs = Math.max(0, Date.now() - vectorStartedAt);
