@@ -150,6 +150,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 検索質問が1,200 tokenを超える場合は、保存側の文書と同じ800 token以下の連続した区切りへ分け、先頭から最大5区切りを区切りごとに埋め込んでvector検索し、結果をRRFで合流させる。候補は最上位で引いた区切りを保持し、Jevの候補判定にはその区切りを質問として渡す（区切りごとに5件ずつのrequest）。6区切り目以降は検索に使わず、結果へ`question_truncated`のwarningを残す。識別子の抽出は質問全文に対して行う。1,200 token以下の質問は区切らず、従来どおり1回で検索する。route時のquery埋め込みの先行実行も同じ区切りで行う。
 - sourceが利用者の依頼（role=user・`statement_status=request`）だけで、明示識別子の一致もない候補は、上限10件で切る前に答えを含む候補より後ろへ回す。除外はしないので、他に候補がなければ残る。
 - vector・entity・strategyの3経路で集めた候補のうちエージェントの回答について、そのターンの直前の入力に対する検索が`matched`だった場合に、その検索が根拠として返した発言の文書を`provenance`経路として候補へ加える（最大10件、`SEARCH_PROVENANCE_LIMIT`）。検索結果の注入を受けて書かれた回答から、元になった発言へ1段だけ辿る。Jevは呼ばず`search_requests.result`の記録だけを使い、会社・案件・世代・現在入力以降の除外は他の経路と同じ。加えた文書も上限10件の選別とJevの判定を通る。
+- 受付が`primary_only=true`（明示検索だけが指定できる）の場合、候補を集めた後・上限10件で切る前に、検索結果の注入を受けて書かれた回答をsourceに持つ文書を候補から外す。判定は`provenance`経路と同じで、エージェントの回答の直前の入力に対する検索が`matched`で完了していること。`provenance`経路で加えた元の文書は残り、辿った先も派生なら同じ判定で外れる。自動検索と指定のない明示検索は外さない。
 - vector経路は区切りごとに60件（`SEARCH_VECTOR_FETCH_LIMIT`）取得し、内容が重複する候補を除いて別々の内容が20件（`SEARCH_VECTOR_LIMIT`）そろうところまでを使う。重複は順位どおりに残し、どれを残すかは後段の集約が決める。同じ質問への回答の繰り返しが上位20件を超えて溜まっても、別の内容の候補が残る。重複がなければ上位20件ちょうどになる。
 - 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、元と派生の関係がある時は元を、関係がない時は最も新しい発言を持つ候補を残す。識別子一致のない依頼だけの候補で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけ、または全候補が残予算外なら`input_budget_exceeded`。
@@ -194,7 +195,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 調整値（質問の区切り、候補の上限、順位付け）を、デプロイせずに手元で比べるための道具。本番DBの写しを手元のDBへ復元し、そのDBを`DATABASE_URL`に指定して実行する。写しのDBに対してworkerを同時に動かさない。
 
-ケースのfileは次の配列。`expected_message_ids`は、その質問で根拠として出るべき発言の`messages.id`。`pass_when`は合格条件で、省略時は`adopted`（代表根拠になること）、`in_candidates`はJevの判定へ渡った候補に入れば合格にする。
+ケースのfileは次の配列。`expected_message_ids`は、その質問で根拠として出るべき発言の`messages.id`。`pass_when`は合格条件で、省略時は`adopted`（代表根拠になること）、`in_candidates`はJevの判定へ渡った候補に入れば合格にする。`primary_only`を`true`にしたケースは、一次資料だけを求める明示検索として実行する。
 
 ```json
 [{ "name": "device-discount", "question": "端末値引きの実装ってどういう方針で誰がやりましたか？", "expected_message_ids": ["<message uuid>"] }]
