@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { v7 as uuidv7 } from 'uuid';
 import {
+  AUTO_SEARCH_MAX_INPUT_AGE_MS,
   AUTO_SEARCH_POLICY_VERSION,
   EVENT_WRITE_LOCK_NAMESPACE,
   RECEIPT_PAYLOAD_KEYS,
@@ -192,7 +193,10 @@ async function applyEvent(
     await insertRevision(client, messageId, event.revision, event.text, event.model_id, event.client_version);
   }
 
-  const requestId = event.role === 'user' ? await resolveAutoSearchRequest(client, auth, projectId, sessionId, messageId, event) : null;
+  // 過去の発言の取り込みでは自動検索を作らない。結果を待つ利用者がおらず、検索laneを今の入力から奪うため。
+  const isCurrentInput = Date.now() - occurredAt.getTime() <= AUTO_SEARCH_MAX_INPUT_AGE_MS;
+  const requestId =
+    event.role === 'user' ? await resolveAutoSearchRequest(client, auth, projectId, sessionId, messageId, event, isCurrentInput) : null;
 
   await enqueueJob(client, {
     kind: 'classify_message',
@@ -202,7 +206,7 @@ async function applyEvent(
     messageId,
     targetRevision: event.revision,
   });
-  if (event.role === 'user') {
+  if (requestId !== null) {
     // 再送・過去revision再送では同じキーになり、route_search jobを重複させない。
     await enqueueJob(client, {
       kind: 'route_search',
@@ -303,6 +307,7 @@ async function insertRevision(
 }
 
 // user発言の自動検索受付をrevision単位で1件だけ作成し、再送では既存request_idを返す。
+// createWhenMissingがfalseなら新しく作らず、既存の受付がなければnullを返す。
 async function resolveAutoSearchRequest(
   client: PoolClient,
   auth: AuthContext,
@@ -310,7 +315,8 @@ async function resolveAutoSearchRequest(
   sessionId: string,
   messageId: string,
   event: ParsedEvent,
-): Promise<string> {
+  createWhenMissing: boolean,
+): Promise<string | null> {
   const existing = await client.query<{ id: string }>(
     `SELECT id
        FROM search_requests
@@ -318,8 +324,8 @@ async function resolveAutoSearchRequest(
     [messageId, event.revision, AUTO_SEARCH_POLICY_VERSION],
   );
   const request = existing.rows[0];
-  if (request) {
-    return request.id;
+  if (request || !createWhenMissing) {
+    return request?.id ?? null;
   }
   const id = uuidv7();
   await client.query(
