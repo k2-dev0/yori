@@ -4127,6 +4127,43 @@ describe('検索結果の注入を受けて書かれた回答から、元の発�
     assert.ok(!jevBody.includes(DERIVED), '元と重複する派生した回答を残している');
   });
 
+  // 一次資料だけを求める明示検索。受付へ指定を保存してから実行する。
+  async function runPrimaryOnlySearch(config: WorkerConfig): Promise<M5SearchResult> {
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: await seedSession(pool, workspace), sequenceNo: 1, text: '元の発言を辿る検索の質問' });
+    await pool.query('UPDATE search_requests SET primary_only = true WHERE id = $1', [seeded.requestId]);
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+    return readStoredResult(pool, seeded.requestId);
+  }
+
+  it('一次資料だけの検索は、派生した回答を判定へ渡さず、辿った元の発言を代表根拠にする', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    const lineage = await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1) });
+
+    const result = await runPrimaryOnlySearch(config);
+    const jevBody = allJevRawBody(jev);
+    assert.ok(!jevBody.includes(DERIVED), '派生した回答を判定へ渡している');
+    assert.ok(jevBody.includes(ORIGIN), '派生から辿った元の発言を候補から落としている');
+    assert.ok(!evidenceIds(result).includes(lineage.derivedMessageId), '派生した回答を根拠にしている');
+  });
+
+  it('一次資料だけの検索は、検索が当たらなかったターンの回答を外さない', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1), injected: false });
+
+    await runPrimaryOnlySearch(config);
+    assert.ok(allJevRawBody(jev).includes(DERIVED), '注入を受けていない回答を派生として外している');
+  });
+
+  it('指定のない検索は、派生した回答を従来どおり判定へ渡す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1) });
+
+    await runSearch(config);
+    assert.ok(allJevRawBody(jev).includes(DERIVED), '指定がないのに派生した回答を外している');
+  });
+
   it('評価コマンドは、正解の候補を引いた経路をケースごとに出力する', async () => {
     const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
     await seedFillers(config);
