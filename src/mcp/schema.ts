@@ -29,6 +29,7 @@ export const searchHistoryInputSchema = z.strictObject({
   query: conversationText,
   idempotency_key: idempotencyKeySchema,
   force_refresh: z.boolean(),
+  primary_only: z.boolean().optional().describe('利用者が一次資料・当時の原文を求めた時だけtrueにする。検索結果を受けて書かれた回答を除く'),
 });
 
 // request_id、input_id+input_revision、外部identityのどれか1つだけを指定する排他的branch。
