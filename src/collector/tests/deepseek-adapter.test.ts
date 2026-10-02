@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { createDeepSeekTranscriptParser } from '../adapters/deepseek.js';
+import { zstdCompressSync } from 'node:zlib';
+import { createDeepSeekTranscriptParser, decompressDeepSeekTranscript } from '../adapters/deepseek.js';
 
 function line(value: unknown): string {
   return JSON.stringify(value);
 }
 
 describe('DeepSeek Harness transcriptアダプター', () => {
-  it('v3 root sessionのuser本文とcompleted turn最後のassistant本文だけを返す', () => {
+  it('root sessionのuser本文とcompleted turn最後のassistant本文だけを返す', () => {
     const parser = createDeepSeekTranscriptParser();
     const records = [
       { type: 'session', id: 'session-1', cwd: '/repo', version: 3, delegationDepth: 0, isSeeded: false, createdAt: 1_789_000_000_000 },
@@ -77,7 +78,7 @@ describe('DeepSeek Harness transcriptアダプター', () => {
     for (const session of [
       { type: 'session', id: 'subagent', cwd: '/repo', version: 3, delegationDepth: 1, isSeeded: false },
       { type: 'session', id: 'seeded', cwd: '/repo', version: 3, delegationDepth: 0, isSeeded: true },
-      { type: 'session', id: 'future', cwd: '/repo', version: 4, delegationDepth: 0, isSeeded: false },
+      { type: 'session', id: 'future', cwd: '/repo', version: 5, delegationDepth: 0, isSeeded: false },
       { type: 'session', id: 'other', cwd: '/other', version: 3, delegationDepth: 0, isSeeded: false },
     ]) {
       const parser = createDeepSeekTranscriptParser({ repository: '/repo' });
@@ -111,5 +112,28 @@ describe('DeepSeek Harness transcriptアダプター', () => {
       { kind: 'ignored' },
       { kind: 'ignored' },
     ]);
+  });
+
+  it('v4 sessionの発言には、その会話の版を付ける', () => {
+    const parser = createDeepSeekTranscriptParser();
+    const records = [
+      { type: 'session', id: 'session-4', cwd: '/repo', version: 4, delegationDepth: 0, isSeeded: false, agentPreset: 'standard' },
+      { type: 'user/message', seq: 2, time: 1_789_000_000_001, data: { id: 'user-4', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'v4 text' }] } },
+    ].flatMap((value) => parser.parseLine(line(value)));
+    assert.deepEqual(records, [
+      { kind: 'session', source_session_id: 'session-4', transcript_version: '4' },
+      { kind: 'message', source_session_id: 'session-4', transcript_version: '4', source_message_id: 'user-4', occurred_at: new Date(1_789_000_000_001).toISOString(), role: 'user', text: 'v4 text' },
+    ]);
+  });
+
+  it('連結されたzstdフレームを順に展開し、欠けた末尾のフレームから完成した行を作らず、壊れた入力は空にする', () => {
+    const [first, second, third] = [zstdCompressSync('line-1\n'), zstdCompressSync('line-2\n'), zstdCompressSync('line-3\n')];
+    assert.equal(decompressDeepSeekTranscript(Buffer.concat([first, second, third])).toString('utf8'), 'line-1\nline-2\nline-3\n');
+    const truncated = Buffer.concat([first, second, third.subarray(0, third.length - 2)]);
+    // 欠けたフレームはNodeの版によって読まれないか、展開できた分だけ返る。どちらでも完成した行は手前の2行だけ。
+    const completedLines = decompressDeepSeekTranscript(truncated).toString('utf8').split('\n').slice(0, -1);
+    assert.deepEqual(completedLines, ['line-1', 'line-2']);
+    assert.equal(decompressDeepSeekTranscript(Buffer.alloc(0)).length, 0);
+    assert.equal(decompressDeepSeekTranscript(Buffer.from('not zstd')).length, 0);
   });
 });
