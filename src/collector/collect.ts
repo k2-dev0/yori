@@ -5,7 +5,13 @@ import { z } from 'zod';
 import { MAX_SOURCE_IDENTIFIER_BYTES, MAX_TEXT_LENGTH, SUSPECTED_SECRET_OBSERVED, type EventSource } from '../api/contract.js';
 import { emptyRedactionPolicy, redactConversationText, sanitizeConversationText, type RedactionPolicy } from '../api/redaction.js';
 import { SUPPORTED_CLAUDE_CODE_VERSION, parseClaudeTranscriptLine } from './adapters/claude.js';
-import { SUPPORTED_CODEX_CLI_VERSIONS, codexTurnMessageId, parseCodexTranscriptLine } from './adapters/codex.js';
+import {
+  SUPPORTED_CODEX_CLI_VERSIONS,
+  codexTurnMessageId,
+  parseCodexTranscriptLine,
+  readCodexTurnContexts,
+  type CodexTurnContext,
+} from './adapters/codex.js';
 import { SUPPORTED_DEEPSEEK_HARNESS_VERSIONS, createDeepSeekTranscriptParser, decompressDeepSeekTranscript } from './adapters/deepseek.js';
 import { resolveRepositoryFromCwd } from './remote.js';
 import { deliverPending, resolvedTargetKey } from './send.js';
@@ -119,9 +125,11 @@ function isSupportedTranscriptVersion(source: EventSource, version: string): boo
   return source === 'deepseek_harness' && SUPPORTED_DEEPSEEK_HARNESS_VERSIONS.map(String).includes(version);
 }
 
-function createTranscriptLineParser(source: EventSource): (line: string) => TranscriptRecord[] {
+function createTranscriptLineParser(source: EventSource, transcriptPath: string): (line: string) => TranscriptRecord[] {
   if (source === 'codex') {
-    return (line) => [parseCodexTranscriptLine(line)];
+    // turn_contextは今回読む範囲より前にあり得るので、回答行が出た時に1度だけfile全体から表を作る。
+    let turnContexts: Map<string, CodexTurnContext> | undefined;
+    return (line) => [parseCodexTranscriptLine(line, () => (turnContexts ??= readCodexTurnContexts(transcriptPath)))];
   }
   if (source === 'claude_code') {
     return (line) => [parseClaudeTranscriptLine(line)];
@@ -141,6 +149,7 @@ type HookMessageSelection =
       role: 'user' | 'assistant';
       text: string;
       modelId?: string;
+      reasoningEffort?: string;
       clientVersion?: string;
     };
 
@@ -188,11 +197,15 @@ function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookM
     if (hook.turn_id === undefined || hook.last_assistant_message === undefined || hook.last_assistant_message === null) {
       return { kind: 'empty' };
     }
+    // hook入力にmodelは無い。会話ログ経路と同じ表から引き、同じ発言へ同じ値を付ける。
+    const turnContext = hook.transcript_path === undefined ? undefined : readCodexTurnContexts(hook.transcript_path).get(hook.turn_id);
     return {
       kind: 'message',
       sourceMessageId: codexTurnMessageId(hook.turn_id, 'assistant'),
       role: 'assistant',
       text: hook.last_assistant_message,
+      modelId: turnContext?.model_id,
+      reasoningEffort: turnContext?.reasoning_effort,
     };
   }
   return { kind: 'transcript' };
@@ -615,6 +628,7 @@ function ingestHookMessage(
         occurred_at: stored?.occurred_at ?? new Date().toISOString(),
         role: input.message.role,
         model_id: input.message.modelId,
+        reasoning_effort: input.message.reasoningEffort,
         client_version: input.message.clientVersion,
         text: input.message.text,
       },
@@ -694,7 +708,7 @@ export function ingestTranscript(
       // DeepSeekのassistant確定はturn/endまでの状態を要する。backfill再実行は先頭から読み、
       // stored message/outboxの既存冪等性で重複を除く。途中offsetから推測復元しない。
       const start = input.source === 'deepseek_harness' ? { offset: 0, skipStart: null } : resolveStartOffset(fd, cursor, size, device, inode);
-      const parseLine = createTranscriptLineParser(input.source);
+      const parseLine = createTranscriptLineParser(input.source, transcriptPath);
       const ctx: IngestContext = {
         state,
         namespace: input.namespace,
