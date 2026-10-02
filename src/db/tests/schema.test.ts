@@ -136,6 +136,7 @@ describe('migration管理', () => {
       '0016_session_continuity.sql',
       '0017_vector_duration.sql',
       '0018_search_error_detail.sql',
+      '0019_search_primary_only.sql',
     ]);
   });
 
@@ -416,7 +417,7 @@ describe('CHECK制約', () => {
         tokenHash,
       ]);
 
-      assert.deepEqual(await runMigrations(legacy), ['0013_auth_token_scope.sql', '0014_document_build_state.sql', '0015_strategy_fingerprint.sql', '0016_session_continuity.sql', '0017_vector_duration.sql', '0018_search_error_detail.sql']);
+      assert.deepEqual(await runMigrations(legacy), ['0013_auth_token_scope.sql', '0014_document_build_state.sql', '0015_strategy_fingerprint.sql', '0016_session_continuity.sql', '0017_vector_duration.sql', '0018_search_error_detail.sql', '0019_search_primary_only.sql']);
       const migrated = await legacy.query<{ scope: string }>('SELECT scope FROM auth_tokens WHERE token_hash = $1', [tokenHash]);
       assert.deepEqual(migrated.rows, [{ scope: 'employee' }]);
     } finally {
