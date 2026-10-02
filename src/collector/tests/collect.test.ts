@@ -563,6 +563,43 @@ describe('会話の収集', () => {
     }
   });
 
+  it('modelなしで取り込み済みの発言をmodel付きで読み直してもrevisionを増やさず、新しい発言にはmodelを付けて送る', async () => {
+    const fixture = await createCollectorFixture({ binding: { repository: 'github.com/Org/Repo', project_id: randomUUID() } });
+    const mock = installFetchMock(ackResponse);
+    try {
+      const transcript = path.join(fixture.root, 'claude.jsonl');
+      await writeTranscript(transcript, [claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-1', role: 'assistant', content: '収集済みの回答' })]);
+      const options = {
+        source: 'claude_code' as const,
+        hook: buildHook({ session_id: 'session-claude', transcript_path: transcript, cwd: fixture.repoDir }),
+        config: fixture.config,
+        token: 'token-a',
+      };
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents(mock.requests).map((event) => [event.source_message_id, event.revision, event.model_id]),
+        [['a-1', 1, undefined]],
+      );
+
+      // 同じpathへ別inodeのfileを置いて先頭から読み直させる。同じ発言に今度はmodelが付いている。
+      const replacement = path.join(fixture.root, 'replacement.jsonl');
+      await writeTranscript(replacement, [
+        claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-1', role: 'assistant', content: '収集済みの回答', model: 'claude-opus-5-5' }),
+        claudeMessageLine({ sessionId: 'session-claude', uuid: 'a-2', role: 'assistant', content: '新しい回答', model: 'claude-opus-5-5' }),
+      ]);
+      renameSync(replacement, transcript);
+
+      await collectFromHook(options);
+      assert.deepEqual(
+        sentEvents([mock.requests[1]]).map((event) => [event.source_message_id, event.revision, event.model_id]),
+        [['a-2', 1, 'claude-opus-5-5']],
+      );
+    } finally {
+      mock.restore();
+      await fixture.cleanup();
+    }
+  });
+
   it('設定から外れたprojectのoutboxは、別の登録済みprojectのcollectでも送らない', async () => {
     const root = await makeTempDir();
     const removedProject = randomUUID();
