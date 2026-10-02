@@ -388,7 +388,8 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
   let occurredAt = new Date(record.occurred_at).toISOString();
   // custom policyの変更だけでrevisionを増やさないよう、source変更検知はbuilt-in適用後（custom適用前）で固定する。
   const sourceText = redactConversationText(record.text);
-  const contentHash = record.model_id === undefined ? sha256Hex(sourceText) : sha256Hex(JSON.stringify([sourceText, record.model_id]));
+  const textHash = sha256Hex(sourceText);
+  const contentHash = record.model_id === undefined ? textHash : sha256Hex(JSON.stringify([sourceText, record.model_id]));
   const stored = getStoredMessage(ctx.state, ctx.namespace, ctx.source, ctx.hook.session_id, record.source_message_id);
 
   let sequenceNo: number;
@@ -429,7 +430,8 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
       recordDiagnostic(ctx.state, ctx.namespace, 'message_identity_conflict', byteOffset);
       return;
     }
-    if (stored.content_hash === contentHash) {
+    // modelを付けずに取り込んだ発言を後からmodel付きで読み直しても、本文が同じならrevisionを増やさない。
+    if (stored.content_hash === contentHash || stored.content_hash === textHash) {
       return;
     }
     sequenceNo = stored.sequence_no;
