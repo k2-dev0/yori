@@ -16,6 +16,7 @@ import {
   SEARCH_CANDIDATE_BUDGET_TOKENS,
   SEARCH_CANDIDATE_LIMIT,
   SEARCH_DUPLICATE_SIMILARITY,
+  SEARCH_PROVENANCE_LIMIT,
   SEARCH_ENTITY_LIMIT,
   SEARCH_CANDIDATE_REQUEST_SIZE,
   SEARCH_MODE_EXACT_VECTOR_AND_ENTITY,
@@ -87,7 +88,7 @@ interface CandidateSource {
 }
 
 // 候補を見つけた検索経路。結果へ残し、対象が違う類推候補かどうかを利用側が区別できるようにする。
-type RetrievalKind = 'vector' | 'entity' | 'strategy';
+type RetrievalKind = 'vector' | 'entity' | 'strategy' | 'provenance';
 
 interface Candidate {
   documentId: string;
@@ -102,6 +103,10 @@ interface Candidate {
   requestOnly: boolean;
   // この候補をvector経路で最上位に引いた質問の区切り。判定ではこの区切りを質問にする。
   queryChunkIndex: number;
+  // この候補の回答が、検索結果として受け取っていた元の発言の候補。
+  originKeys: string[];
+  // 元の候補が同じ関連度以上で採用可能なため、代表根拠の順位で元の後ろへ回す。
+  derivedFromAccepted: boolean;
   sources: CandidateSource[];
 }
 
@@ -238,6 +243,47 @@ const STRATEGY_CANDIDATES_SQL = `
    LIMIT $7
 `;
 
+// 候補の回答が書かれたターンの入力に対する検索が、根拠として返した発言の文書を引く。
+// 検索結果の注入を受けて書かれた回答から、その元になった発言へ1段だけ辿る。Jevは呼ばない。
+const PROVENANCE_CANDIDATES_SQL = `
+  WITH derived AS (
+    SELECT s.document_id AS derived_id, s.document_revision AS derived_revision, m.session_id, m.sequence_no
+      FROM search_document_sources s
+      JOIN messages m ON m.id = s.message_id
+     WHERE (s.document_id, s.document_revision) IN (SELECT * FROM unnest($1::uuid[], $2::int[]))
+       AND m.role = 'assistant'
+  ),
+  origin AS (
+    SELECT DISTINCT d.derived_id, d.derived_revision, (evidence->>'message_id')::uuid AS message_id
+      FROM derived d
+      JOIN LATERAL (
+        SELECT sr.status, sr.outcome, sr.result
+          FROM search_requests sr
+         WHERE sr.session_id = d.session_id AND sr.input_sequence_no < d.sequence_no
+         ORDER BY sr.input_sequence_no DESC, sr.created_at DESC
+         LIMIT 1
+      ) turn ON turn.status = 'completed' AND turn.outcome = 'matched'
+      CROSS JOIN LATERAL jsonb_array_elements(turn.result->'matches') AS matched
+      CROSS JOIN LATERAL jsonb_array_elements(matched->'evidence') AS evidence
+  )
+  SELECT DISTINCT o.derived_id, o.derived_revision, e.document_id, e.revision, r.content
+    FROM origin o
+    JOIN search_document_sources os ON os.message_id = o.message_id
+    JOIN document_embeddings e ON e.document_id = os.document_id AND e.revision = os.document_revision AND e.generation_id = $3
+    JOIN search_documents d ON d.id = e.document_id AND d.company_id = $4 AND d.project_id = $5
+    JOIN document_search_entries p ON p.document_id = e.document_id AND p.generation_id = $3 AND p.revision = e.revision
+    JOIN search_document_revisions r
+      ON r.document_id = e.document_id AND r.revision = e.revision AND (r.status IN ('ready', 'superseded') OR p.correction_only)
+   WHERE (e.document_id, e.revision) <> (o.derived_id, o.derived_revision)
+     AND NOT EXISTS (
+       SELECT 1
+         FROM search_document_sources sx
+         JOIN messages mx ON mx.id = sx.message_id
+        WHERE sx.document_id = e.document_id AND sx.document_revision = e.revision AND mx.session_id = $6 AND mx.sequence_no >= $7
+     )
+   ORDER BY e.document_id ASC, e.revision ASC
+`;
+
 // sourceごとに分類済みstatement_statusを添える。分類がないsourceはNULL（unknown扱い）。
 const CANDIDATE_SOURCES_SQL = `
   SELECT s.document_id, s.document_revision, s.message_id, s.message_revision,
@@ -289,7 +335,7 @@ function secondaryRank(candidate: Candidate): number {
   return Number(candidate.requestOnly && !candidate.entityMatched);
 }
 
-// 順位順の候補から、既に残した候補と内容が重複するものを畳む。重複のうち新しい発言を残し、枠の位置は先に残した候補のものを使う。
+// 順位順の候補から、既に残した候補と内容が重複するものを畳む。枠の位置は先に残した候補のものを使う。
 // 依頼だけの候補で、答えを含む候補を置き換えない。
 function collapseSimilarCandidates(ordered: readonly Candidate[], similarPairs: ReadonlySet<string>): { candidates: Candidate[]; collapsed: number } {
   const kept: Candidate[] = [];
@@ -298,8 +344,12 @@ function collapseSimilarCandidates(ordered: readonly Candidate[], similarPairs: 
     const current = kept[index];
     if (current === undefined) {
       kept.push(candidate);
-    } else if (latestSourceTime(candidate) > latestSourceTime(current) && secondaryRank(candidate) <= secondaryRank(current)) {
-      kept[index] = candidate;
+    } else {
+      // 元と派生が畳まれる時は元を残す。関係のない候補同士は新しい発言を残す。
+      const isOrigin = current.originKeys.includes(candidateKey(candidate));
+      const isDerived = candidate.originKeys.includes(candidateKey(current));
+      const isNewer = latestSourceTime(candidate) > latestSourceTime(current) && secondaryRank(candidate) <= secondaryRank(current);
+      kept[index] = isOrigin || (isNewer && !isDerived) ? candidate : current;
     }
   }
   return { candidates: kept, collapsed: ordered.length - kept.length };
@@ -324,6 +374,8 @@ function mergeRoutes(
         statementStatus: 'unknown',
         requestOnly: true,
         queryChunkIndex: 0,
+        originKeys: [],
+        derivedFromAccepted: false,
         sources: [],
       };
       candidate.rrfScore += 1 / (SEARCH_RRF_RANK_CONSTANT + index + 1);
@@ -482,11 +534,44 @@ async function loadCandidates(
             SEARCH_STRATEGY_MIN_MATCHED_TERMS,
           ])
         ).rows;
+    // 3経路の候補を起点に、その回答が検索結果として受け取っていた元の発言の文書を引く。
+    const baseRows = [...vectorRoutes.flatMap((route) => route.rows), ...entityRows, ...strategyRows];
+    const baseRank = new Map<string, number>();
+    for (const [index, row] of baseRows.entries()) {
+      baseRank.set(`${row.document_id}:${row.revision}`, baseRank.get(`${row.document_id}:${row.revision}`) ?? index);
+    }
+    const lineage = await client.query<CandidateRow & { derived_id: string; derived_revision: number }>(PROVENANCE_CANDIDATES_SQL, [
+      baseRows.map((row) => row.document_id),
+      baseRows.map((row) => row.revision),
+      input.generation.id,
+      input.target.companyId,
+      input.target.projectId,
+      input.target.sessionId,
+      input.target.sequenceNo,
+    ]);
+    // 順位の高い回答の元から先に、上限件数まで候補へ加える。
+    const originRanks = new Map<string, { row: CandidateRow; rank: number }>();
+    for (const row of lineage.rows) {
+      const rank = baseRank.get(`${row.derived_id}:${row.derived_revision}`) ?? Number.MAX_SAFE_INTEGER;
+      const known = originRanks.get(`${row.document_id}:${row.revision}`);
+      originRanks.set(`${row.document_id}:${row.revision}`, known !== undefined && known.rank <= rank ? known : { row, rank });
+    }
+    const provenanceRows = [...originRanks.values()].sort((left, right) => left.rank - right.rank).slice(0, SEARCH_PROVENANCE_LIMIT);
     const candidates = mergeRoutes([
       ...vectorRoutes,
       { kind: 'entity', rows: entityRows },
       { kind: 'strategy', rows: strategyRows },
+      { kind: 'provenance', rows: provenanceRows.map((item) => item.row) },
     ]);
+    for (const row of lineage.rows) {
+      const [derived, origin] = [candidates.get(`${row.derived_id}:${row.derived_revision}`), candidates.get(`${row.document_id}:${row.revision}`)];
+      if (derived === undefined || origin === undefined || derived.originKeys.includes(candidateKey(origin))) {
+        continue;
+      }
+      derived.originKeys.push(candidateKey(origin));
+      // 元を辿って入っただけの候補は、派生した回答を引いた区切りを判定の質問に使う。
+      origin.queryChunkIndex = origin.retrievalKinds.includes('vector') ? origin.queryChunkIndex : derived.queryChunkIndex;
+    }
     const similarPairs = new Set<string>();
     if (candidates.size > 0) {
       const entries = [...candidates.values()];
@@ -771,7 +856,7 @@ function latestSourceTime(candidate: Candidate): number {
   return latest;
 }
 
-// relevanceを最優先し、同じrelevanceでは答えを含む候補を依頼だけの候補より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
+// relevanceを最優先し、同じrelevanceでは元の発言をその派生より先に、答えを含む候補を依頼だけの候補より先にし、次に確定度・既知status内の新しさ・RRFの順にする。
 // status不明同士は新しさで推測せず、従来のRRF・document ID順を維持する。
 function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAssessment[] {
   return assessments
@@ -780,6 +865,10 @@ function rankAccepted(assessments: readonly CandidateAssessment[]): CandidateAss
       const relevance = RELEVANCE_ORDER[right.relevance] - RELEVANCE_ORDER[left.relevance];
       if (relevance !== 0) {
         return relevance;
+      }
+      const derived = Number(left.candidate.derivedFromAccepted) - Number(right.candidate.derivedFromAccepted);
+      if (derived !== 0) {
+        return derived;
       }
       const secondary = secondaryRank(left.candidate) - secondaryRank(right.candidate);
       if (secondary !== 0) {
@@ -1507,6 +1596,16 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     return;
   }
   const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, questions: chunks });
+  // 元の候補が同じ関連度以上で採用可能な派生は、代表根拠の順位で元の後ろへ回す。
+  const accepted = assessments.filter((assessment) => assessment.relevance === 'useful' || assessment.relevance === 'direct');
+  const acceptedRelevance = new Map(accepted.map((assessment) => [candidateKey(assessment.candidate), RELEVANCE_ORDER[assessment.relevance]]));
+  for (const { candidate, relevance } of accepted) {
+    candidate.derivedFromAccepted = candidate.originKeys.some((key) => (acceptedRelevance.get(key) ?? -1) >= RELEVANCE_ORDER[relevance]);
+  }
+  const demoted = accepted.filter((assessment) => assessment.candidate.derivedFromAccepted).length;
+  if (demoted > 0) {
+    warnings.push({ code: 'derived_candidates_demoted', excluded_count: demoted });
+  }
   let exploration: ExplorationResult | null = null;
   if (generation !== null && assessments.length > 0) {
     const primary = await selectPrimaryCandidate(pool, { target, generation, evaluations: assessments });
