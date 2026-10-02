@@ -380,6 +380,7 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
   }
   if (
     (record.model_id !== undefined && !isStorableIdentifier(record.model_id)) ||
+    (record.reasoning_effort !== undefined && !isStorableIdentifier(record.reasoning_effort)) ||
     (record.client_version !== undefined && !isStorableIdentifier(record.client_version))
   ) {
     recordDiagnostic(ctx.state, ctx.namespace, 'message_invalid_identifier', byteOffset);
@@ -463,6 +464,7 @@ function ingestMessage(ctx: IngestContext, record: TranscriptMessageRecord, byte
     role: record.role,
     occurred_at: occurredAt,
     model_id: record.model_id,
+    reasoning_effort: record.reasoning_effort,
     client_version: record.client_version,
     text,
   });
