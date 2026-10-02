@@ -113,6 +113,8 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 ### route_search
 
+- 自動検索は、発言時刻が受付時刻から10分以内（`AUTO_SEARCH_MAX_INPUT_AGE_MS`）のuser入力にだけ作る。それより古い発言は履歴の取り込みとして扱い、原文の保存と分類だけを行って、検索の受付と`route_search` jobを作らない。`POST /v1/events`の`request_id`は`null`になる。結果を待つ利用者がいない検索が、1並列の検索laneを今の入力から奪うのを防ぐ。届いた時点で受付が作られていた発言の再送は、既存の`request_id`を返す。
+
 分類の完了を待たず、routeとclassifyは同じstate/questionsから独立に判定する。検索振り分けは保存分類と独立して決まる。
 
 - `new_search`: 条件hashと段階`awaiting_search`を保存し、受付はpendingのまま`execute_search`をenqueueする。
