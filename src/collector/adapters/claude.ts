@@ -70,9 +70,12 @@ export function parseClaudeTranscriptLine(line: string): TranscriptRecord {
     return { kind: 'ignored' };
   }
   const model = value.type === 'assistant' ? value.message.model : undefined;
+  const hasModel = typeof model === 'string' && model !== SYNTHETIC_MODEL;
   return {
     kind: 'message',
-    ...(typeof model === 'string' && model !== SYNTHETIC_MODEL ? { model_id: model } : {}),
+    ...(hasModel ? { model_id: model } : {}),
+    // 思考量はmodelの付帯情報として保存するので、modelを付ける発言にだけ付ける。
+    ...(hasModel && typeof value.effort === 'string' ? { reasoning_effort: value.effort } : {}),
     source_session_id: value.sessionId,
     transcript_version: value.version,
     source_message_id: value.uuid,
