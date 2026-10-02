@@ -4,7 +4,7 @@
 
 ## 対象route
 
-`openapi.json`は現在実装する16 routeを含む。
+`openapi.json`は現在実装する17 routeを含む。
 
 | method | path | 主な成功status | 主な失敗status |
 |---|---|---:|---|
@@ -17,6 +17,7 @@
 | POST | `/v1/employees/{employee_id}/tokens` | 201 | 400, 401, 403, 404, 413, 500 |
 | DELETE | `/v1/tokens/{token_id}` | 200 | 400, 401, 403, 404, 409, 500 |
 | POST | `/v1/projects` | 200, 201 | 400, 401, 409, 413, 500 |
+| DELETE | `/v1/projects/{project_id}` | 200 | 400, 401, 403, 404, 500 |
 | POST | `/v1/events` | 202 | 400, 401, 403, 409, 413, 500 |
 | POST | `/v1/searches` | 200, 202 | 400, 401, 403, 404, 409, 413, 500 |
 | POST | `/v1/collector/setup` | 200 | 400, 401, 404, 500 |
