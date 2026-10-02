@@ -2,7 +2,7 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { validate as isUuid, version as uuidVersion } from 'uuid';
 import { buildApp } from '../app.js';
-import { AUTO_SEARCH_POLICY_VERSION, MAX_TEXT_LENGTH, type EventInput, type EventsResponse } from '../contract.js';
+import { AUTO_SEARCH_MAX_INPUT_AGE_MS, AUTO_SEARCH_POLICY_VERSION, MAX_TEXT_LENGTH, type EventInput, type EventsResponse } from '../contract.js';
 import { createPool, requireDatabaseUrl } from '../../db/pool.js';
 import { runMigrations } from '../../db/migrator.js';
 import {
@@ -260,6 +260,35 @@ describe('POST /v1/events 正常保存', () => {
     const rows = await pool.query<{ occurred_at: Date }>('SELECT occurred_at FROM messages');
     assert.equal(rows.rows.length, 1);
     assert.equal(rows.rows[0].occurred_at.toISOString(), '2026-09-21T01:00:00.000Z');
+  });
+
+  it('過去の発言のuserイベントは保存と分類だけを行い、自動検索の受付とroute jobを作らない', async () => {
+    // 履歴の取り込みで届く発言。結果を待つ利用者がいないため、検索の枠を今の入力から奪わない。
+    const occurredAt = new Date(Date.now() - AUTO_SEARCH_MAX_INPUT_AGE_MS - 60_000).toISOString();
+    const event = buildEventInput({ idempotency_key: 'idem-old-input', occurred_at: occurredAt, text: '1か月前の利用者の入力' });
+
+    const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
+
+    assert.equal(response.statusCode, 202, `受付に失敗: ${response.body}`);
+    assert.equal(response.json<EventsResponse>().results[0].request_id, null, '過去の発言へ自動検索の受付を返している');
+    const counts = await pool.query<{ requests: string; route_jobs: string; classify_jobs: string; messages: string }>(
+      `SELECT (SELECT count(*) FROM search_requests) AS requests,
+              (SELECT count(*) FROM jobs WHERE kind = 'route_search') AS route_jobs,
+              (SELECT count(*) FROM jobs WHERE kind = 'classify_message') AS classify_jobs,
+              (SELECT count(*) FROM messages) AS messages`,
+    );
+    assert.deepEqual(counts.rows[0], { requests: '0', route_jobs: '0', classify_jobs: '1', messages: '1' });
+  });
+
+  it('上限ちょうどの古さまでの発言は、今の入力として自動検索を作る', async () => {
+    // 判定は受付時刻との差。受付までの処理時間で上限を超えないよう、余裕を持たせた境界の内側を使う。
+    const occurredAt = new Date(Date.now() - AUTO_SEARCH_MAX_INPUT_AGE_MS + 60_000).toISOString();
+    const event = buildEventInput({ idempotency_key: 'idem-recent-input', occurred_at: occurredAt });
+
+    const response = await postEvents(app, { token: workspace.token, body: buildEventBatch(workspace.projectId, [event]) });
+
+    assert.equal(response.statusCode, 202, `受付に失敗: ${response.body}`);
+    assertUuidV7(response.json<EventsResponse>().results[0].request_id);
   });
 
   it('assistant・agent_reportは自動検索を作らず、AIを起動しない', async () => {
