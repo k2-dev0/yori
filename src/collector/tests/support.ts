@@ -191,6 +191,7 @@ export function claudeMessageLine(input: {
   content: unknown;
   timestamp?: string;
   version?: string;
+  model?: string;
   extra?: Record<string, unknown>;
 }): string {
   return JSON.stringify({
@@ -199,7 +200,7 @@ export function claudeMessageLine(input: {
     sessionId: input.sessionId,
     timestamp: input.timestamp ?? '2026-09-21T00:00:01.000Z',
     version: input.version ?? SUPPORTED_CLAUDE_CODE_VERSION,
-    message: { role: input.role, content: input.content },
+    message: { role: input.role, content: input.content, ...(input.model === undefined ? {} : { model: input.model }) },
     ...(input.extra ?? {}),
   });
 }
