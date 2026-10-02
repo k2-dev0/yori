@@ -163,7 +163,7 @@ function selectOutboxRows(state: CollectorState, namespace: string, target: Queu
   const rows = state.db
     .prepare(
       `SELECT id, idempotency_key, project_id, source, source_scope, source_session_id, source_message_id,
-              sequence_no, revision, role, occurred_at, model_id, client_version, text
+              sequence_no, revision, role, occurred_at, model_id, reasoning_effort, client_version, text
          FROM outbox
         WHERE namespace = ? AND project_id = ? AND source_scope = ?
         ORDER BY source_session_id, sequence_no, revision, id
@@ -183,6 +183,7 @@ function selectOutboxRows(state: CollectorState, namespace: string, target: Queu
     role: row.role as OutboxRow['role'],
     occurred_at: String(row.occurred_at),
     model_id: row.model_id === null ? null : String(row.model_id),
+    reasoning_effort: row.reasoning_effort === null ? null : String(row.reasoning_effort),
     client_version: row.client_version === null ? null : String(row.client_version),
     text: String(row.text),
   }));
@@ -207,6 +208,7 @@ function buildBatch(projectId: string, rows: OutboxRow[], limit: number): Batch 
       role: row.role,
       occurred_at: row.occurred_at,
       ...(row.model_id === null ? {} : { model_id: row.model_id }),
+      ...(row.reasoning_effort === null ? {} : { reasoning_effort: row.reasoning_effort }),
       ...(row.client_version === null ? {} : { client_version: row.client_version }),
       text: row.text,
     };
