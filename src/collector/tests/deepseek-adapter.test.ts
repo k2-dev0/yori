@@ -114,6 +114,33 @@ describe('DeepSeek Harness transcriptアダプター', () => {
     ]);
   });
 
+  it('assistant発言には、その発言を生成したmodelを付ける', () => {
+    const parser = createDeepSeekTranscriptParser();
+    const records = [
+      { type: 'session', id: 'session-1', cwd: '/repo', version: 4, delegationDepth: 0, isSeeded: false },
+      {
+        type: 'assistant/message',
+        time: 1_789_000_000_002,
+        data: {
+          turn: 1,
+          message: { id: 'assistant-1', role: 'assistant', source: { kind: 'model', model: 'deepseek-flash' }, content: [{ type: 'text', text: 'answer' }] },
+        },
+      },
+      { type: 'turn/end', time: 1_789_000_000_003, data: { turn: 1, reason: { kind: 'completed' } } },
+    ].flatMap((value) => parser.parseLine(line(value)));
+
+    assert.deepEqual(records.at(-1), {
+      kind: 'message',
+      source_session_id: 'session-1',
+      transcript_version: '4',
+      source_message_id: 'assistant-1',
+      occurred_at: new Date(1_789_000_000_002).toISOString(),
+      role: 'assistant',
+      model_id: 'deepseek-flash',
+      text: 'answer',
+    });
+  });
+
   it('v4 sessionの発言には、その会話の版を付ける', () => {
     const parser = createDeepSeekTranscriptParser();
     const records = [
