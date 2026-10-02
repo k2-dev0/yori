@@ -5,6 +5,7 @@ import {
   MAX_BATCH_SIZE,
   MAX_CLIENT_VERSION_BYTES,
   MAX_MODEL_IDENTIFIER_BYTES,
+  MAX_REASONING_EFFORT_BYTES,
   MAX_SOURCE_IDENTIFIER_BYTES,
   MAX_TEXT_LENGTH,
   MIN_BATCH_SIZE,
@@ -49,6 +50,18 @@ export const modelIdentifier = storableString
     'x-yori-max-utf8-bytes': MAX_MODEL_IDENTIFIER_BYTES,
   });
 
+// modelへ指定した思考量。値の種類はproviderごとに違うので固定enumへ閉じず、保存可能な長さだけを制約する。
+export const reasoningEffort = storableString
+  .max(MAX_REASONING_EFFORT_BYTES)
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_REASONING_EFFORT_BYTES, {
+    message: `思考量はUTF-8で${MAX_REASONING_EFFORT_BYTES}バイト以内にしてください`,
+  })
+  .meta({
+    maxLength: MAX_REASONING_EFFORT_BYTES,
+    description: `思考量はUTF-8で${MAX_REASONING_EFFORT_BYTES}バイト以内。model_idがあるイベントだけが持てる`,
+    'x-yori-max-utf8-bytes': MAX_REASONING_EFFORT_BYTES,
+  });
+
 // collector clientのversion。任意のsemver外suffixを許し、保存可能な長さだけを制約する。
 export const clientVersion = storableString
   .max(MAX_CLIENT_VERSION_BYTES)
@@ -91,20 +104,26 @@ export const occurredAtSchema = z.iso.datetime({ offset: true });
 export const waitMsValueSchema = z.int().min(0).max(MAX_WAIT_MS);
 
 // 受信イベント1件の契約。company_id/employee_id等のunknown fieldは境界を偽装できないよう拒否する。
-const eventSchema = z.strictObject({
-  idempotency_key: idempotencyKeySchema,
-  source: z.enum(EVENT_SOURCES),
-  source_scope: sourceIdentifier,
-  source_session_id: sourceIdentifier,
-  source_message_id: sourceIdentifier,
-  sequence_no: revisionSchema,
-  revision: revisionSchema,
-  role: z.enum(EVENT_ROLES),
-  occurred_at: occurredAtSchema,
-  model_id: modelIdentifier.optional(),
-  client_version: clientVersion.optional(),
-  text: conversationText,
-});
+// 思考量はmodelの付帯情報として保存するので、model_idなしのreasoning_effortは保存先が無く拒否する。
+const eventSchema = z
+  .strictObject({
+    idempotency_key: idempotencyKeySchema,
+    source: z.enum(EVENT_SOURCES),
+    source_scope: sourceIdentifier,
+    source_session_id: sourceIdentifier,
+    source_message_id: sourceIdentifier,
+    sequence_no: revisionSchema,
+    revision: revisionSchema,
+    role: z.enum(EVENT_ROLES),
+    occurred_at: occurredAtSchema,
+    model_id: modelIdentifier.optional(),
+    reasoning_effort: reasoningEffort.optional(),
+    client_version: clientVersion.optional(),
+    text: conversationText,
+  })
+  .refine((event) => event.reasoning_effort === undefined || event.model_id !== undefined, {
+    message: 'reasoning_effortはmodel_idと一緒に指定してください',
+  });
 
 // バッチ受付の契約。1..100件・UUID形式のproject_idだけを受理し、UUIDは小文字の正規形へ揃える。
 export const eventsRequestSchema = z.strictObject({
