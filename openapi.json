@@ -1747,6 +1747,9 @@
           },
           "force_refresh": {
             "type": "boolean"
+          },
+          "primary_only": {
+            "type": "boolean"
           }
         },
         "required": [
