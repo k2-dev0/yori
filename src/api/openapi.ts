@@ -27,6 +27,7 @@ import {
   healthReadyResponseSchema,
   meResponseSchema,
   projectRegistrationResponseSchema,
+  projectRemovalResponseSchema,
   searchAcceptedResponseSchema,
   searchLookupResponseSchema,
   searchViewResponseSchema,
@@ -240,6 +241,15 @@ function buildPaths(): JsonObject {
         ],
       }),
     },
+    '/v1/projects/{project_id}': {
+      delete: buildOperation({
+        operationId: 'removeProject',
+        summary: 'company adminが同じ会社のprojectを収集済みデータごと物理削除する',
+        secured: true,
+        parameters: [parameter('project_id', 'path', true, uuid)],
+        responses: [success('200', 'ProjectRemovalResponse'), ...errorResponses(['400', '401', '403', '404', '500'])],
+      }),
+    },
     '/v1/searches': {
       post: buildOperation({
         operationId: 'createSearch',
@@ -327,6 +337,7 @@ export function buildOpenApiDocument(): JsonObject {
     ErrorResponse: toOpenApiSchema(errorResponseSchema, 'output'),
     EventsResponse: toOpenApiSchema(eventsResponseSchema, 'output'),
     ProjectRegistrationResponse: toOpenApiSchema(projectRegistrationResponseSchema, 'output'),
+    ProjectRemovalResponse: toOpenApiSchema(projectRemovalResponseSchema, 'output'),
     EmployeeCreateResponse: toOpenApiSchema(employeeCreateResponseSchema, 'output'),
     EmployeeRenameResponse: toOpenApiSchema(employeeRenameResponseSchema, 'output'),
     MeResponse: toOpenApiSchema(meResponseSchema, 'output'),
