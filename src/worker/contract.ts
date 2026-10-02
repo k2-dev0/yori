@@ -319,6 +319,8 @@ export interface JevRequest {
 // vector/識別子の各経路の取得上限と、Jevへ渡す候補上限・本文予算。
 export const SEARCH_VECTOR_LIMIT = 20;
 export const SEARCH_ENTITY_LIMIT = 20;
+// 候補の回答が受け取った検索結果から辿って候補へ加える、元の発言の文書の上限。
+export const SEARCH_PROVENANCE_LIMIT = 10;
 export const SEARCH_CANDIDATE_LIMIT = 10;
 // 候補同士の埋め込みのcosine類似度がこの値以上なら、同じ内容の繰り返しとして1件へ畳む。
 // 本番の写しの1質問で、同じ質問への回答の繰り返し同士は0.84以上、別の内容とは0.80以下だった。その間に置いた暫定値。
