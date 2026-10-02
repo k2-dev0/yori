@@ -180,6 +180,7 @@ const searchEvalCasesSchema = z.array(
     question: z.string().min(1),
     expected_message_ids: z.array(z.uuid()).min(1),
     pass_when: z.enum(['adopted', 'in_candidates']).optional(),
+    primary_only: z.boolean().optional(),
   }),
 );
 
