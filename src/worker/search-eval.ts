@@ -13,6 +13,8 @@ export interface SearchEvalCase {
   expected_message_ids: string[];
   // 合格条件。省略時は代表根拠になること。in_candidatesはJevの判定へ渡った候補に入ること。
   pass_when?: 'adopted' | 'in_candidates';
+  // 一次資料だけを求める明示検索として実行する。省略時は指定なし。
+  primary_only?: boolean;
 }
 
 export interface SearchEvalCaseResult {
@@ -43,8 +45,8 @@ const INSERT_REVISION_SQL = 'INSERT INTO message_revisions (message_id, revision
 const INSERT_REQUEST_SQL = `
   INSERT INTO search_requests
     (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no,
-     trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash)
-  VALUES ($1::uuid, $2, $3, $4, $5, $6, 1, 1, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $7, $8, $1::uuid::text, $9)`;
+     trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash, primary_only)
+  VALUES ($1::uuid, $2, $3, $4, $5, $6, 1, 1, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $7, $8, $1::uuid::text, $9, $10)`;
 const INSERT_RUNNING_JOB_SQL = `
   INSERT INTO jobs (id, kind, status, priority, session_id, message_id, target_revision, payload, idempotency_key,
                     lease_token, lease_expires_at, attempts)
@@ -78,7 +80,7 @@ async function evaluateSearchCase(pool: Pool, config: WorkerConfig, scope: EvalS
     await pool.query(INSERT_SESSION_SQL, [sessionId, scope.projectId, scope.employee_id, EVAL_SOURCE_NAMESPACE]);
     await pool.query(INSERT_MESSAGE_SQL, [messageId, sessionId]);
     await pool.query(INSERT_REVISION_SQL, [messageId, item.question, hash]);
-    const request = [requestId, scope.company_id, scope.projectId, scope.employee_id, sessionId, messageId, WORKER_POLICY_VERSION, item.question, hash];
+    const request = [requestId, scope.company_id, scope.projectId, scope.employee_id, sessionId, messageId, WORKER_POLICY_VERSION, item.question, hash, item.primary_only === true];
     await pool.query(INSERT_REQUEST_SQL, request);
     await pool.query(INSERT_RUNNING_JOB_SQL, [jobId, EXECUTE_SEARCH_PRIORITY, sessionId, messageId, payload, leaseToken, leaseExpiresAt]);
     await processJob(pool, job, config);
