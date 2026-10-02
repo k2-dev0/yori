@@ -43,6 +43,7 @@ import { ensureActiveGeneration } from '../embedding.js';
 import { runCli } from '../cli.js';
 import { processJob, retryJob } from '../process.js';
 import { evaluateSearchCases } from '../search-eval.js';
+import { loadProjectMetrics } from '../metrics.js';
 import { runWorker } from '../runner.js';
 import { loadVoyageTokenizer } from '../tokenizer.js';
 import {
@@ -54,6 +55,7 @@ import {
   seedApproval,
   seedMessage,
   seedSearchRequest,
+  matchedResult,
   seedSession,
   sleep,
   startFakeJev,
@@ -3922,6 +3924,215 @@ describe('内容が重複する候補の集約', () => {
     const jevBody = allJevRawBody(jev);
     assert.ok(jevBody.includes('TOPIC-ONE') && jevBody.includes('TOPIC-TWO'), '別の内容の候補を畳んでいる');
     assert.equal(collapsedCount(result), undefined, '畳んでいないのに警告を付けている');
+  });
+});
+
+describe('検索結果の注入を受けて書かれた回答から、元の発言を辿る', () => {
+  const ORIGIN = 'ORIGIN-DOC';
+  const DERIVED = 'DERIVED-DOC';
+
+  interface Lineage {
+    originMessageId: string;
+    derivedMessageId: string;
+  }
+
+  // 元の発言と、それを検索結果として注入されたターンで書かれた回答を作る。injected=falseは検索が当たらなかったターン。
+  async function seedLineage(
+    config: WorkerConfig,
+    input: { originEmbedding: number[]; derivedEmbedding: number[]; injected?: boolean; originSessionId?: string; originSequenceNo?: number },
+  ): Promise<Lineage> {
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const originSession = input.originSessionId ?? (await seedSession(pool, workspace));
+    const originText = `${ORIGIN} 元の発言の本文`;
+    const origin = await seedMessage(pool, {
+      sessionId: originSession,
+      sequenceNo: input.originSequenceNo ?? 1,
+      role: 'assistant',
+      text: originText,
+      occurredAt: new Date('2026-08-17T06:20:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: originSession,
+      documentKey: `lineage-origin-${origin.messageId}`,
+      content: originText,
+      generationId: generation.id,
+      embedding: input.originEmbedding,
+      sources: [{ messageId: origin.messageId, messageRevision: 1, startOffset: 0, endOffset: originText.length }],
+    });
+    const derivedSession = await seedSession(pool, workspace);
+    const asked = await seedMessage(pool, { sessionId: derivedSession, sequenceNo: 1, role: 'user', text: '過去に同じことを聞いた質問' });
+    const evidence = { messageId: origin.messageId, revision: 1, employeeId: workspace.employeeId, role: 'assistant', occurredAt: '2026-08-17T06:20:00.000Z', text: originText };
+    await seedSearchRequest(pool, {
+      workspace,
+      sessionId: derivedSession,
+      inputId: asked.messageId,
+      sequenceNo: 1,
+      status: 'completed',
+      outcome: input.injected === false ? 'no_match' : 'matched',
+      searchAction: 'new_search',
+      result: input.injected === false ? undefined : matchedResult([evidence]),
+    });
+    const derivedText = `${DERIVED} 注入された内容を要約した回答`;
+    const derived = await seedMessage(pool, {
+      sessionId: derivedSession,
+      sequenceNo: 2,
+      role: 'assistant',
+      text: derivedText,
+      occurredAt: new Date('2026-10-01T05:22:00.000Z'),
+    });
+    await seedReadyDocument(pool, {
+      companyId: workspace.companyId,
+      projectId: workspace.projectId,
+      sessionId: derivedSession,
+      documentKey: `lineage-derived-${derived.messageId}`,
+      content: derivedText,
+      generationId: generation.id,
+      embedding: input.derivedEmbedding,
+      sources: [{ messageId: derived.messageId, messageRevision: 1, startOffset: 0, endOffset: derivedText.length }],
+    });
+    return { originMessageId: origin.messageId, derivedMessageId: derived.messageId };
+  }
+
+  // 質問に近い別々の候補を20件置き、質問から遠い候補をvector経路の上位20件の外へ押し出す。
+  async function seedFillers(config: WorkerConfig): Promise<void> {
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionId = await seedSession(pool, workspace);
+    for (let index = 0; index < SEARCH_VECTOR_LIMIT; index += 1) {
+      const text = `FILLER-${index + 1} 別の内容の候補`;
+      const message = await seedMessage(pool, { sessionId, sequenceNo: index + 1, role: 'assistant', text });
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId,
+        documentKey: `lineage-filler-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
+    }
+  }
+
+  async function runSearch(config: WorkerConfig, sessionId?: string, sequenceNo = 1): Promise<M5SearchResult> {
+    const inputSession = sessionId ?? (await seedSession(pool, workspace));
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: inputSession, sequenceNo, text: '元の発言を辿る検索の質問' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+    return readStoredResult(pool, seeded.requestId);
+  }
+
+  function evidenceIds(result: M5SearchResult): string[] {
+    return result.matches?.[0]?.evidence?.map((evidence) => evidence.message_id) ?? [];
+  }
+
+  function hasWarning(result: M5SearchResult, code: string): boolean {
+    return (result.warnings ?? []).some((warning) => (warning as { code?: string }).code === code);
+  }
+
+  const queryResponder = vectorQueryResponder(basisVector(0, 1));
+  // 質問と無関係な向き。vector経路では上位に入らない。
+  const farVector = (): number[] => basisVector(5, 1);
+  // 質問と中程度に近く、派生の回答（第1軸そのもの）とは重複として畳まれない向き。
+  const moderateVector = (): number[] => {
+    const vector = basisVector(0, 0.6);
+    vector[150] = 0.8;
+    return vector;
+  };
+
+  it('派生した回答が候補に入れば、vector経路の上位に入らない元の発言も候補へ加えて判定に渡す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1) });
+
+    const result = await runSearch(config);
+    assert.ok(allJevRawBody(jev).includes(ORIGIN), '元の発言を候補に加えていない');
+    const evaluations = (result.candidate_evaluations ?? []) as Array<{ retrieval_kinds?: string[] }>;
+    assert.ok(evaluations.some((evaluation) => (evaluation.retrieval_kinds ?? []).includes('provenance')), '元を辿った経路を結果へ残していない');
+  });
+
+  it('検索が当たらなかったターンの回答からは元を辿らず、候補を増やさない', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1), injected: false });
+
+    await runSearch(config);
+    assert.ok(!allJevRawBody(jev).includes(ORIGIN), '注入を受けていない回答から発言を辿っている');
+  });
+
+  it('元と派生が同じ関連度なら元を代表根拠にし、派生を後ろへ回したことを警告に残す', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    const lineage = await seedLineage(config, { originEmbedding: moderateVector(), derivedEmbedding: basisVector(0, 1) });
+
+    const result = await runSearch(config);
+    assert.ok(evidenceIds(result).includes(lineage.originMessageId), '元の発言を代表根拠にしていない');
+    assert.ok(!evidenceIds(result).includes(lineage.derivedMessageId), '派生した回答を元より優先している');
+    assert.ok(hasWarning(result, 'derived_candidates_demoted'), '派生を後ろへ回したことを警告に残していない');
+  });
+
+  it('元が無関係と判定されたら、派生した回答をそのまま代表根拠にする', async () => {
+    const select: JevChoiceSelector = (question, request) => {
+      const field = question.id.split(':')[0] ?? question.id;
+      const candidate = request.state.candidates?.find((item) => question.instructions.includes(`candidate_id=${item.candidate_id}`));
+      if (field === 'candidate_relevance') {
+        return candidate?.text.includes(ORIGIN) === true ? 'unrelated' : 'direct';
+      }
+      return Object.keys(question.criteria).includes('yes') ? 'yes' : undefined;
+    };
+    const { config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({ body: jevReply(request, select) }),
+      voyageResponder: queryResponder,
+    });
+    const lineage = await seedLineage(config, { originEmbedding: moderateVector(), derivedEmbedding: basisVector(0, 1) });
+
+    const result = await runSearch(config);
+    assert.ok(evidenceIds(result).includes(lineage.derivedMessageId), '元が無関係なのに派生した回答を降格している');
+    assert.ok(!hasWarning(result, 'derived_candidates_demoted'), '降格していないのに警告を付けている');
+  });
+
+  it('現在の入力より後の発言は、元として候補へ加えない', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    const inputSession = await seedSession(pool, workspace);
+    // 元の発言を、現在の入力と同じ会話の、入力より後ろへ置く。
+    await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1), originSessionId: inputSession, originSequenceNo: 2 });
+
+    await runSearch(config, inputSession, 1);
+    assert.ok(!allJevRawBody(jev).includes(ORIGIN), '現在の入力より後の発言を元として加えている');
+  });
+
+  it('元と派生の埋め込みが近くて畳まれる時は、新しい派生ではなく元を残す', async () => {
+    const { jev, config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    const nearOrigin = basisVector(0, 1);
+    nearOrigin[1] = 0.02;
+    await seedLineage(config, { originEmbedding: nearOrigin, derivedEmbedding: basisVector(0, 1) });
+
+    await runSearch(config);
+    const jevBody = allJevRawBody(jev);
+    assert.ok(jevBody.includes(ORIGIN), '畳んだ結果、元の発言が残っていない');
+    assert.ok(!jevBody.includes(DERIVED), '元と重複する派生した回答を残している');
+  });
+
+  it('評価コマンドは、正解の候補を引いた経路をケースごとに出力する', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedFillers(config);
+    const lineage = await seedLineage(config, { originEmbedding: farVector(), derivedEmbedding: basisVector(0, 1) });
+
+    const evaluated = await evaluateSearchCases(pool, config, workspace.projectId, [
+      { name: 'origin-by-lineage', question: '評価用の質問', expected_message_ids: [lineage.originMessageId], pass_when: 'in_candidates' },
+    ]);
+    const item = evaluated.ok ? evaluated.report.cases[0] : undefined;
+    assert.equal(item?.status, 'hit', `元の発言が候補に入っていない: ${JSON.stringify(evaluated)}`);
+    assert.deepEqual(item?.retrieval_kinds, ['provenance'], '候補を引いた経路を出力していない');
+  });
+
+  it('metricsは、元を辿った候補が代表になった検索と、派生を後ろへ回した検索の件数を出す', async () => {
+    const { config } = await startProviders(pool, workspace.companyId, { jevMode: 'direct', voyageResponder: queryResponder });
+    await seedLineage(config, { originEmbedding: moderateVector(), derivedEmbedding: basisVector(0, 1) });
+    await runSearch(config);
+
+    const metrics = await loadProjectMetrics(pool, workspace.projectId);
+    assert.deepEqual(metrics?.provenance, { searches: 1, origin_adopted: 1, derived_demoted: 1 });
   });
 });
 
