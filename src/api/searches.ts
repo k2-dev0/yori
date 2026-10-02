@@ -62,6 +62,8 @@ function manualConditionHash(input: ParsedSearchRequest): Buffer {
     project_id: input.project_id,
     force_refresh: input.force_refresh,
     policy_version: AUTO_SEARCH_POLICY_VERSION,
+    // 指定がある時だけ含める。省略した既存の再送は、列の追加前に保存したhashと一致し続ける。
+    ...(input.primary_only === true ? { primary_only: true } : {}),
   };
   return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest();
 }
@@ -129,7 +131,8 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
       return { requestId: duplicate.id, reused: true };
     }
     // 初回でkey未使用かつquestionが現在入力の原文と同じなら、既存の自動受付を再利用する。
-    if (!request.force_refresh && request.query === target.text) {
+    // 自動受付の結果は検索結果を受けて書かれた回答を含むため、一次資料だけの指定では再利用しない。
+    if (!request.force_refresh && request.primary_only !== true && request.query === target.text) {
       const auto = await client.query<{ id: string }>(
         `SELECT id
            FROM search_requests
@@ -146,8 +149,8 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
     await client.query(
       `INSERT INTO search_requests
          (id, company_id, project_id, employee_id, session_id, input_message_id, input_message_revision, input_sequence_no,
-          trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $9, $10, $11, $12)`,
+          trigger, status, outcome, search_action, stage, policy_version, question, idempotency_key, condition_hash, primary_only)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', 'pending', NULL, 'new_search', 'awaiting_search', $9, $10, $11, $12, $13)`,
       [
         requestId,
         auth.companyId,
@@ -161,6 +164,7 @@ export async function createSearch(pool: Pool, auth: AuthContext, rawRequest: Pa
         request.query,
         request.idempotency_key,
         conditionHash,
+        request.primary_only === true,
       ],
     );
     await enqueueJob(client, {
