@@ -25,6 +25,9 @@ export const SUSPECTED_SECRET_CODE = 'suspected_secret';
 export const SUSPECTED_SECRET_OBSERVED = 'suspected_secret_observed';
 export const SUSPECTED_SECRET_DETECTOR_VERSION = 'initial-v1';
 export const AUTO_SEARCH_POLICY_VERSION = 'initial-v1';
+// 発言時刻が受付時刻よりこれ以上古いuser入力には、自動検索を作らない。履歴の取り込みでは結果を待つ利用者がおらず、
+// 1並列の検索laneを今の入力から奪うため。通知が結果を待つのは最大10秒なので、送信の遅れを見込んでも十分に長い。
+export const AUTO_SEARCH_MAX_INPUT_AGE_MS = 10 * 60 * 1_000;
 
 // 同一社員のイベント保存と再利用確定を直列化するtransaction advisory lockの名前空間。
 export const EVENT_WRITE_LOCK_NAMESPACE = 20260922;
