@@ -792,6 +792,8 @@ interface EvidenceRow {
   occurred_at: Date;
   employee_id: string;
   text: string;
+  model_id: string | null;
+  reasoning_effort: string | null;
 }
 
 // 保存済みrevisionの原文を同一会社・案件で取得する。別案件・別会社・未保存revisionはnullにする。
@@ -803,11 +805,12 @@ export async function loadEvidence(
   revision: number,
 ): Promise<EvidenceView | null> {
   const result = await pool.query<EvidenceRow>(
-    `SELECT m.id AS message_id, m.role, m.occurred_at, s.employee_id, r.text
+    `SELECT m.id AS message_id, m.role, m.occurred_at, s.employee_id, r.text, d.model_id, d.reasoning_effort
        FROM messages m
        JOIN sessions s ON s.id = m.session_id
        JOIN projects p ON p.id = s.project_id
        JOIN message_revisions r ON r.message_id = m.id AND r.revision = $4
+       LEFT JOIN message_metadata d ON d.message_id = r.message_id AND d.revision = r.revision
       WHERE m.id = $1 AND p.company_id = $2 AND s.project_id = $3`,
     [messageId, auth.companyId, projectId, revision],
   );
@@ -822,5 +825,8 @@ export async function loadEvidence(
     role: row.role,
     occurred_at: row.occurred_at.toISOString(),
     text: row.text,
+    // 生成したmodelが記録されていない発言では項目ごと省く。
+    ...(row.model_id === null ? {} : { model_id: row.model_id }),
+    ...(row.reasoning_effort === null ? {} : { reasoning_effort: row.reasoning_effort }),
   };
 }
