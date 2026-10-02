@@ -123,6 +123,8 @@ export const searchRequestSchema = z.strictObject({
   query: conversationText,
   idempotency_key: idempotencyKeySchema,
   force_refresh: z.boolean(),
+  // 一次資料だけを求める指定。省略時は従来どおり全ての文書を対象にする。
+  primary_only: z.boolean().optional(),
 });
 
 export type ParsedSearchRequest = z.infer<typeof searchRequestSchema>;
