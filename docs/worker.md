@@ -147,9 +147,10 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 短いREPEATABLE READ TXで案件内の厳密vector上位20件と明示識別子完全一致上位20件を取得し、RRFで統合する。現在input自身・現在input以降の同session発言、別案件・別会社は除外する。
 - 検索質問が1,200 tokenを超える場合は、保存側の文書と同じ800 token以下の連続した区切りへ分け、先頭から最大5区切りを区切りごとに埋め込んでvector検索し、結果をRRFで合流させる。候補は最上位で引いた区切りを保持し、Jevの候補判定にはその区切りを質問として渡す（区切りごとに5件ずつのrequest）。6区切り目以降は検索に使わず、結果へ`question_truncated`のwarningを残す。識別子の抽出は質問全文に対して行う。1,200 token以下の質問は区切らず、従来どおり1回で検索する。route時のquery埋め込みの先行実行も同じ区切りで行う。
 - sourceが利用者の依頼（role=user・`statement_status=request`）だけで、明示識別子の一致もない候補は、上限10件で切る前に答えを含む候補より後ろへ回す。除外はしないので、他に候補がなければ残る。
-- 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、その中で最も新しい発言を持つ候補を残す。識別子一致のない依頼だけの候補で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
+- vector・entity・strategyの3経路で集めた候補のうちエージェントの回答について、そのターンの直前の入力に対する検索が`matched`だった場合に、その検索が根拠として返した発言の文書を`provenance`経路として候補へ加える（最大10件、`SEARCH_PROVENANCE_LIMIT`）。検索結果の注入を受けて書かれた回答から、元になった発言へ1段だけ辿る。Jevは呼ばず`search_requests.result`の記録だけを使い、会社・案件・世代・現在入力以降の除外は他の経路と同じ。加えた文書も上限10件の選別とJevの判定を通る。
+- 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、元と派生の関係がある時は元を、関係がない時は最も新しい発言を持つ候補を残す。識別子一致のない依頼だけの候補で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけ、または全候補が残予算外なら`input_budget_exceeded`。
-- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、答えを含むかどうか（識別子一致のない依頼だけの候補を後ろ）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
+- Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、元か派生か（元の候補が同じrelevance以上で採用可能な派生を元の後ろへ回し、件数を`derived_candidates_demoted`のwarningへ残す）、答えを含むかどうか（識別子一致のない依頼だけの候補を後ろ）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
 - input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
 
 ### 評価キャッシュ
@@ -196,6 +197,8 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 [{ "name": "device-discount", "question": "端末値引きの実装ってどういう方針で誰がやりましたか？", "expected_message_ids": ["<message uuid>"] }]
 ```
 
-出力はケースごとに`status`（`hit`＝正解が代表根拠、`miss`、`error`）、`in_candidates`（Jevの判定まで届いたか）、`candidate_position`（判定へ渡した順の位置、1始まり）、`relevance`（Jevの総合判定）、`error_code`を持ち、末尾に`total`と`hits`を持つ。`miss`かつ`in_candidates=false`は候補の探し方（区切り・埋め込み・上限）の問題、`miss`かつ`in_candidates=true`は順位付けまたはJevの判定の問題を示す。
+出力はケースごとに`status`（`hit`＝正解が代表根拠、`miss`、`error`）、`in_candidates`（Jevの判定まで届いたか）、`candidate_position`（判定へ渡した順の位置、1始まり）、`relevance`（Jevの総合判定）、`retrieval_kinds`（その候補を引いた検索経路。`provenance`は元を辿って入ったことを示す）、`error_code`を持ち、末尾に`total`と`hits`を持つ。`miss`かつ`in_candidates=false`は候補の探し方（区切り・埋め込み・上限）の問題、`miss`かつ`in_candidates=true`は順位付けまたはJevの判定の問題を示す。
 
 評価で作った会話は削除するが、外部呼び出しの記録（`usage_events`）、評価cache、埋め込みcache、検索所要時間のsampleは写しのDBに残る。調整値はコードの定数または環境変数を変えて再実行する。
+
+`worker:metrics`の`provenance`は、案件の直近500件の完了済み検索について、`searches`（対象件数）、`origin_adopted`（元を辿って加えた候補が代表根拠になった件数）、`derived_demoted`（派生を元の後ろへ回した件数）を返す。保存済みの検索結果から数え、本文は読まない。
