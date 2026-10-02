@@ -50,11 +50,16 @@ describe('Claude Code transcriptアダプター', () => {
     );
   });
 
-  it('assistant行のmodelだけを発言に付け、Claude Code自身が作った行とuser行には付けない', () => {
-    const parse = (role: 'user' | 'assistant', model: string) =>
-      parseClaudeTranscriptLine(claudeMessageLine({ sessionId: 'session-claude', uuid: 'm-1', role, content: '本文', model }));
+  it('assistant行のmodelと思考量だけを発言に付け、Claude Code自身が作った行とuser行には付けない', () => {
+    const parse = (role: 'user' | 'assistant', model: string, extra: Record<string, unknown> = { effort: 'medium' }) =>
+      parseClaudeTranscriptLine(claudeMessageLine({ sessionId: 'session-claude', uuid: 'm-1', role, content: '本文', model, extra }));
 
     assert.deepEqual(parse('assistant', 'claude-opus-5-5'), {
+      ...expectedMessage({ uuid: 'm-1', role: 'assistant', text: '本文' }),
+      model_id: 'claude-opus-5-5',
+      reasoning_effort: 'medium',
+    });
+    assert.deepEqual(parse('assistant', 'claude-opus-5-5', {}), {
       ...expectedMessage({ uuid: 'm-1', role: 'assistant', text: '本文' }),
       model_id: 'claude-opus-5-5',
     });
