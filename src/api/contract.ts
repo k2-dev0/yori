@@ -7,6 +7,7 @@ export const MAX_BATCH_SIZE = 100;
 export const MAX_TEXT_LENGTH = 65_536;
 export const MAX_SOURCE_IDENTIFIER_BYTES = 1024;
 export const MAX_MODEL_IDENTIFIER_BYTES = 1024;
+export const MAX_REASONING_EFFORT_BYTES = 1024;
 export const MAX_CLIENT_VERSION_BYTES = 1024;
 // business伏せ字はfields＋terms合算100件。termは512 code points、fieldは128 code points。
 export const MAX_BUSINESS_REDACTION_RULES = 100;
@@ -52,6 +53,8 @@ export interface EventInput {
   role: EventRole;
   occurred_at: string;
   model_id?: string;
+  // modelへ指定した思考量。modelの付帯情報なので、model_idがあるイベントだけが持てる。
+  reasoning_effort?: string;
   client_version?: string;
   text: string;
 }
@@ -80,6 +83,7 @@ export const RECEIPT_PAYLOAD_KEYS = [
   'role',
   'occurred_at',
   'model_id',
+  'reasoning_effort',
   'client_version',
   'text',
 ] as const;
