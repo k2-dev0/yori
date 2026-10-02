@@ -172,6 +172,7 @@ export function createDeepSeekTranscriptParser(options: { repository?: string } 
             source_message_id: message.id,
             occurred_at: occurredAt,
             role: 'assistant',
+            ...(typeof message.source.model === 'string' ? { model_id: message.source.model } : {}),
             text,
           });
         }
