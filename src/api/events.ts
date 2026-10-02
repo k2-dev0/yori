@@ -190,7 +190,7 @@ async function applyEvent(
        VALUES ($1, $2, $3, $4, $5, $6, 1)`,
       [messageId, sessionId, event.source_message_id, event.sequence_no, event.role, occurredAt],
     );
-    await insertRevision(client, messageId, event.revision, event.text, event.model_id, event.client_version);
+    await insertRevision(client, messageId, event);
   }
 
   // 過去の発言の取り込みでは自動検索を作らない。結果を待つ利用者がおらず、検索laneを今の入力から奪うため。
@@ -273,12 +273,15 @@ async function applyRevision(client: PoolClient, message: StoredMessage, event: 
     throw new EventConflictError();
   }
   if (event.revision === message.current_revision + 1) {
-    await insertRevision(client, message.id, event.revision, event.text, event.model_id, event.client_version);
+    await insertRevision(client, message.id, event);
     await client.query('UPDATE messages SET current_revision = $2, updated_at = now() WHERE id = $1', [message.id, event.revision]);
     return;
   }
-  const existing = await client.query<{ text: string; model_id: string | null; client_version: string | null }>(
-    'SELECT text, model_id, client_version FROM message_revisions WHERE message_id = $1 AND revision = $2',
+  const existing = await client.query<{ text: string; model_id: string | null; reasoning_effort: string | null; client_version: string | null }>(
+    `SELECT r.text, d.model_id, d.reasoning_effort, r.client_version
+       FROM message_revisions r
+       LEFT JOIN message_metadata d ON d.message_id = r.message_id AND d.revision = r.revision
+      WHERE r.message_id = $1 AND r.revision = $2`,
     [message.id, event.revision],
   );
   const revision = existing.rows[0];
@@ -286,24 +289,27 @@ async function applyRevision(client: PoolClient, message: StoredMessage, event: 
     !revision ||
     revision.text !== event.text ||
     revision.model_id !== (event.model_id ?? null) ||
+    revision.reasoning_effort !== (event.reasoning_effort ?? null) ||
     revision.client_version !== (event.client_version ?? null)
   ) {
     throw new EventConflictError();
   }
 }
 
-async function insertRevision(
-  client: PoolClient,
-  messageId: string,
-  revision: number,
-  text: string,
-  modelId: string | undefined,
-  clientVersion: string | undefined,
-): Promise<void> {
+async function insertRevision(client: PoolClient, messageId: string, event: ParsedEvent): Promise<void> {
   await client.query(
-    'INSERT INTO message_revisions (message_id, revision, text, content_hash, model_id, client_version) VALUES ($1, $2, $3, $4, $5, $6)',
-    [messageId, revision, text, sha256Utf8(text), modelId ?? null, clientVersion ?? null],
+    'INSERT INTO message_revisions (message_id, revision, text, content_hash, client_version) VALUES ($1, $2, $3, $4, $5)',
+    [messageId, event.revision, event.text, sha256Utf8(event.text), event.client_version ?? null],
   );
+  // 生成したmodelが分かる発言にだけ行を作る。user発言のようにmodelが無いイベントでは作らない。
+  if (event.model_id !== undefined) {
+    await client.query('INSERT INTO message_metadata (message_id, revision, model_id, reasoning_effort) VALUES ($1, $2, $3, $4)', [
+      messageId,
+      event.revision,
+      event.model_id,
+      event.reasoning_effort ?? null,
+    ]);
+  }
 }
 
 // user発言の自動検索受付をrevision単位で1件だけ作成し、再送では既存request_idを返す。
@@ -360,6 +366,7 @@ function receiptHash(input: ReceiptHashInput): Buffer {
     role: input.event.role,
     occurred_at: input.event.occurred_at,
     model_id: input.event.model_id,
+    reasoning_effort: input.event.reasoning_effort,
     client_version: input.event.client_version,
     text: input.event.text,
   };
