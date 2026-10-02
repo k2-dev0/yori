@@ -61,6 +61,7 @@ export interface CollectorHookInput {
   text?: string;
   workspace_roots?: string[];
   model_id?: string;
+  reasoning_effort?: string;
   client_version?: string;
   stop_hook_active?: boolean;
   last_assistant_message?: string | null;
@@ -166,6 +167,7 @@ function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookM
         role: 'user',
         text: hook.prompt,
         modelId: hook.model_id,
+        reasoningEffort: hook.reasoning_effort,
         clientVersion: hook.client_version,
       };
     }
@@ -176,6 +178,7 @@ function selectHookMessage(source: EventSource, hook: CollectorHookInput): HookM
         role: 'assistant',
         text: hook.text,
         modelId: hook.model_id,
+        reasoningEffort: hook.reasoning_effort,
         clientVersion: hook.client_version,
       };
     }
