@@ -762,31 +762,40 @@ interface CandidateEvaluationInput {
   target: JobTarget;
   config: WorkerConfig;
   candidates: readonly Candidate[];
+  jobId: string;
   jobKind: string;
   question: string;
 }
 
-// 候補を、引いた質問の区切りごとにSEARCH_CANDIDATE_REQUEST_SIZE件ずつのJev requestへ分け、並列に送って候補ごとの判定へ写す。
-// 全requestの完了（usage記録）を待ってから、最初の失敗を既存のエラー分類のまま返す。
+// 候補を、引いた質問の区切りごとにSEARCH_CANDIDATE_REQUEST_SIZE件ずつのJev requestへ分け、組ごとに並列に送って候補ごとの判定へ写す。
+// 各組の全requestの完了（usage記録）を待ってから、最初の失敗を既存のエラー分類のまま返す。
 async function evaluateCandidates(
   pool: Pool,
   input: Omit<CandidateEvaluationInput, 'question'> & { questions: readonly string[] },
 ): Promise<CandidateAssessment[]> {
-  const batches: { candidates: Candidate[]; question: string }[] = [];
-  // 候補を引いた区切りごとにまとめ、その区切りを質問として渡す。
+  const batches: { candidates: Candidate[]; question: string; first: boolean }[] = [];
+  // 候補を引いた区切りごとにまとめ、その区切りを質問として渡す。区切り内の候補は順位順に並んでいる。
   for (const [chunkIndex, question] of input.questions.entries()) {
     const group = input.candidates.filter((candidate) => candidate.queryChunkIndex === chunkIndex);
     for (let index = 0; index < group.length; index += SEARCH_CANDIDATE_REQUEST_SIZE) {
-      batches.push({ candidates: group.slice(index, index + SEARCH_CANDIDATE_REQUEST_SIZE), question });
+      batches.push({ candidates: group.slice(index, index + SEARCH_CANDIDATE_REQUEST_SIZE), question, first: index === 0 });
     }
   }
-  const settled = await Promise.allSettled(batches.map((batch) => evaluateCandidateBatch(pool, { ...input, ...batch })));
+  // 各区切りの上位の組を先に判定し、使える候補が無い時だけ残りを判定する。採用候補の大半は上位の組に入るため、
+  // 残りの判定の費用を省く。上位に使える候補があれば、下位により良い候補があっても見に行かない。
+  const rounds = [batches.filter((batch) => batch.first), batches.filter((batch) => !batch.first)];
   const assessments: CandidateAssessment[] = [];
-  for (const outcome of settled) {
-    if (outcome.status === 'rejected') {
-      throw outcome.reason;
+  for (const round of rounds) {
+    const settled = await Promise.allSettled(round.map((batch) => evaluateCandidateBatch(pool, { ...input, ...batch })));
+    for (const outcome of settled) {
+      if (outcome.status === 'rejected') {
+        throw outcome.reason;
+      }
+      assessments.push(...outcome.value);
     }
-    assessments.push(...outcome.value);
+    if (assessments.some((assessment) => assessment.relevance === 'useful' || assessment.relevance === 'direct')) {
+      break;
+    }
   }
   return assessments;
 }
@@ -837,7 +846,7 @@ async function evaluateCandidateBatch(pool: Pool, input: CandidateEvaluationInpu
     const jevError = error instanceof JevCallError ? error : new JevCallError('provider_unavailable', true);
     await recordJevUsage(
       pool,
-      { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
+      { companyId: input.target.companyId, config: input.config, jobId: input.jobId, jobKind: input.jobKind },
       false,
       Date.now() - started,
       jevError.code,
@@ -853,7 +862,7 @@ async function evaluateCandidateBatch(pool: Pool, input: CandidateEvaluationInpu
     const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
     await recordJevUsage(
       pool,
-      { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
+      { companyId: input.target.companyId, config: input.config, jobId: input.jobId, jobKind: input.jobKind },
       false,
       durationMs,
       code,
@@ -864,7 +873,7 @@ async function evaluateCandidateBatch(pool: Pool, input: CandidateEvaluationInpu
   }
   await recordJevUsage(
     pool,
-    { companyId: input.target.companyId, config: input.config, jobKind: input.jobKind },
+    { companyId: input.target.companyId, config: input.config, jobId: input.jobId, jobKind: input.jobKind },
     true,
     durationMs,
     null,
@@ -1653,7 +1662,7 @@ export async function processExecuteSearch(pool: Pool, job: ClaimedJob, config: 
     await saveSearchResult(pool, { job, target, request, generation, warnings, evaluations: [], exploration: null, searchMode });
     return;
   }
-  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobKind: job.kind, questions: chunks });
+  const assessments = await evaluateCandidates(pool, { target, config, candidates: selected, jobId: job.id, jobKind: job.kind, questions: chunks });
   // 元の候補が同じ関連度以上で採用可能な派生は、代表根拠の順位で元の後ろへ回す。
   const accepted = assessments.filter((assessment) => assessment.relevance === 'useful' || assessment.relevance === 'direct');
   const acceptedRelevance = new Map(accepted.map((assessment) => [candidateKey(assessment.candidate), RELEVANCE_ORDER[assessment.relevance]]));
