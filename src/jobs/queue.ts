@@ -264,7 +264,7 @@ export async function claimJobs(pool: Pool, input: ClaimJobsInput): Promise<Clai
       const leaseExpiresAt = new Date(Date.now() + leaseMs);
       const updated = await client.query<{ attempts: number }>(
         `UPDATE jobs
-            SET status = 'running', lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = now()
+            SET status = 'running', lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, started_at = now(), updated_at = now()
           WHERE id = $1 AND status = 'pending'
           RETURNING attempts`,
         [row.id, leaseToken, leaseExpiresAt],
