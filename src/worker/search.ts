@@ -3,15 +3,9 @@ import { validate as validateUuid, v7 as uuidv7 } from 'uuid';
 import { completeJob, type ClaimedJob } from '../jobs/queue.js';
 import type { WorkerConfig } from './config.js';
 import {
-  CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX,
   CANDIDATE_RELEVANCE_CRITERIA,
   CANDIDATE_RELEVANCE_QUESTION_PREFIX,
   CANDIDATE_RELEVANCES,
-  CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX,
-  CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX,
-  CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX,
-  CANDIDATE_TARGET_MATCH_QUESTION_PREFIX,
-  CANDIDATE_YES_NO_CRITERIA,
   JEV_PROVIDER,
   SEARCH_CANDIDATE_BUDGET_TOKENS,
   SEARCH_CANDIDATE_LIMIT,
@@ -691,8 +685,8 @@ async function loadCandidates(
   }
 }
 
-// overall relevanceと、計画9.3の独立Choice質問を候補ごとに組み立てる。
-// statement_statusはsource messageの分類結果から決めるため、候補判定では質問しない。
+// overall relevanceの質問だけを候補ごとに組み立てる。対象一致などの観点は代表根拠の選択に使わず、質問の分だけ費用が増えるため
+// 質問しない（結果のrelevance_kindは空配列になる）。statement_statusはsource messageの分類結果から決めるため、質問しない。
 function buildCandidateQuestions(candidates: readonly Candidate[]): {
   questions: Record<string, JevChoiceQuestion>;
   index: Map<string, { candidate: Candidate; kind: CandidateQuestionKind }>;
@@ -718,41 +712,6 @@ function buildCandidateQuestions(candidates: readonly Candidate[]): {
       CANDIDATE_RELEVANCE_QUESTION_PREFIX,
       `state.candidatesのcandidate_id=${key}が現在の質問へどれだけ答えるかoverall relevanceを選ぶ。`,
       CANDIDATE_RELEVANCE_CRITERIA,
-    );
-    addQuestion(
-      candidate,
-      'target_match',
-      CANDIDATE_TARGET_MATCH_QUESTION_PREFIX,
-      `candidate_id=${key}が現在の質問の対象と一致するか選ぶ。`,
-      CANDIDATE_YES_NO_CRITERIA,
-    );
-    addQuestion(
-      candidate,
-      'similar_symptom_or_request',
-      CANDIDATE_SIMILAR_SYMPTOM_OR_REQUEST_QUESTION_PREFIX,
-      `candidate_id=${key}の症状または修正依頼が現在の質問と類似しているか選ぶ。`,
-      CANDIDATE_YES_NO_CRITERIA,
-    );
-    addQuestion(
-      candidate,
-      'similar_constraints',
-      CANDIDATE_SIMILAR_CONSTRAINTS_QUESTION_PREFIX,
-      `candidate_id=${key}の環境・制約が現在の質問と近いか選ぶ。`,
-      CANDIDATE_YES_NO_CRITERIA,
-    );
-    addQuestion(
-      candidate,
-      'implementation_rationale',
-      CANDIDATE_IMPLEMENTATION_RATIONALE_QUESTION_PREFIX,
-      `candidate_id=${key}が実装理由の根拠になるか選ぶ。`,
-      CANDIDATE_YES_NO_CRITERIA,
-    );
-    addQuestion(
-      candidate,
-      'reusable_procedure',
-      CANDIDATE_REUSABLE_PROCEDURE_QUESTION_PREFIX,
-      `candidate_id=${key}の解決方法または調査手順を再利用できるか選ぶ。`,
-      CANDIDATE_YES_NO_CRITERIA,
     );
   }
   return { questions, index };
