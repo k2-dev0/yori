@@ -1775,27 +1775,9 @@ describe('M5 順位統合とJev投入量', () => {
 });
 
 describe('M5 独立候補判定', () => {
-  it('overall relevanceと5つの独立Choiceを候補ごとに評価し、positiveをreason code・分類済みstatement_statusを別fieldで残す', async () => {
+  it('候補ごとにoverall relevanceだけを質問し、relevance_kindは空・分類済みstatement_statusを別fieldで残す', async () => {
     const queryVector = basisVector(0, 1);
-    const selectByQuestion: JevChoiceSelector = (question) => {
-      const field = question.id.split(':')[0] ?? question.id;
-      switch (field) {
-        case 'candidate_relevance':
-          return 'useful';
-        case 'candidate_target_match':
-          return 'yes';
-        case 'candidate_similar_symptom_or_request':
-          return 'no';
-        case 'candidate_similar_constraints':
-          return 'yes';
-        case 'candidate_implementation_rationale':
-          return 'no';
-        case 'candidate_reusable_procedure':
-          return 'yes';
-        default:
-          return undefined;
-      }
-    };
+    const selectByQuestion: JevChoiceSelector = (question) => ((question.id.split(':')[0] ?? question.id) === 'candidate_relevance' ? 'useful' : undefined);
     const { config, jev } = await startProviders(pool, workspace.companyId, {
       jevResponder: (request) => ({ body: jevReply(request, selectByQuestion) }),
       voyageResponder: vectorQueryResponder(queryVector),
@@ -1836,7 +1818,7 @@ describe('M5 独立候補判定', () => {
     const evaluation = evaluations[0];
     assert.equal(evaluation.document_id !== undefined, true);
     assert.equal(evaluation.relevance, 'useful');
-    assert.deepEqual(evaluation.relevance_kind, ['target_match', 'similar_constraints', 'reusable_procedure']);
+    assert.deepEqual(evaluation.relevance_kind, [], '質問していない観点をrelevance_kindへ入れている');
     assert.equal(evaluation.statement_status, 'reported_verified');
     assert.equal(evaluation.adopted, true);
     const answers = evaluation.answers ?? {};
@@ -1844,14 +1826,14 @@ describe('M5 独立候補判定', () => {
     assert.equal(answers.statement_status, undefined, 'statement_statusをJevへ質問している');
     const candidateRequest = jev.requests.map((item) => item.rawBody).find((body) => body.includes('"candidate_relevance:'));
     assert.ok(candidateRequest !== undefined && !candidateRequest.includes('candidate_statement_status'), '候補判定でstatement_statusを質問している');
-    for (const kind of [
-      'overall',
-      'target_match',
-      'similar_symptom_or_request',
-      'similar_constraints',
-      'implementation_rationale',
-      'reusable_procedure',
-    ]) {
+    const candidateQuestionIds = Object.keys((JSON.parse(candidateRequest) as { questions: Record<string, unknown> }).questions);
+    assert.deepEqual(
+      candidateQuestionIds.map((id) => id.split(':')[0]),
+      ['candidate_relevance'],
+      `候補1件にoverall以外の質問を送っている: ${JSON.stringify(candidateQuestionIds)}`,
+    );
+    assert.deepEqual(Object.keys(answers), ['overall'], 'overall以外のraw answerを保存している');
+    for (const kind of ['overall']) {
       const answer = answers[kind];
       assert.ok(answer, `${kind}のraw answerがない`);
       const probabilities = answer.probabilities ?? {};
@@ -1862,7 +1844,7 @@ describe('M5 独立候補判定', () => {
     }
     const match = result.matches?.[0];
     assert.equal(match?.relevance, 'useful');
-    assert.deepEqual(match?.relevance_kind, ['target_match', 'similar_constraints', 'reusable_procedure']);
+    assert.deepEqual(match?.relevance_kind, []);
     assert.equal(match?.statement_status, 'reported_verified');
     assert.equal(match?.claim_status, 'agent_reported', 'reported_verifiedをエージェント報告のclaim_statusへ格上げした');
   });
