@@ -153,7 +153,7 @@ async function saveCachedEvaluation(
 async function recordUsage(
   pool: Pool,
   target: JobTarget,
-  jobKind: string,
+  job: { id: string; kind: string },
   config: WorkerConfig,
   success: boolean,
   durationMs: number,
@@ -163,15 +163,15 @@ async function recordUsage(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO usage_events
-       (id, company_id, provider, account_ref, endpoint, operation, requested_model, response_model, input_tokens, output_tokens, duration_ms, success, error_code)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+       (id, company_id, provider, account_ref, endpoint, operation, requested_model, response_model, input_tokens, output_tokens, duration_ms, success, error_code, job_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
     [
       uuidv7(),
       target.companyId,
       JEV_PROVIDER,
       config.accountRef,
       config.apiUrl,
-      jobKind,
+      job.kind,
       config.model,
       responseModel,
       usage.input_tokens,
@@ -179,6 +179,7 @@ async function recordUsage(
       Math.max(0, Math.round(durationMs)),
       success,
       errorCode,
+      job.id,
     ],
   );
 }
@@ -303,7 +304,7 @@ async function callPlannedEvaluation(
     await recordUsage(
       pool,
       target,
-      job.kind,
+      job,
       config,
       false,
       Date.now() - started,
@@ -315,13 +316,13 @@ async function callPlannedEvaluation(
   }
   try {
     const validated = validateJevResponse(json, planned.request.questions);
-    await recordUsage(pool, target, job.kind, config, true, durationMs, null, validated.usage, validated.model);
+    await recordUsage(pool, target, job, config, true, durationMs, null, validated.usage, validated.model);
     await saveCachedEvaluation(pool, target.companyId, config, planned.stateHash, validated.model, validated.answers);
     return { part: planned.part, answers: validated.answers, candidates: planned.candidates, responseModel: validated.model };
   } catch (error) {
     const code = error instanceof JevCallError ? error.code : 'provider_contract_invalid';
     // 応答本文からmodelを取得できた場合は、検証失敗でも取得できた値だけを記録する。
-    await recordUsage(pool, target, job.kind, config, false, durationMs, code, extractJevUsage(json), extractJevResponseModel(json));
+    await recordUsage(pool, target, job, config, false, durationMs, code, extractJevUsage(json), extractJevResponseModel(json));
     throw error instanceof JevCallError ? error : new JevCallError('provider_contract_invalid', false);
   }
 }
