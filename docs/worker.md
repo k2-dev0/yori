@@ -105,6 +105,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 同sessionの対象sequenceより前の最新6発言を最新revisionでstateへ入れる。現在発言はjobの`target_revision`固定。
 - 直前の完全発言、直近先行検索の元入力、現在発言の順に予算へ入れる。入り切らない文脈は除外数をstateへ明示する。
 - 入力が16,000バイト予算を超える場合は、Unicodeを壊さない連続UTF-16範囲のpartへ分割し、1request 1partで送る。原文範囲（offset/length）は判定と一緒に保存し、原文は切り捨てない。
+- 主な意図（`primary_intent`）は読む処理が無いため質問せず、列互換のため`unknown`を保存する。検索の要否（`search_action`）と先行検索との条件の同一性（`same_conditions`）は自動検索の振り分けがあるuser発言だけに質問し、assistant発言などには送らない。user発言では振り分けと分類が同じrequestになり、評価cacheで1回の外部評価を共有する。質問を変えたため、質問版`JEV_QUESTIONS_VERSION`を`m3-6`へ上げ、旧版の評価cacheは再利用しない。
 - retentionは`substantive`→`decision_signal`→`unknown`→`progress_only`の順に保守的に統合する。全partが高信頼`progress_only`の時だけ`is_searchable=false`。
 - retention以外の単一分類は全part一致時だけ採用し、不一致はunknownにする。technical_labelsは採用ラベルの和集合。低信頼は採用しない。
 - `message_analysis.response_models`は全partの実応答modelを重複除去した出現順のjsonb文字列配列にする。`parts[].response_model`へpartごとの応答modelを保存し、旧`parts[].model_version`からの移行時も他のkeyを維持する。
