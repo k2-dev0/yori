@@ -293,7 +293,7 @@ function m5ChoiceSelector(mode: M5JevMode): JevChoiceSelector {
 }
 
 // 候補のstatement_statusはJevへ質問せず、source messageの分類済みstatement_statusから決まる。
-function rankingChoiceSelector(relevanceFor: (text: string) => 'useful' | 'direct' = () => 'direct'): JevChoiceSelector {
+function rankingChoiceSelector(relevanceFor: (text: string) => 'unrelated' | 'useful' | 'direct' = () => 'direct'): JevChoiceSelector {
   return (question, request) => {
     const field = question.id.split(':')[0] ?? question.id;
     const candidate = request.state.candidates?.find((item) => question.instructions.includes(`candidate_id=${item.candidate_id}`));
@@ -1390,7 +1390,7 @@ describe('M5 順位統合とJev投入量', () => {
     assert.ok(jevBody.includes('src/worker/process.ts'), '識別子がJev候補本文にない');
   });
 
-  it('Jevへ渡す候補は最大10件で、ベクトル順の上位を安定して残す', async () => {
+  it('Jevへ渡す候補は最大10件で、ベクトル順の上位を安定して残し、上位5件に使える候補があれば残りを判定しない', async () => {
     const queryVector = basisVector(0, 1);
     const { jev, config } = await startProviders(pool, workspace.companyId, {
       jevMode: 'direct',
@@ -1429,7 +1429,7 @@ describe('M5 順位統合とJev投入量', () => {
     assert.equal(request.outcome, 'matched');
     const jevBody = allJevRawBody(jev);
     const present = markers.filter((marker) => jevBody.includes(marker));
-    assert.deepEqual(present, markers.slice(0, 10), `Jevへ渡す候補が最大10件の上位順でない: ${JSON.stringify(present)}`);
+    assert.deepEqual(present, markers.slice(0, 5), `上位5件の判定で止まっていない: ${JSON.stringify(present)}`);
     const result = await readStoredResult(pool, seeded.requestId);
     assert.ok(
       (result.matches?.[0]?.evidence ?? []).some((evidence) => evidence.message_id === messageIds[0]),
@@ -3808,12 +3808,58 @@ describe('M5 設計方針fingerprint経路', () => {
     assert.ok(evaluations.length <= 10, '候補上限10件を超えている');
     assert.equal(result.index_status?.search_mode, 'exact_vector_entity_and_strategy');
     assert.ok(!(result.warnings ?? []).some((warning) => (warning as { code?: string }).code === 'strategy_fingerprint_unavailable'));
-    // 候補10件は5件ずつ2つのJev requestへ分けて送る。
+    // 上位5件の組に使える候補があるので、6件目以降の組は判定しない。
     const candidateRequests = jev.requests.filter((request) => request.rawBody.includes('"candidate_relevance:'));
-    assert.equal(candidateRequests.length, 2, '候補判定を2requestへ分割していない');
-    for (const request of candidateRequests) {
-      assert.ok((request.body.state.candidates?.length ?? 0) <= 5, '1requestの候補が5件を超えている');
+    assert.equal(candidateRequests.length, 1, '上位の組に使える候補があるのに残りを判定している');
+    assert.ok((candidateRequests[0]?.body.state.candidates?.length ?? 0) <= 5, '1requestの候補が5件を超えている');
+  });
+
+  it('上位5件に使える候補が無い時だけ6〜10位を判定し、11位以降は送らない', async () => {
+    const queryVector = basisVector(0, 1);
+    const markers = Array.from({ length: 12 }, (_, index) => `M5STAGE-${String(index + 1).padStart(2, '0')}`);
+    const upper = new Set(markers.slice(0, 5));
+    const { jev, config } = await startProviders(pool, workspace.companyId, {
+      jevResponder: (request) => ({
+        body: jevReply(request, rankingChoiceSelector((text) => (markers.some((marker) => upper.has(marker) && text.includes(marker)) ? 'unrelated' : 'direct'))),
+      }),
+      voyageResponder: vectorQueryResponder(queryVector),
+    });
+    const generation = await ensureActiveGeneration(pool, { companyId: workspace.companyId, projectId: workspace.projectId }, config);
+    const sessionA = await seedSession(pool, workspace);
+    const messageIds: string[] = [];
+    for (const [index, marker] of markers.entries()) {
+      const text = `${marker} 候補本文`;
+      const message = await seedMessage(pool, { sessionId: sessionA, sequenceNo: index + 1, role: 'assistant', text: `候補発言-${index + 1}` });
+      messageIds.push(message.messageId);
+      await seedReadyDocument(pool, {
+        companyId: workspace.companyId,
+        projectId: workspace.projectId,
+        sessionId: sessionA,
+        documentKey: `stage-${index + 1}`,
+        content: text,
+        generationId: generation.id,
+        embedding: similarityVector(index + 1),
+        sources: [{ messageId: message.messageId, messageRevision: 1, startOffset: 0, endOffset: text.length }],
+      });
     }
+    const sessionB = await seedSession(pool, workspace);
+    const seeded = await seedExecuteSearch(pool, { workspace, sessionId: sessionB, sequenceNo: 1, text: 'M5STAGE-QUERY 2段階判定の確認' });
+    await runExecuteSearch(pool, { jobId: seeded.jobId, config });
+
+    const candidateRequests = jev.requests.filter((request) => request.rawBody.includes('"candidate_relevance:'));
+    assert.equal(candidateRequests.length, 2, '上位の組に使える候補が無いのに残りを判定していない');
+    assert.deepEqual(
+      candidateRequests.map((request) => markers.filter((marker) => request.rawBody.includes(marker))),
+      [markers.slice(0, 5), markers.slice(5, 10)],
+      '1回目に上位5件、2回目に6〜10位を送っていない',
+    );
+    const request = await readSearchRequest(pool, seeded.requestId);
+    assert.equal(request.outcome, 'matched');
+    const result = await readStoredResult(pool, seeded.requestId);
+    assert.ok(
+      (result.matches?.[0]?.evidence ?? []).some((evidence) => evidence.message_id === messageIds[5]),
+      '2回目の組の最上位が代表evidenceになっていない',
+    );
   });
 
   it('fingerprint未評価の自動検索は経路を省き、部分検索であることをwarningで示す', async () => {
