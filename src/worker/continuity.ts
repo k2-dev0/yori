@@ -190,7 +190,7 @@ export async function processJudgeContinuity(pool: Pool, job: ClaimedJob, config
     truncation: { omitted_prior_messages: 0, split_current: false, prior_search_omitted: false },
   };
   const request: JevRequest = buildRequest(config.model, state, questions);
-  const usageInput = { companyId: scope.companyId, config, jobKind: job.kind };
+  const usageInput = { companyId: scope.companyId, config, jobId: job.id, jobKind: job.kind };
   const started = Date.now();
   let json: unknown;
   let durationMs: number;
