@@ -3,7 +3,6 @@ import {
   CONTINUITIES,
   DECISION_ACTIONS,
   JEV_SAME_CONDITIONS_QUESTION_ID,
-  PRIMARY_INTENTS,
   RETENTIONS,
   SAME_CONDITION_VALUES,
   SEARCH_ACTIONS,
@@ -50,22 +49,6 @@ const RETENTION_CRITERIA = criteriaFrom(RETENTIONS, {
   unknown: '判断不能',
 });
 
-const PRIMARY_INTENT_CRITERIA = criteriaFrom(PRIMARY_INTENTS, {
-  requirements: '要件',
-  design: '設計',
-  implementation: '実装',
-  explanation: '説明',
-  investigation: '調査',
-  bugfix: 'バグ修正',
-  review: 'レビュー',
-  test: 'テスト',
-  refactor: 'リファクタリング',
-  operation: '運用',
-  handoff: '引き継ぎ',
-  other: 'その他',
-  unknown: '判断不能',
-});
-
 const DECISION_ACTION_CRITERIA = criteriaFrom(DECISION_ACTIONS, {
   propose: '提案',
   accept: '承認',
@@ -106,18 +89,19 @@ const SAME_CONDITION_CRITERIA = criteriaFrom(SAME_CONDITION_VALUES, {
 
 
 // partごとの質問を、fieldの意味と判定基準がinstructionから分かるように組み立てる。
-export function buildQuestions(part: JevStatePart, candidateIds: readonly string[], includeSameConditions: boolean): Record<string, JevChoiceQuestion> {
+// includeSearchActionは自動検索の振り分けがあるuser発言だけtrueにし、振り分けの無い発言へ検索用の質問を送らない。
+export function buildQuestions(
+  part: JevStatePart,
+  candidateIds: readonly string[],
+  includeSameConditions: boolean,
+  includeSearchAction: boolean,
+): Record<string, JevChoiceQuestion> {
   const partLabel = `現在発言の原文範囲(offset ${part.offset}, ${part.length}文字)`;
   const questions: Record<string, JevChoiceQuestion> = {};
   questions[jevQuestionId('retention', 0)] = {
     type: 'choice',
     instructions: `${partLabel}の保存価値retentionを選ぶ。`,
     criteria: RETENTION_CRITERIA,
-  };
-  questions[jevQuestionId('primary_intent', 0)] = {
-    type: 'choice',
-    instructions: `${partLabel}の主な意図primary_intentを選ぶ。`,
-    criteria: PRIMARY_INTENT_CRITERIA,
   };
   questions[jevQuestionId('decision_action', 0)] = {
     type: 'choice',
@@ -134,11 +118,13 @@ export function buildQuestions(part: JevStatePart, candidateIds: readonly string
     instructions: `${partLabel}の発言状態statement_statusを選ぶ。`,
     criteria: STATEMENT_STATUS_CRITERIA,
   };
-  questions[jevQuestionId('search_action', 0)] = {
-    type: 'choice',
-    instructions: `${partLabel}で過去履歴の検索を開始・再利用・省略のどれにすべきかsearch_actionを選ぶ。`,
-    criteria: SEARCH_ACTION_CRITERIA,
-  };
+  if (includeSearchAction) {
+    questions[jevQuestionId('search_action', 0)] = {
+      type: 'choice',
+      instructions: `${partLabel}で過去履歴の検索を開始・再利用・省略のどれにすべきかsearch_actionを選ぶ。`,
+      criteria: SEARCH_ACTION_CRITERIA,
+    };
+  }
   const relationCriteria: CriteriaMap = {};
   for (const candidateId of candidateIds) {
     relationCriteria[candidateId] = 'stateの直前発言候補';
