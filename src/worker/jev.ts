@@ -322,7 +322,6 @@ export async function callJev(config: WorkerConfig, bodyText: string): Promise<J
     const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
     throw new JevCallError(timedOut ? 'provider_timeout' : 'provider_unavailable', true);
   }
-  const durationMs = Date.now() - started;
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel().catch(() => undefined);
     throw new JevCallError('provider_redirect_rejected', false);
@@ -344,5 +343,6 @@ export async function callJev(config: WorkerConfig, bodyText: string): Promise<J
   } catch {
     throw new JevCallError('provider_contract_invalid', false, undefined, 'response_not_json');
   }
-  return { json, durationMs };
+  // 所要時間は本文の受信・parseまで含める。Voyageと同じ範囲にし、出力量による待ちも計測へ入れる。
+  return { json, durationMs: Date.now() - started };
 }
