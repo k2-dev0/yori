@@ -153,6 +153,7 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - 受付が`primary_only=true`（明示検索だけが指定できる）の場合、候補を集めた後・上限10件で切る前に、検索結果の注入を受けて書かれた回答をsourceに持つ文書を候補から外す。判定は`provenance`経路と同じで、エージェントの回答の直前の入力に対する検索が`matched`で完了していること。`provenance`経路で加えた元の文書は残り、辿った先も派生なら同じ判定で外れる。自動検索と指定のない明示検索は外さない。
 - vector経路は区切りごとに60件（`SEARCH_VECTOR_FETCH_LIMIT`）取得し、内容が重複する候補を除いて別々の内容が20件（`SEARCH_VECTOR_LIMIT`）そろうところまでを使う。重複は順位どおりに残し、どれを残すかは後段の集約が決める。同じ質問への回答の繰り返しが上位20件を超えて溜まっても、別の内容の候補が残る。重複がなければ上位20件ちょうどになる。
 - 候補を上限10件で切る前に、内容が重複する候補を1件へ畳む。候補同士の埋め込みのcosine類似度が0.82以上（`SEARCH_DUPLICATE_SIMILARITY`）なら同じ内容の繰り返しとみなし、順位の高い候補の枠に、元と派生の関係がある時は元を、関係がない時は最も新しい発言を持つ候補を残す。識別子一致のない依頼だけの候補で、答えを含む候補を置き換えない。畳んだ件数は`similar_candidates_collapsed`のwarningへ残す。同じ質問への回答の繰り返しが枠を占め、別の内容の会話が候補から落ちるのを防ぐ。0.82は本番の写しの1質問（繰り返し同士0.84以上、別の内容とは0.80以下）から置いた暫定値で、`worker:search-eval`で見直す。
+- 候補の判定は、各区切りの上位5件の組を先に送り、useful/directの候補が1件も無い時だけ6〜10位の組を送る。採用された候補の8割強は上位5件に入るため（本番の写しで83%）、残りの判定の費用を省く。上位に採用可能な候補があれば、下位により良い候補があっても判定しない。
 - 同じ原文rangeをまとめ、上位10件かつ現在質問と候補本文の合計8,000 token相当までをJevへ送る。除外はwarningへ記録し、質問だけ、または全候補が残予算外なら`input_budget_exceeded`。
 - Jevのuseful/direct候補から代表1件を選ぶ。順位はrelevance、元か派生か（元の候補が同じrelevance以上で採用可能な派生を元の後ろへ回し、件数を`derived_candidates_demoted`のwarningへ残す）、答えを含むかどうか（識別子一致のない依頼だけの候補を後ろ）、明示識別子一致、発言状態（検証済み報告、完了報告、提案、unknown）、RRFとし、同じ既知statusかつRRF同点ではsourceの最新日時を使う。unknown同士は日時で推測しない。総合relevanceとは別に対象一致、症状・依頼、制約、実装理由、手順、発言状態を判定し、全候補のchoice・probabilities・confidenceと採用理由をresultへ残す。代表候補は原文revision・社員・role・日時・本文を保存し、保存TXでlease、入力revision、publication、source revision、scopeを再検証して原文message行をcommitまで共有lockする。
 - input自身が改訂された古い受付は`expired/input_revision_stale`で終端する。候補原文の改訂・非公開化は無効化し、残る候補がなければ`no_match`。lease喪失時は旧ownerが受付・jobを更新しない。
@@ -163,7 +164,9 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 
 ### usage
 
-外部呼出しの試行ごとに`usage_events`へ会社・provider/account/endpoint・operation・要求model・実応答model（`response_model`、応答本文を取得できない失敗はnull）・実usage（不明はnull）・所要時間・成功/error_codeを記録する。応答契約不正でも本文からmodelを取得できた場合は記録する。原文・credential・外部error bodyは保存しない。
+外部呼出しの試行ごとに`usage_events`へ会社・provider/account/endpoint・operation・要求model・実応答model（`response_model`、応答本文を取得できない失敗はnull）・実usage（不明はnull）・所要時間・成功/error_codeを記録する。Jevの呼出しには呼出し元の`job_id`も記録し、検索1件・発言1件あたりの費用をjob経由で集計できるようにする。Voyageの呼出しは`job_id`を持たない。所要時間はJev・Voyageとも本文の受信・parse完了までを含める。
+
+`jobs.started_at`はjobを取り出して処理を始めた時刻で、再試行では最後の開始時刻で上書きする。作成から開始までが待ち、開始から完了（completedの`updated_at`）までが処理時間になる。応答契約不正でも本文からmodelを取得できた場合は記録する。原文・credential・外部error bodyは保存しない。
 
 ## 失敗と再開
 
@@ -183,7 +186,6 @@ workerはroute laneとclassify/build/execute_search laneを各1、合計2並列�
 - HTTP待ち中に同じmessage revisionのanalysisだけが変わると、次buildまで旧計画が一時公開され得る（原文・analysisは保持され、次のbuildで新しいanalysisから再計画する）。
 - Jevの成功ヘッダー受信後の本文受信timeout・通信切断は恒久失敗となる。原文は保持され、明示retryで再開する。Voyageは上記のretryable transport failureとして扱う。
 - 長文の複数partが同じ承認・撤回関係を示す場合、関係の根拠範囲は最初のpartだけが保存される。
-- Jevの正常応答所要時間はヘッダー受信までを計測し、本文受信の時間を含まない。Voyageは本文受信・parse完了まで含める。
 
 上記はユーザー指定により今回の修正対象から除外している。再利用は外部評価後、保存トランザクション内で比較対象の受付を読み直し、入力revisionが有効で、直接の元検索がnew_searchと確定している場合だけ採用する。各参照先の受付と元入力を保存完了までロックするため、判定後の改訂は保存完了まで待つ。先に改訂された場合は新規検索へ戻す。保存後の改訂はM5/M6の取得時に再検証する。
 
