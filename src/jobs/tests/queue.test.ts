@@ -155,6 +155,25 @@ describe('ジョブclaimとlease', () => {
     assert.equal(running.rows[0].count, 3);
   });
 
+  it('claimした時刻をstarted_atへ記録し、再claimでは最後の開始時刻で上書きする', async () => {
+    const sessionId = await seedSession();
+    const messageId = await seedMessage(sessionId, 1);
+    const jobId = await insertJob({ sessionId, messageId, targetRevision: 1 });
+    const startedOf = async () =>
+      (await pool.query<{ started_at: Date | null; created_at: Date }>('SELECT started_at, created_at FROM jobs WHERE id = $1', [jobId])).rows[0];
+    assert.equal((await startedOf()).started_at, null, 'claim前にstarted_atが入っている');
+
+    await claimJobs(pool, { kinds: ['classify_message'], limit: 1 });
+    const first = (await startedOf()).started_at;
+    assert.ok(first !== null && first.getTime() >= (await startedOf()).created_at.getTime(), 'claim時にstarted_atを記録していない');
+
+    await pool.query("UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1", [jobId]);
+    await recoverExpiredJobs(pool);
+    await claimJobs(pool, { kinds: ['classify_message'], limit: 1 });
+    const second = (await startedOf()).started_at;
+    assert.ok(second !== null && second.getTime() >= first.getTime(), '再claimでstarted_atを更新していない');
+  });
+
   it('lease期限切れのjobは回収されて再claimできる', async () => {
     const sessionId = await seedSession();
     const messageId = await seedMessage(sessionId, 1);
