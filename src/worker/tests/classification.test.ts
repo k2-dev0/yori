@@ -20,6 +20,7 @@ import {
   readRelations,
   readRevision,
   readUsageEvents,
+  enqueueWorkerJobs,
   seedMessage,
   seedSession,
   seedUserMessage,
@@ -51,6 +52,27 @@ async function processClassify(messageId: string, server: FakeJevServer): Promis
 }
 
 describe('分類と原文保持', () => {
+  it('振り分けの無いassistant発言には検索用の質問を送らず、user発言では先行検索との同一性も質問する', async () => {
+    const sessionId = await seedSession(pool, workspace);
+    const first = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 1, text: '最初の依頼です' });
+    const second = await seedUserMessage(pool, { workspace, sessionId, sequenceNo: 2, text: '続けて別の条件で検索したい' });
+    const answer = await seedMessage(pool, { sessionId, sequenceNo: 3, role: 'assistant', text: '対応しました' });
+    await enqueueWorkerJobs(pool, { sessionId, messageId: answer.messageId, revision: answer.revision });
+    const server = await startApprovedJev(pool, workspace.companyId, (request) => ({ body: jevReply(request, jevChoices({ retention: 'substantive' })) }));
+    try {
+      for (const messageId of [first.messageId, second.messageId, answer.messageId]) {
+        await processClassify(messageId, server);
+      }
+      const questionsOf = (index: number) => Object.keys(server.requests[index].body.questions);
+      assert.ok(questionsOf(1).some((id) => id.startsWith('search_action')), 'user発言でsearch_actionを質問していない');
+      assert.ok(questionsOf(1).some((id) => id.startsWith('same_conditions')), '先行検索があるuser発言でsame_conditionsを質問していない');
+      assert.ok(!questionsOf(2).some((id) => id.startsWith('search_action') || id.startsWith('same_conditions')), 'assistant発言へ検索用の質問を送っている');
+      assert.notEqual(server.requests[2].body.state.prior_search, null, 'assistant発言の文脈から先行検索を外している');
+    } finally {
+      await server.close();
+    }
+  });
+
   it('substantiveの高信頼分類を保存し、原文とbuild_documents jobを保持する', async () => {
     const sessionId = await seedSession(pool, workspace);
     const text = '毎分100件までにしてください';
@@ -79,12 +101,14 @@ describe('分類と原文保持', () => {
       assert.ok(analysis, 'message_analysisが保存されていない');
       assert.equal(analysis.retention_category, 'substantive');
       assert.equal(analysis.is_searchable, true);
-      assert.equal(analysis.primary_intent, 'requirements');
+      assert.equal(analysis.primary_intent, 'unknown', '質問しない主な意図を保存している');
       assert.equal(analysis.statement_status, 'request');
       assert.deepEqual(analysis.technical_labels, [], '質問しない技術領域ラベルを保存している');
       assert.deepEqual(analysis.strategy_terms, ['failure_strategy:backpressure', 'performance_strategy:batch'], '設計方針fingerprintが不正');
       const sentQuestions = Object.keys(server.requests[0].body.questions);
       assert.ok(!sentQuestions.some((id) => id.startsWith('technical_label')), '技術領域ラベルを質問している');
+      assert.ok(!sentQuestions.some((id) => id.startsWith('primary_intent')), '読む処理の無い主な意図を質問している');
+      assert.ok(sentQuestions.some((id) => id.startsWith('search_action')), 'user発言で振り分け用のsearch_actionを質問していない');
       assert.equal(sentQuestions.filter((id) => id.startsWith('strategy:')).length, 7, '設計方針の7軸を質問していない');
       assert.equal(analysis.policy_version, 'initial-v1');
       assert.ok(analysis.response_models.length > 0, 'response_modelsが保存されていない');
