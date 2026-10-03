@@ -142,7 +142,6 @@ export function strategyTerms(parts: readonly PartEvaluation[], threshold: numbe
 // partごとの高信頼回答を設計の優先順位で統合し、analysis/relation/search_actionを決める。
 export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold: number): AggregatedEvaluation {
   const retention = aggregateRetention(parts, threshold);
-  const primaryIntent = adoptedOrUnknown(parts, jevQuestionId('primary_intent', 0), threshold);
   const decisionAction = adoptedOrUnknown(parts, jevQuestionId('decision_action', 0), threshold);
   const continuity = adoptedOrUnknown(parts, jevQuestionId('continuity', 0), threshold);
   const statementStatus = adoptedOrUnknown(parts, jevQuestionId('statement_status', 0), threshold);
@@ -155,7 +154,8 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
     );
   return {
     retention,
-    primaryIntent,
+    // 主な意図は読む処理が無いため質問しない。列互換のためunknownを保存する。
+    primaryIntent: 'unknown',
     // 技術領域ラベルは質問しない。列互換のため空配列を保存する。
     technicalLabels: [],
     strategyTerms: strategyTerms(parts, threshold),
@@ -170,7 +170,7 @@ export function aggregateEvaluations(parts: readonly PartEvaluation[], threshold
       offset: part.part.offset,
       length: part.part.length,
       retention: aggregateRetention([part], threshold),
-      primary_intent: adoptedOrUnknown([part], jevQuestionId('primary_intent', 0), threshold),
+      primary_intent: 'unknown',
       technical_labels: [],
       strategy_terms: strategyTerms([part], threshold),
       decision_action: adoptedOrUnknown([part], jevQuestionId('decision_action', 0), threshold),
