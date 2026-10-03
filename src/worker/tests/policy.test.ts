@@ -162,6 +162,8 @@ describe('外部送信・障害', () => {
       for (const rowText of usageRows) {
         assert.equal(rowText.includes(text), false, 'usage_eventsへ原文が混入している');
       }
+      const linked = await pool.query<{ job_id: string | null }>('SELECT job_id FROM usage_events WHERE company_id = $1', [workspace.companyId]);
+      assert.deepEqual(new Set(linked.rows.map((row) => row.job_id)), new Set([jobId]), 'usage_eventsが呼出し元のjobに紐付いていない');
     } finally {
       await server.close();
     }
