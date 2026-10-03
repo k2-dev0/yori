@@ -75,7 +75,7 @@ export const RELATION_ACTIONS = ['accept', 'reject', 'revoke', 'change'] as cons
 export type RelationAction = (typeof RELATION_ACTIONS)[number];
 
 // 質問文・criteriaを変えた時に古いキャッシュを再利用しないための版。
-export const JEV_QUESTIONS_VERSION = 'm3-5';
+export const JEV_QUESTIONS_VERSION = 'm3-6';
 
 // ---- M4 Voyage埋め込みの固定契約（計画3.3） ----
 export const VOYAGE_PROVIDER = 'voyage_direct';
